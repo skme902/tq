@@ -1,0 +1,35 @@
+package sqlcore
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/skme902/tq/store"
+)
+
+func TestSplitStatements(t *testing.T) {
+	got := splitStatements("-- header\nCREATE TABLE a (\n  x INT -- trailing\n);\n\n-- c\nCREATE INDEX i ON a (x);\nSELECT 1")
+	require.Equal(t, []string{"CREATE TABLE a (\n  x INT \n);", "CREATE INDEX i ON a (x);", "SELECT 1"}, got)
+}
+
+func TestQueueIDIsUnambiguous(t *testing.T) {
+	seen := map[string]store.QueueKey{}
+	for _, k := range []store.QueueKey{
+		{Namespace: "a", Name: "bc"}, {Namespace: "ab", Name: "c"}, {Namespace: "", Name: "abc"},
+		{Namespace: "a", Name: "bc", Partition: 1}, {Namespace: "a", Name: "bc\x01"},
+	} {
+		id, _ := queueIDAndHash(k)
+		prev, dup := seen[string(id)]
+		require.False(t, dup, "%v and %v share an id", prev, k)
+		seen[string(id)] = k
+	}
+	id1, h1 := queueIDAndHash(store.QueueKey{Namespace: "ns", Name: "q"})
+	id2, h2 := queueIDAndHash(store.QueueKey{Namespace: "ns", Name: "q"})
+	require.Equal(t, id1, id2)
+	require.Equal(t, h1, h2, "hash is deterministic (farm.Fingerprint32)")
+}
+
+func TestRebind(t *testing.T) {
+	require.Equal(t, "a=$1 AND b IN ($2, $3)", rebind("a=? AND b IN (?, ?)", 0))
+}

@@ -1,0 +1,11 @@
+tq (github.com/skme902/tq)
+Copyright (c) 2026 skme902
+
+This product includes software ported from Temporal (https://github.com/temporalio/temporal),
+tag v1.32.1, commit af08a5e5f2dd40f545f2afac7780daaa6987001e, licensed under the MIT License:
+
+  Copyright (c) 2025 Temporal Technologies Inc.  All rights reserved.
+  Copyright (c) 2020 Uber Technologies, Inc.
+
+The full upstream license text is in UPSTREAM_LICENSE. Files containing ported code carry a
+header of the form "Ported from temporalio/temporal v1.32.1 af08a5e5, <upstream path>".
