@@ -332,6 +332,11 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 	readFrom := readLevel.max(fairLevel{pass: 1, id: 0}).inc()
 	res, err := tr.backlogMgr.db.GetFairTasks(tr.backlogMgr.tqCtx, tr.subqueue, readFrom, batchSize)
 	if err != nil {
+		var inv *store.InvalidArgumentError
+		if errors.As(err, &inv) {
+			// Most likely a corrupt row (REVIEW L10): it blocks this subqueue until repaired.
+			tr.logger.Error("backlog read failed on invalid data; retrying", "subqueue", tr.subqueue, "error", err)
+		}
 		// TODO: Should we ever stop retrying on db errors?
 		if tr.backlogMgr.signalIfFatal(err) || errors.Is(err, context.Canceled) {
 			// don't retry
