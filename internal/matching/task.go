@@ -49,6 +49,9 @@ type (
 	genericTaskInfo struct {
 		*store.TaskInfo
 		completionFunc func(*internalTask, taskResponse)
+		// leaseFunc, if set, is called when a backlog task is handed out under a delivery lease
+		// (library addition; see fairTaskReader.leaseTask).
+		leaseFunc func(*internalTask)
 	}
 
 	// internalTask represents a task from AddTask (sync match) or from the backlog.
@@ -70,6 +73,10 @@ type (
 		// allow inserting forwards in between priority levels.
 		effectivePriority priorityKey
 		pollForwarderType pollForwarderType
+
+		// leased is true while a backlog task is held under a delivery lease and tracked by the
+		// reader as leased rather than loaded. Guarded by the owning fairTaskReader's lock.
+		leased bool
 	}
 
 	// taskResponse is used to report the result of either a match with a local poller,

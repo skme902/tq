@@ -3,9 +3,12 @@ package matching
 // Delivery leases are a library addition with no upstream counterpart: upstream matching hands a
 // task to history (RecordTaskStarted) and acks it immediately; history then owns retries. Here the
 // consumer owns the task until Ack, and an unacked lease is redelivered:
-//   - backlog tasks stay "loaded, not acked" in the fairTaskReader for the whole lease, so the
-//     ack level cannot pass them; expiry/Nack finishes them with a retryable error, which the
-//     reader turns into addTaskToMatcher (upstream's transient-error path).
+//   - backlog tasks stay unacked in the fairTaskReader for the whole lease, so the ack level
+//     cannot pass them, but they are counted as leased rather than loaded so they do not hold
+//     back reads (fairTaskReader.leaseTask). If the reader trims a leased task from memory it
+//     remembers it in leasedEvicted, so a re-read does not hand it to a second poller.
+//     Expiry/Nack finishes them with a retryable error, which the reader turns into
+//     addTaskToMatcher (upstream's transient-error path).
 //   - sync-matched tasks were never persisted; expiry/Nack spools them to the backlog.
 
 import (
@@ -50,6 +53,9 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 	}
 	if !d.SyncMatched {
 		d.TaskID = task.event.ID
+		if f := task.event.leaseFunc; f != nil {
+			f(task) // before the timer is armed, so expiry always follows the lease
+		}
 	}
 	pqm.outstandingLeases.Add(1)
 	d.mu.Lock()
