@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/skme902/tq/clock"
+	"github.com/skme902/tq/internal/backoff"
 	"github.com/skme902/tq/store"
 )
 
@@ -141,4 +142,14 @@ func TestPartitionStartAfterStopIsNoop(t *testing.T) {
 	defer cancel()
 	require.Error(t, pm.WaitUntilInitialized(ctx))
 	require.NoError(t, ctx.Err(), "WaitUntilInitialized on a stopped queue must not wait for the caller's deadline")
+}
+
+// L1: upstream's addErrorRetryPolicy keeps NewExponentialRetryPolicy's 10s max interval.
+func TestAddErrorRetryPolicyCapped(t *testing.T) {
+	r := backoff.NewRetrier(addErrorRetryPolicy)
+	for i := range 100 {
+		d := r.NextBackOff()
+		require.Greater(t, d, time.Duration(0), "attempt %d", i)
+		require.LessOrEqual(t, d, 10*time.Second, "attempt %d", i)
+	}
 }

@@ -24,7 +24,9 @@ import (
 
 const concurrentAddRetries = 10 // pri_task_reader.go
 
-var addErrorRetryPolicy = backoff.Policy{Initial: 2 * time.Second, Expiration: backoff.NoInterval} // pri_task_reader.go
+// pri_task_reader.go: NewExponentialRetryPolicy(2s).WithExpirationInterval(NoInterval), which keeps
+// the constructor's 10s maximum interval.
+var addErrorRetryPolicy = backoff.Policy{Initial: 2 * time.Second, Max: 10 * time.Second, Expiration: backoff.NoInterval}
 
 type (
 	fairTaskReader struct {
