@@ -4,6 +4,8 @@ package matching
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,4 +101,44 @@ func TestExtendLeaseBeatsStaleExpiry(t *testing.T) {
 		return d.settled
 	}, 5*time.Second, time.Millisecond, "extended lease expires on its new deadline")
 	require.ErrorIs(t, d.Ack(), ErrLeaseLost)
+}
+
+type countingWatcher struct {
+	mu     sync.Mutex
+	active int
+}
+
+func (w *countingWatcher) QueueConfig(store.QueueKey) QueueConfig { return QueueConfig{} }
+func (w *countingWatcher) WatchQueueConfig(store.QueueKey, func()) func() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.active++
+	return func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.active--
+	}
+}
+
+// M3: a partition published to e.partitions but stopped (engine Stop or unload) before its
+// Start ran must stay stopped: Start is then a no-op, and waiters fail fast.
+func TestPartitionStartAfterStopIsNoop(t *testing.T) {
+	w := &countingWatcher{}
+	e, err := NewEngine(Options{Config: DefaultConfig(), Store: newTestStore(), TimeSource: clock.NewRealTimeSource(),
+		Logger: discardLogger(), QueueConfigSource: w})
+	require.NoError(t, err)
+	t.Cleanup(e.Stop)
+
+	pm := newTaskQueuePartitionManager(e, portQueue, newTaskQueueConfig(e.config))
+	pm.Stop(unloadCauseShuttingDown) // the window between publish and Start
+	pm.Start()
+
+	require.Equal(t, daemonStatusStopped, atomic.LoadInt32(&pm.defaultQueue.status), "physical queue started after Stop")
+	w.mu.Lock()
+	require.Zero(t, w.active, "config watch registered after Stop")
+	w.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.Error(t, pm.WaitUntilInitialized(ctx))
+	require.NoError(t, ctx.Err(), "WaitUntilInitialized on a stopped queue must not wait for the caller's deadline")
 }
