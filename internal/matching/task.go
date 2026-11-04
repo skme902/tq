@@ -159,13 +159,6 @@ func (task *internalTask) isSyncMatchTask() bool {
 	return task.responseC != nil
 }
 
-func (task *internalTask) getCreateTime() time.Time {
-	if task.event != nil {
-		return task.event.Data.CreateTime
-	}
-	return time.Time{}
-}
-
 // getResponse waits for a response on the task's response channel.
 func (task *internalTask) getResponse() (taskResponse, bool) {
 	if task.responseC == nil {
@@ -214,11 +207,6 @@ func (task *internalTask) finish(r taskFinishResult) {
 		startErr:   r.err,
 		dropReason: r.dropReason,
 	}, r.consumedToken)
-}
-
-// finishForward must be called after forwarding a task.
-func (task *internalTask) finishForward(forwardErr error, consumedToken bool) {
-	task.finishInternal(taskResponse{forwarded: true, forwardErr: forwardErr}, consumedToken)
 }
 
 func (task *internalTask) finishInternal(res taskResponse, consumedToken bool) {

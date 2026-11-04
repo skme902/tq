@@ -144,12 +144,6 @@ func (tr *fairTaskReader) Start() {
 	tr.maybeReadTasksLocked()
 }
 
-func (tr *fairTaskReader) getOldestBacklogTime() time.Time {
-	tr.lock.Lock()
-	defer tr.lock.Unlock()
-	return tr.backlogAge.oldestTime()
-}
-
 func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 	recordDroppedTask(tr.backlogMgr.metricsHandler, res.dropReason)
 	err := res.err()
@@ -664,15 +658,6 @@ func (tr *fairTaskReader) getLoadedTasks() int {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
 	return tr.loadedTasks
-}
-
-// isDrained returns true if this subqueue has been fully drained:
-// - We've read to the end of the queue (atEnd is true)
-// - No tasks are loaded in memory
-func (tr *fairTaskReader) isDrained() bool {
-	tr.lock.Lock()
-	defer tr.lock.Unlock()
-	return tr.atEnd && tr.loadedTasks == 0
 }
 
 func (tr *fairTaskReader) ackLevelPinnedLocked() bool {

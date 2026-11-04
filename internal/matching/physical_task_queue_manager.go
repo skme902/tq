@@ -220,10 +220,6 @@ func (c *physicalTaskQueueManagerImpl) PollTask(
 	}
 }
 
-func (c *physicalTaskQueueManagerImpl) backlogCountHint() int64 {
-	return c.backlogMgr.BacklogCountHint()
-}
-
 func (c *physicalTaskQueueManagerImpl) MarkAlive() {
 	c.liveness.markAlive()
 }

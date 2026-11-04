@@ -352,10 +352,6 @@ func (c *fairBacklogManagerImpl) respoolTaskAfterError(task *store.Task) error {
 	return err
 }
 
-func (c *fairBacklogManagerImpl) queueKey() store.QueueKey {
-	return c.pqMgr.QueueKey()
-}
-
 func (c *fairBacklogManagerImpl) getDB() *taskQueueDB {
 	return c.db
 }
