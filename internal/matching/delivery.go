@@ -12,6 +12,7 @@ package matching
 //   - sync-matched tasks were never persisted; expiry/Nack spools them to the backlog.
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -146,8 +147,11 @@ func (d *Delivery) Nack() error {
 	return nil
 }
 
-// ExtendLease pushes the lease deadline to now+dur.
+// ExtendLease pushes the lease deadline to now+dur. dur must be positive.
 func (d *Delivery) ExtendLease(dur time.Duration) error {
+	if dur <= 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("lease extension must be positive, got %v", dur)}
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.settled {
@@ -159,9 +163,15 @@ func (d *Delivery) ExtendLease(dur time.Duration) error {
 }
 
 func (d *Delivery) expire() {
-	if !d.settle() {
+	d.mu.Lock()
+	// A callback from before an ExtendLease can still run after it: the deadline decides
+	// (REVIEW M2). The reset timer fires again at the new deadline.
+	if d.settled || d.engine.timeSource.Now().Before(d.deadline) {
+		d.mu.Unlock()
 		return
 	}
+	d.settled = true
+	d.mu.Unlock()
 	d.engine.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
 	d.release()
 	go d.redeliver(errLeaseExpired) // not under the timer callback
