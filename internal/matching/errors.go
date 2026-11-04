@@ -16,7 +16,7 @@ var (
 	ErrNoTasks = errors.New("no tasks")
 	// ErrResourceExhausted is returned by AddTask when the writer queue is full.
 	ErrResourceExhausted = &store.ResourceExhaustedError{Msg: "too many outstanding appends to the task queue"}
-	// ErrEngineStopped is returned after Stop.
+	// ErrEngineStopped is returned after Stop, including by Delivery methods on leases Stop ended.
 	ErrEngineStopped = errors.New("engine stopped")
 	// ErrLeaseLost is returned by Ack/Nack/Extend after the delivery lease expired or was settled.
 	ErrLeaseLost = errors.New("delivery lease lost")
@@ -35,6 +35,7 @@ var (
 	errInternalMatchError  = errors.New("internal matcher error")
 	errLeaseExpired        = Retryable(errors.New("delivery lease expired"))
 	errNacked              = Retryable(errors.New("delivery nacked"))
+	errLeaseRefused        = Retryable(errors.New("delivery refused: engine stopped"))
 )
 
 // isTransientMatchError replaces common.IsServiceClientTransientError ||

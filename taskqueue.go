@@ -78,7 +78,7 @@ var (
 	ErrNoTasks = matching.ErrNoTasks
 	// ErrResourceExhausted is returned by AddTask when too many writes are outstanding.
 	ErrResourceExhausted = matching.ErrResourceExhausted
-	// ErrEngineStopped is returned after Stop.
+	// ErrEngineStopped is returned after Stop, including by Delivery methods on leases Stop ended.
 	ErrEngineStopped = matching.ErrEngineStopped
 	// ErrLeaseLost is returned by Delivery methods after the lease expired or was settled.
 	ErrLeaseLost = matching.ErrLeaseLost

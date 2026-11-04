@@ -10,6 +10,7 @@ package matching
 //     Expiry/Nack finishes them with a retryable error, which the reader turns into
 //     addTaskToMatcher (upstream's transient-error path).
 //   - sync-matched tasks were never persisted; expiry/Nack spools them to the backlog.
+//   - Engine.Stop ends every lease (stopping its timer); later calls return ErrEngineStopped.
 
 import (
 	"fmt"
@@ -36,13 +37,15 @@ type Delivery struct {
 
 	mu       sync.Mutex
 	settled  bool
+	lostErr  error // returned by Ack/Nack/ExtendLease once settled
 	deadline time.Time
 }
 
-// newDelivery leases a matched task to a poller. It fails with ErrEngineStopped for a sync-matched
-// task once Stop has started re-spooling sync leases; the task is then finished with that error,
-// so the partition manager spools it (or AddTask reports the error) instead of handing out an
-// in-memory-only task that Stop would never re-spool (REVIEW M1).
+// newDelivery leases a matched task to a poller. It fails with ErrEngineStopped once Stop has
+// snapshotted the leases. A refused sync-matched task is finished with that error, so the
+// partition manager spools it (or AddTask reports the error) instead of handing out an
+// in-memory-only task that Stop would never re-spool (REVIEW M1); a refused backlog task is
+// returned to its reader.
 func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) (*Delivery, error) {
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
@@ -61,25 +64,28 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		if f := task.event.leaseFunc; f != nil {
 			f(task) // before the timer is armed, so expiry always follows the lease
 		}
-		pqm.outstandingLeases.Add(1)
-		d.arm(lease)
-		return d, nil
 	}
 
-	// Register the sync lease and arm its timer atomically with respect to Stop's snapshot.
-	e.syncLeasesLock.Lock()
-	if e.syncLeasesClosed {
-		e.syncLeasesLock.Unlock()
-		task.finish(taskFinishResult{err: ErrEngineStopped})
+	// Register the lease and arm its timer atomically with respect to Stop's snapshot.
+	e.leasesLock.Lock()
+	if e.leasesClosed {
+		e.leasesLock.Unlock()
+		if d.SyncMatched {
+			task.finish(taskFinishResult{err: ErrEngineStopped})
+		} else {
+			task.finish(taskFinishResult{err: errLeaseRefused}) // unlease; the queue is unloading
+		}
 		return nil, ErrEngineStopped
 	}
 	pqm.outstandingLeases.Add(1)
 	d.arm(lease)
-	e.syncLeases[d] = struct{}{}
-	e.syncLeasesLock.Unlock()
-	// The task is "started": let the AddTask caller return (upstream: finish after
-	// RecordTaskStarted succeeds).
-	task.finish(taskFinishResult{consumedToken: true})
+	e.leases[d] = struct{}{}
+	e.leasesLock.Unlock()
+	if d.SyncMatched {
+		// The task is "started": let the AddTask caller return (upstream: finish after
+		// RecordTaskStarted succeeds).
+		task.finish(taskFinishResult{consumedToken: true})
+	}
 	return d, nil
 }
 
@@ -97,14 +103,24 @@ func (d *Delivery) LeaseDeadline() time.Time {
 }
 
 // settle marks the delivery settled; returns false if it already was.
-func (d *Delivery) settle() bool {
+func (d *Delivery) settle() bool { return d.settleWith(ErrLeaseLost) }
+
+// settleWith settles the delivery; later calls get lost as their error.
+func (d *Delivery) settleWith(lost error) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.settled {
 		return false
 	}
 	d.settled = true
+	d.lostErr = lost
 	return true
+}
+
+func (d *Delivery) lost() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lostErr
 }
 
 func (d *Delivery) stopTimer() {
@@ -115,18 +131,17 @@ func (d *Delivery) stopTimer() {
 
 func (d *Delivery) release() {
 	d.pqm.outstandingLeases.Add(-1)
-	if d.SyncMatched {
-		d.engine.syncLeasesLock.Lock()
-		delete(d.engine.syncLeases, d)
-		d.engine.syncLeasesLock.Unlock()
-	}
+	d.engine.leasesLock.Lock()
+	delete(d.engine.leases, d)
+	d.engine.leasesLock.Unlock()
 	d.pqm.MarkAlive()
 }
 
-// Ack completes the task. It returns ErrLeaseLost if the lease already expired or was settled.
+// Ack completes the task. It returns ErrLeaseLost if the lease already expired or was settled,
+// or ErrEngineStopped if Stop ended the lease (the task is then redelivered after a reload).
 func (d *Delivery) Ack() error {
 	if !d.settle() {
-		return ErrLeaseLost
+		return d.lost()
 	}
 	d.stopTimer()
 	d.release()
@@ -139,7 +154,7 @@ func (d *Delivery) Ack() error {
 // Nack releases the task for immediate redelivery.
 func (d *Delivery) Nack() error {
 	if !d.settle() {
-		return ErrLeaseLost
+		return d.lost()
 	}
 	d.stopTimer()
 	d.release()
@@ -155,7 +170,7 @@ func (d *Delivery) ExtendLease(dur time.Duration) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.settled {
-		return ErrLeaseLost
+		return d.lostErr
 	}
 	d.deadline = d.engine.timeSource.Now().Add(dur)
 	d.timer.Reset(dur)
@@ -171,6 +186,7 @@ func (d *Delivery) expire() {
 		return
 	}
 	d.settled = true
+	d.lostErr = ErrLeaseLost
 	d.mu.Unlock()
 	d.engine.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
 	d.release()

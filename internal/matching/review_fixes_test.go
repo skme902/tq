@@ -183,3 +183,36 @@ func TestWriterOverridesComeFromRateLimitManager(t *testing.T) {
 	src.mu.Unlock()
 	require.Equal(t, pm.GetRateLimitManager().GetFairnessWeightOverrides(), pm.defaultQueue.GetFairnessWeightOverrides())
 }
+
+// L6: Stop ends every outstanding lease. Ack/Nack/ExtendLease afterwards report
+// ErrEngineStopped instead of claiming an ack that a stopped reader can no longer persist;
+// the backlog task stays durable and is redelivered after the next load.
+func TestLeaseOpsAfterStopReportEngineStopped(t *testing.T) {
+	ts := newTestStore()
+	e, _ := newFakeClockEngine(t, ts)
+	d1 := pollBacklogTask(t, e, time.Minute)
+	d2 := pollBacklogTask(t, e, time.Minute)
+	d3 := pollBacklogTask(t, e, time.Minute)
+	e.Stop()
+	require.ErrorIs(t, d1.Ack(), ErrEngineStopped)
+	require.ErrorIs(t, d2.Nack(), ErrEngineStopped)
+	require.ErrorIs(t, d3.ExtendLease(time.Minute), ErrEngineStopped)
+	d1.mu.Lock()
+	stopped := d1.timer.Stop()
+	d1.mu.Unlock()
+	require.False(t, stopped, "Stop must stop the lease timer")
+
+	e2, err := NewEngine(Options{Config: DefaultConfig(), Store: ts, TimeSource: clock.NewRealTimeSource(), Logger: discardLogger()})
+	require.NoError(t, err)
+	t.Cleanup(e2.Stop)
+	seen := map[int64]bool{}
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		d, err := e2.PollTask(ctx, portQueue, PollOptions{})
+		cancel()
+		require.NoError(t, err)
+		seen[d.TaskID] = true
+		require.NoError(t, d.Ack())
+	}
+	require.Equal(t, map[int64]bool{d1.TaskID: true, d2.TaskID: true, d3.TaskID: true}, seen)
+}

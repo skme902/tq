@@ -62,11 +62,11 @@ type Engine struct {
 	partitions     map[store.QueueKey]*taskQueuePartitionManagerImpl
 	stopped        bool
 
-	syncLeasesLock sync.Mutex
-	syncLeases     map[*Delivery]struct{}
-	// syncLeasesClosed is set by Stop (under syncLeasesLock) before it snapshots syncLeases; no
-	// sync-matched task is leased after that.
-	syncLeasesClosed bool
+	// leases holds every outstanding Delivery (backlog and sync-matched). leasesClosed is set by
+	// Stop (under leasesLock) before it snapshots leases; no task is leased after that.
+	leasesLock   sync.Mutex
+	leases       map[*Delivery]struct{}
+	leasesClosed bool
 
 	// testHookStopAfterSyncLeases, if set, runs in Stop after sync leases are re-spooled and
 	// before queues unload (tests only).
@@ -104,7 +104,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		ctx:            ctx,
 		cancel:         cancel,
 		partitions:     make(map[store.QueueKey]*taskQueuePartitionManagerImpl),
-		syncLeases:     make(map[*Delivery]struct{}),
+		leases:         make(map[*Delivery]struct{}),
 	}, nil
 }
 
@@ -121,20 +121,24 @@ func (e *Engine) Stop() {
 	e.stopped = true
 	e.partitionsLock.Unlock()
 
-	// Sync-matched tasks only exist in memory while leased; write them back before unloading so a
-	// graceful shutdown does not lose them (library addition; backlog tasks are already durable).
-	e.syncLeasesLock.Lock()
-	e.syncLeasesClosed = true
-	leases := make([]*Delivery, 0, len(e.syncLeases))
-	for d := range e.syncLeases {
+	// End every outstanding lease (library addition). Sync-matched tasks only exist in memory
+	// while leased; write them back before unloading so a graceful shutdown does not lose them.
+	// Backlog tasks are already durable and are redelivered after the next load; their later
+	// Ack/Nack/ExtendLease report ErrEngineStopped (REVIEW L6).
+	e.leasesLock.Lock()
+	e.leasesClosed = true
+	leases := make([]*Delivery, 0, len(e.leases))
+	for d := range e.leases {
 		leases = append(leases, d)
 	}
-	e.syncLeasesLock.Unlock()
+	e.leasesLock.Unlock()
 	for _, d := range leases {
-		if d.settle() {
+		if d.settleWith(ErrEngineStopped) {
 			d.stopTimer()
 			d.release()
-			e.respoolSyncTaskLocked(d, true)
+			if d.SyncMatched {
+				e.respoolSyncTaskLocked(d, true)
+			}
 		}
 	}
 
