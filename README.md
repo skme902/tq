@@ -44,7 +44,10 @@ Semantics:
 - **Ordering.** Tasks are served by effective priority first, then by fairness pass within a priority (see
   Fairness). With no fairness keys, that is FIFO within a priority.
 - **At-least-once delivery.** If a lease expires or the task is nacked, it is redelivered. A sync-matched
-  task whose lease expires is written to the backlog. Duplicates are possible after a crash or a queue reload.
+  task whose lease expires is written to the backlog. While a lease is live, its task is not handed to another
+  poller. A task is delivered again after its lease ends without an Ack: on expiry, on Nack, or when the engine
+  stops or crashes, or the queue unloads, while the lease is held. So a consumer that is slower than its lease, or
+  that is cut off by a stop or crash, can see the task twice.
 - **Fencing.** Every write and delete is conditioned on the queue's rangeID. When the engine loses ownership,
   the queue unloads and the next call reloads it.
 - **Optional hooks** (`Options`):

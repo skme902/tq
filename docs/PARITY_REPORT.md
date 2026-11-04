@@ -190,6 +190,30 @@ at unset time. Each upstream update is a persisted user-data write followed by l
 unset lands 0.5–0.75 s late. Per-250 ms buckets show upstream rl-fair still at 100/s during that time, then running at exactly
 1000/s. Our config source is in-process. This is an intentional architectural difference (§3, item 9), not a matching difference.
 
+### 2.6 Held leases (ours only) and the review-fixes rerun
+
+Upstream acks at RecordTaskStarted, so it never holds a task. `parity/cmd/ours -hold-ms N` acks each lease N ms after
+delivery instead, and `run_probes.sh` runs it (results/probes.md, "Held leases"):
+
+| scenario | ours/mem | ours/sqlite | notes |
+|---|---|---|---|
+| det-fair, hold 2000 ms (3 × 1500 tasks, batch 1000) | order exact 1.000, tau 1.000; 0 lost, 0 dup; 1.3 s | exact 1.000; 0 lost, 0 dup; 2.0 s | order is the same as upstream acking at once |
+| churn, hold 500 ms | 5686/5686, 0 lost, 0 dup, sync 84.9% | 5686/5686, 0 lost, 0 dup, sync 85.0% | |
+
+Before the H1/H2 fix (`6e4b017`, same harness), det-fair with 2000 ms holds still finished in order, but backlog p99
+latency was 2822 ms and the run took 3.2 s, compared with 1306 ms and 1.3 s after the fix. More than
+`GetTasksBatchSize` held leases stopped reads until the first acks arrived.
+
+The full `run_all.sh` rerun on `feat/review-fixes` matched the earlier results:
+- det-fair exact order 1.000 (mem and sqlite).
+- 0 lost and 0 duplicates everywhere except the known upstream/mem fixture.
+- churn sync 84.9%.
+- Limited throughput within 1% of upstream, for example rl-queue50 55.0–55.1 vs 55.0.
+
+One exception was churn exact order: ours/mem 0.983 and ours/sqlite 0.994, compared with 0.997 and 0.995 before. Run 2
+was slowed by load on the shared host, and upstream's own run 2 dropped to 0.870 (elapsed 20.6 s instead of 15.0 s).
+Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite. Upstream's own run 2 rerun gave 0.998.
+
 ## 3. Intentional differences (all slices)
 
 1. **Leases and ack model.** Upstream treats "delivery" as the RecordTaskStarted RPC to history, and history dedupes.
@@ -223,6 +247,31 @@ unset lands 0.5–0.75 s late. Per-250 ms buckets show upstream rl-fair still at
     frontend or history retries.
 14. **Clock.** The long-poll child timeout uses the injected clock. LRU `Entries` returns a snapshot.
 15. **Backlog types.** Only the fair-path backlog exists. There is no classic or pri backlog and no classic-to-fair migration.
+16. **Leased-task accounting (review H1/H2).** Upstream drops a task from the reader at RecordTaskStarted, so it never has
+    "held" tasks. Our leased backlog tasks stay in the reader until Ack/Nack/expiry. They count in `leasedTasks`, not
+    `loadedTasks`, so held leases never block reads (`loadedTasks <= GetTasksReloadAt` is unchanged). Trims skip them, and a
+    leased task chopped by an eviction is remembered in `leasedEvicted` so a re-read reattaches the entry instead of matching
+    it again. The read, trim, ack-level and GC algorithms are otherwise upstream's. §2.6 checks this with held leases.
+17. **Leases at Stop (review M1/L6).** `Engine.Stop` ends every live lease and stops its timer. A sync-matched lease is
+    re-spooled; a backlog lease stays in the store. Ack, Nack and ExtendLease on those leases return `ErrEngineStopped`,
+    and so does any lease created after Stop starts (a sync match then spools the task). Upstream has no leases.
+18. **Lease expiry (review M2).** The lease deadline decides expiry: an expiry callback that loses a race with
+    ExtendLease does nothing. `ExtendLease(d <= 0)` is an InvalidArgumentError.
+19. **Partition lifecycle (review M3).** A physical queue stopped before `Start` stays stopped; `Start` after Stop starts
+    nothing, and `WaitUntilInitialized` returns once the queue stops. Upstream has the same publish-then-start window but
+    runs inside fx lifecycle code that does not hit it.
+20. **Config validation (review L7).** `NewEngine` rejects `GetTasksBatchSize < 1` and `GetTasksReloadAt` outside
+    `[0, GetTasksBatchSize)`. Upstream takes dynamic config unchecked.
+21. **Corrupt rows (review L10).** The SQL stores return an `InvalidArgumentError` naming the task ID when a row cannot be
+    decoded, and the reader logs it at Error. It still retries the batch forever, as upstream does, so the subqueue stays
+    blocked until the row is repaired.
+22. **Backoff jitter.** `internal/backoff` applies up to 20% downward jitter; upstream's default jitter in v1.32.1 is 0. The
+    maximum interval (10 s for add-error retries, review L1) and ThrottleRetryContext rules (review L2) match upstream.
+23. **API (review L8).** `DefaultCounterParams` is a function that returns a copy instead of a mutable package variable.
+
+Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
+`clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
+limit manager (L4).
 
 UPSTREAM_MAP.md §§2–16 has the source-level detail for each item.
 
