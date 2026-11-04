@@ -13,6 +13,16 @@ for s in scripts-ablate/*.json; do ./bin/ours -script "$s" -out "traces/probe/ab
 echo "## Ablations (ours/mem, each row one feature removed; compared with the full upstream det-fair run)"
 for s in scripts-ablate/*.json; do n=$(basename "$s" .json); echo; echo "### $n"
   go run ./cmd/compare -scripts scripts "$ref" "traces/probe/ablate-$n.json" | grep -E '^\| ours/mem/p1 \| 0 \| det-'; done
+echo; echo "## Held leases (ours only: each lease acked after -hold-ms; upstream acks at start)"
+echo "Order must still match upstream det-fair (leases do not hold back reads), with 0 lost and 0 dup."
+for st in mem sqlite; do
+  ./bin/ours -script scripts/det-fair.json -out "traces/probe/hold-det-fair.ours-$st.json" -store "$st" -run 0 -hold-ms 2000
+  ./bin/ours -script scripts/churn.json -out "traces/probe/hold-churn.ours-$st.json" -store "$st" -run 0 -hold-ms 500
+done
+echo; echo "### det-fair, hold 2000 ms"
+go run ./cmd/compare -scripts scripts "$ref" traces/probe/hold-det-fair.ours-*.json | grep -E '^\| ours/'
+echo; echo "### churn, hold 500 ms (delivery counts only; churn order is not deterministic)"
+go run ./cmd/compare -scripts scripts traces/probe/hold-churn.ours-*.json | grep -E '^\| ours/[a-z]+/p1 \| 0 \| [0-9]'
 echo; echo "## System-limit probes (4000 backlog, 4 pollers)"; echo
 for s in scripts-probe/*.json; do n=$(basename "$s" .json)
   ./run_upstream.sh "$PWD/$s" "$PWD/traces/probe/$n.up.json" sqlite 1 0 >/dev/null

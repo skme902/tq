@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	taskqueue "github.com/skme902/tq"
@@ -24,6 +25,12 @@ type impl struct {
 	cs  *taskqueue.MemoryQueueConfigSource
 	ns  string
 	rec *driver.Recorder
+	// hold > 0 keeps each lease for hold before acking (tq-only lease-holding scenario; upstream
+	// has no leases, so with H1/H2 fixed dispatch order must not change).
+	hold  time.Duration
+	acks  sync.WaitGroup
+	ackMu sync.Mutex
+	ackEr error
 }
 
 func (m *impl) key(q string) taskqueue.QueueKey { return taskqueue.QueueKey{Namespace: m.ns, Name: q} }
@@ -52,6 +59,17 @@ func (m *impl) Poll(ctx context.Context, q, poller string) error {
 		return err
 	}
 	m.rec.Delivered(q, decode(d.Task.Payload), poller)
+	if m.hold > 0 {
+		m.acks.Go(func() {
+			time.Sleep(m.hold)
+			if err := d.Ack(); err != nil {
+				m.ackMu.Lock()
+				m.ackEr = errors.Join(m.ackEr, err)
+				m.ackMu.Unlock()
+			}
+		})
+		return nil
+	}
 	// Upstream's matching acks implicitly at RecordTaskStarted; ack immediately to match.
 	if err := d.Ack(); err != nil {
 		return err
@@ -74,6 +92,7 @@ func main() {
 	out := flag.String("out", "", "trace json")
 	storeName := flag.String("store", "mem", "mem|sqlite")
 	run := flag.Int("run", 0, "run number")
+	holdMS := flag.Int("hold-ms", 0, "hold each lease this long before acking (0 = ack at once, like upstream)")
 	flag.Parse()
 	s, err := driver.LoadScript(*scriptPath)
 	if err != nil {
@@ -109,8 +128,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tr := driver.Run(s, &impl{e: e, cs: cs, ns: s.Namespace, rec: rec}, rec)
+	m := &impl{e: e, cs: cs, ns: s.Namespace, rec: rec, hold: time.Duration(*holdMS) * time.Millisecond}
+	tr := driver.Run(s, m, rec)
+	m.acks.Wait()
 	e.Stop()
+	if m.ackEr != nil {
+		log.Fatalf("held-lease acks failed: %v", m.ackEr)
+	}
 	if err := driver.WriteTrace(*out, tr); err != nil {
 		log.Fatal(err)
 	}
