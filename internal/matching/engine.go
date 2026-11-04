@@ -90,9 +90,13 @@ func NewEngine(opts Options) (*Engine, error) {
 	if opts.Router == nil {
 		opts.Router = NoopRouter
 	}
+	config := opts.Config.WithDefaults()
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		config:         opts.Config.WithDefaults(),
+		config:         config,
 		store:          opts.Store,
 		timeSource:     opts.TimeSource,
 		logger:         opts.Logger,

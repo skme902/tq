@@ -216,3 +216,33 @@ func TestLeaseOpsAfterStopReportEngineStopped(t *testing.T) {
 	}
 	require.Equal(t, map[int64]bool{d1.TaskID: true, d2.TaskID: true, d3.TaskID: true}, seen)
 }
+
+// L7: read-batch settings that would stall or hot-loop the reader are rejected.
+func TestNewEngineValidatesReadBatchConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		batch, reloadAt int
+		ok              bool
+	}{
+		{"defaults", 0, 0, true},
+		{"explicit", 20, 5, true},
+		{"reload just below batch", 20, 19, true},
+		{"negative batch", -1, 5, false},
+		{"negative reloadAt", 20, -1, false},
+		{"reloadAt equals batch", 20, 20, false},
+		{"reloadAt above batch", 50, 100, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.GetTasksBatchSize, cfg.GetTasksReloadAt = tc.batch, tc.reloadAt
+			e, err := NewEngine(Options{Config: cfg, Store: newTestStore(), Logger: discardLogger()})
+			if tc.ok {
+				require.NoError(t, err)
+				e.Stop()
+				return
+			}
+			var inv *store.InvalidArgumentError
+			require.ErrorAs(t, err, &inv)
+		})
+	}
+}
