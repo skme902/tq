@@ -231,12 +231,11 @@ func (e *Engine) unloadTaskQueuePartitionByKey(
 }
 
 func (e *Engine) validatePriority(p store.Priority) error {
-	if p.PriorityKey < 0 || int(p.PriorityKey) > e.config.PriorityLevels {
-		return &store.InvalidArgumentError{
-			Msg: fmt.Sprintf("priority key %d out of range [0, %d]", p.PriorityKey, e.config.PriorityLevels),
-		}
+	// upstream common/priorities.Validate (applied by frontend on AddTask). Keys above
+	// PriorityLevels are accepted and clamped by clipPriority, as upstream (REVIEW L3).
+	if p.PriorityKey < 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("priority key %d must not be negative", p.PriorityKey)}
 	}
-	// upstream common/priorities.Validate (applied by frontend on AddTask).
 	if len(p.FairnessKey) > fairnessKeyMaxLength {
 		return &store.InvalidArgumentError{Msg: "fairness key length exceeds limit"}
 	}

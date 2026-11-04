@@ -224,8 +224,8 @@ func TestDefaultPriorityIsMiddleLevel(t *testing.T) {
 		require.Equal(t, want, string(d.Task.Payload))
 		require.NoError(t, d.Ack())
 	}
-	_, err := e.AddTask(context.Background(), q, taskqueue.Task{Priority: taskqueue.Priority{PriorityKey: 6}})
-	require.Error(t, err, "priority above PriorityLevels is rejected")
+	_, err := e.AddTask(context.Background(), q, taskqueue.Task{Priority: taskqueue.Priority{PriorityKey: -1}})
+	require.Error(t, err, "negative priority key is rejected (keys above PriorityLevels are clamped, see L3)")
 }
 
 // The 5s rule: a sync match is refused while the in-memory backlog has a task older than
