@@ -153,3 +153,33 @@ func TestAddErrorRetryPolicyCapped(t *testing.T) {
 		require.LessOrEqual(t, d, 10*time.Second, "attempt %d", i)
 	}
 }
+
+type mutableSource struct {
+	mu  sync.Mutex
+	cfg QueueConfig
+}
+
+func (s *mutableSource) QueueConfig(store.QueueKey) QueueConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
+}
+
+// L4: like upstream, the writer takes fairness weight overrides from the partition's
+// rateLimitManager, so writer weights and per-key rate limits use the same snapshot.
+func TestWriterOverridesComeFromRateLimitManager(t *testing.T) {
+	src := &mutableSource{cfg: QueueConfig{FairnessWeightOverrides: fairnessWeightOverrides{"a": 2}}}
+	e, err := NewEngine(Options{Config: DefaultConfig(), Store: newTestStore(), TimeSource: clock.NewRealTimeSource(),
+		Logger: discardLogger(), QueueConfigSource: src})
+	require.NoError(t, err)
+	t.Cleanup(e.Stop)
+	_, err = e.AddTask(context.Background(), portQueue, store.Task{Payload: []byte("x")})
+	require.NoError(t, err)
+	pm, err := e.getTaskQueuePartitionManager(context.Background(), portQueue, false)
+	require.NoError(t, err)
+
+	src.mu.Lock()
+	src.cfg = QueueConfig{FairnessWeightOverrides: fairnessWeightOverrides{"a": 5}} // no watcher notification
+	src.mu.Unlock()
+	require.Equal(t, pm.GetRateLimitManager().GetFairnessWeightOverrides(), pm.defaultQueue.GetFairnessWeightOverrides())
+}

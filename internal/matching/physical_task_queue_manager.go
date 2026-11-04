@@ -269,9 +269,8 @@ func (c *physicalTaskQueueManagerImpl) UserDataChanged() {
 	c.priMatcher.ReprocessAllTasks()
 }
 
+// GetFairnessWeightOverrides is upstream's (physical_task_queue_manager.go:876-878): the
+// rateLimitManager's snapshot, so writer weights match the per-key limiter (REVIEW L4).
 func (c *physicalTaskQueueManagerImpl) GetFairnessWeightOverrides() fairnessWeightOverrides {
-	if src := c.partitionMgr.engine.configSource; src != nil {
-		return src.QueueConfig(c.queue).FairnessWeightOverrides
-	}
-	return nil
+	return c.partitionMgr.GetRateLimitManager().GetFairnessWeightOverrides()
 }
