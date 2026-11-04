@@ -34,6 +34,7 @@ type (
 	// QueueConfig is per-queue runtime config.
 	QueueConfig = matching.QueueConfig
 	// QueueConfigSource supplies per-queue config (fairness weight overrides, rate limits).
+	// A loaded queue re-reads it only when notified through QueueConfigWatcher.
 	QueueConfigSource = matching.QueueConfigSource
 	// QueueConfigWatcher is optionally implemented by a QueueConfigSource to apply changes
 	// to loaded queues live.

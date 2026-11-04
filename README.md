@@ -139,7 +139,8 @@ Dispatch from the matcher is paced by upstream's GCRA-style limiter. A limit of 
   gets twice the rate. Up to `Config.FairnessKeyRateLimitCacheSize` keys (default 2000, LRU) are tracked. A throttled
   key is skipped and doesn't block other keys. Without a per-key limit, a throttled queue stalls as a whole.
 - **Live changes.** A `QueueConfigSource` that also implements `QueueConfigWatcher` (`MemoryQueueConfigSource` does)
-  applies rate changes to loaded queues immediately and re-evaluates waiting tasks. Other sources are read only at load.
+  applies rate and weight-override changes to loaded queues immediately and re-evaluates waiting tasks. Other sources
+  are read only when a queue loads (like upstream, writers use the queue's cached overrides).
 - **Tokens.** A matched task that isn't used (the Starter returned `ErrDropTask` or another error) gives its token
   back. Forwarded tasks are not counted twice.
 - **Upstream quirk (kept by default).** A new limit is installed only when the effective rate *changes*. A queue with
