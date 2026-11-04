@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	taskqueue "github.com/skme902/tq"
 	"github.com/skme902/tq/store/memstore"
 )
 
@@ -36,4 +37,13 @@ func TestPriorityKeyAboveLevelsIsClamped(t *testing.T) {
 	neg.Priority.PriorityKey = -1
 	_, err := e.AddTask(context.Background(), q, neg)
 	require.Error(t, err)
+}
+
+// L8: the default fairness counter params are returned by value; callers cannot change the
+// library's defaults.
+func TestDefaultCounterParamsImmutable(t *testing.T) {
+	p := taskqueue.DefaultCounterParams()
+	p.MapLimit = 1
+	require.Equal(t, 100, taskqueue.DefaultCounterParams().MapLimit)
+	require.Equal(t, taskqueue.DefaultCounterParams(), taskqueue.DefaultConfig().FairnessCounter)
 }

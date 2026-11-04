@@ -504,7 +504,7 @@ func (s *BacklogManagerTestSuite) testStandingBacklog(p standingBacklogParams) {
 	s.cfg.MaxTaskBatchSize = p.maxBatch
 	if p.hybridCounter {
 		s.counterFactory = func() counter.Counter {
-			return counter.NewHybridCounter(counter.DefaultCounterParams, rand2.NewPCG(rand2.Uint64(), rand2.Uint64()))
+			return counter.NewHybridCounter(counter.DefaultCounterParams(), rand2.NewPCG(rand2.Uint64(), rand2.Uint64()))
 		}
 	}
 

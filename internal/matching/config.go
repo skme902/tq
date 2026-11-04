@@ -47,7 +47,7 @@ type Config struct {
 	// FairnessPassDither spreads new keys' initial pass (false).
 	FairnessPassDither bool
 	// FairnessCounter configures the per-subqueue fairness pass counter (upstream
-	// matching.fairnessCounter, default counter.DefaultCounterParams): an exact map for up to
+	// matching.fairnessCounter, default counter.DefaultCounterParams()): an exact map for up to
 	// MapLimit (100) keys, then a count-min sketch (W=100, D=5, growth up to W=10000, shadow-row
 	// reseed every 250000 increments). The zero value means the default; a non-zero value is
 	// used as given (so e.g. Grow.Threshold=0 disables growth like upstream).
@@ -108,7 +108,7 @@ func DefaultConfig() Config {
 		BacklogTaskForwardTimeout:       time.Minute,
 		PriorityLevels:                  5,
 		FairnessPassDither:              false,
-		FairnessCounter:                 counter.DefaultCounterParams,
+		FairnessCounter:                 counter.DefaultCounterParams(),
 		RangeSize:                       100000,
 		DeliveryLeaseDuration:           time.Minute,
 

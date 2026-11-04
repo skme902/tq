@@ -27,21 +27,25 @@ type (
 
 var _ Counter = (*hybridCounter)(nil)
 
-var DefaultCounterParams = CounterParams{
-	MapLimit: 100,
-	CMS: CMSketchParams{
-		W: 100,
-		D: 5,
-		Grow: CMSGrowParams{
-			SkipRateDecay: 10_000,
-			Threshold:     0.35,
-			Ratio:         1.5,
-			MaxW:          10_000,
+// DefaultCounterParams returns upstream's fairness counter defaults (matching.fairnessCounter,
+// constants.go:1597). It returns a fresh value so callers cannot change the defaults.
+func DefaultCounterParams() CounterParams {
+	return CounterParams{
+		MapLimit: 100,
+		CMS: CMSketchParams{
+			W: 100,
+			D: 5,
+			Grow: CMSGrowParams{
+				SkipRateDecay: 10_000,
+				Threshold:     0.35,
+				Ratio:         1.5,
+				MaxW:          10_000,
+			},
+			Reseed: CMSReseedParams{
+				Interval: 250_000,
+			},
 		},
-		Reseed: CMSReseedParams{
-			Interval: 250_000,
-		},
-	},
+	}
 }
 
 func NewHybridCounter(params CounterParams, src rand.Source) *hybridCounter {

@@ -6,6 +6,9 @@
 // limiting (whole-queue and per-fairness-key next-ready-time limiters).
 //
 // See README.md for usage and docs/UPSTREAM_MAP.md for the upstream mapping.
+//
+// The package name is taskqueue while the module path ends in tq; import it as
+// taskqueue "github.com/skme902/tq". The name is kept for API stability.
 package taskqueue
 
 import (
@@ -87,14 +90,16 @@ var (
 	// ErrFairnessOverridesUpdateRejected is returned by
 	// MemoryQueueConfigSource.UpdateFairnessWeightOverrides when the merged map is too large.
 	ErrFairnessOverridesUpdateRejected = matching.ErrFairnessOverridesUpdateRejected
-	// DefaultCounterParams are upstream's fairness counter defaults.
-	DefaultCounterParams = counter.DefaultCounterParams
 	// NoopRouter never forwards.
 	NoopRouter = matching.NoopRouter
 )
 
 // New returns an Engine. Options.Store is required.
 func New(opts Options) (*Engine, error) { return matching.NewEngine(opts) }
+
+// DefaultCounterParams returns upstream's fairness counter defaults (Config.FairnessCounter).
+// It is a function, not a variable, so callers cannot change the library's defaults.
+func DefaultCounterParams() CounterParams { return counter.DefaultCounterParams() }
 
 // DefaultConfig returns upstream defaults.
 func DefaultConfig() Config { return matching.DefaultConfig() }

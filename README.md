@@ -13,6 +13,9 @@ queries/Nexus, sticky queues, hooks/poller scaling, describe; see the report's g
 
 ## Usage
 
+The package is named `taskqueue` (the module path ends in `tq`), so import it as
+`taskqueue "github.com/skme902/tq"`.
+
 ```go
 eng, _ := taskqueue.New(taskqueue.Options{Store: memstore.New()}) // Config zero values = upstream defaults
 defer eng.Stop()
@@ -20,7 +23,7 @@ defer eng.Stop()
 key := taskqueue.QueueKey{Namespace: "acme", Name: "emails"}
 syncMatched, err := eng.AddTask(ctx, key, taskqueue.Task{
 	Payload:  []byte("hello"),
-	Priority: taskqueue.Priority{PriorityKey: 1}, // 1 (highest) .. 5; 0 = default (3)
+	Priority: taskqueue.Priority{PriorityKey: 1}, // 1 (highest) .. 5; 0 = default (3); >5 runs as 5
 })
 
 d, err := eng.PollTask(ctx, key, taskqueue.PollOptions{Identity: "w1"}) // long-polls up to ~1m
@@ -114,7 +117,7 @@ eng.AddTask(ctx, key, taskqueue.Task{
   already in the backlog keep their pass (as upstream).
 - **Counter.** Pass state is tracked per priority subqueue by upstream's hybrid counter: an exact map up
   to 100 keys, then a count-min sketch (upstream parameters, random seed per counter). You can tune it with
-  `Config.FairnessCounter` (`DefaultCounterParams`). The top 100 keys are persisted as TopK in queue metadata
+  `Config.FairnessCounter` (`DefaultCounterParams()`). The top 100 keys are persisted as TopK in queue metadata
   at most once per `UpdateAckInterval` and restored on load, so a heavy key keeps its place after unload or
   reload. A key outside the TopK, or one whose counts weren't persisted since the last sync, restarts from
   the ack level. Upstream behaves the same way.
