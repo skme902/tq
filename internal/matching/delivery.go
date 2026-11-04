@@ -38,7 +38,11 @@ type Delivery struct {
 	deadline time.Time
 }
 
-func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) *Delivery {
+// newDelivery leases a matched task to a poller. It fails with ErrEngineStopped for a sync-matched
+// task once Stop has started re-spooling sync leases; the task is then finished with that error,
+// so the partition manager spools it (or AddTask reports the error) instead of handing out an
+// in-memory-only task that Stop would never re-spool (REVIEW M1).
+func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) (*Delivery, error) {
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
 	}
@@ -56,20 +60,32 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		if f := task.event.leaseFunc; f != nil {
 			f(task) // before the timer is armed, so expiry always follows the lease
 		}
+		pqm.outstandingLeases.Add(1)
+		d.arm(lease)
+		return d, nil
+	}
+
+	// Register the sync lease and arm its timer atomically with respect to Stop's snapshot.
+	e.syncLeasesLock.Lock()
+	if e.syncLeasesClosed {
+		e.syncLeasesLock.Unlock()
+		task.finish(taskFinishResult{err: ErrEngineStopped})
+		return nil, ErrEngineStopped
 	}
 	pqm.outstandingLeases.Add(1)
+	d.arm(lease)
+	e.syncLeases[d] = struct{}{}
+	e.syncLeasesLock.Unlock()
+	// The task is "started": let the AddTask caller return (upstream: finish after
+	// RecordTaskStarted succeeds).
+	task.finish(taskFinishResult{consumedToken: true})
+	return d, nil
+}
+
+func (d *Delivery) arm(lease time.Duration) {
 	d.mu.Lock()
-	d.timer = e.timeSource.AfterFunc(lease, d.expire)
+	d.timer = d.engine.timeSource.AfterFunc(lease, d.expire)
 	d.mu.Unlock()
-	if d.SyncMatched {
-		e.syncLeasesLock.Lock()
-		e.syncLeases[d] = struct{}{}
-		e.syncLeasesLock.Unlock()
-		// The task is "started": let the AddTask caller return (upstream: finish after
-		// RecordTaskStarted succeeds).
-		task.finish(taskFinishResult{consumedToken: true})
-	}
-	return d
 }
 
 // LeaseDeadline returns when the lease expires.

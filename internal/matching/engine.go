@@ -64,6 +64,13 @@ type Engine struct {
 
 	syncLeasesLock sync.Mutex
 	syncLeases     map[*Delivery]struct{}
+	// syncLeasesClosed is set by Stop (under syncLeasesLock) before it snapshots syncLeases; no
+	// sync-matched task is leased after that.
+	syncLeasesClosed bool
+
+	// testHookStopAfterSyncLeases, if set, runs in Stop after sync leases are re-spooled and
+	// before queues unload (tests only).
+	testHookStopAfterSyncLeases func()
 }
 
 // NewEngine validates options and returns an engine. Queues load lazily on first use.
@@ -117,6 +124,7 @@ func (e *Engine) Stop() {
 	// Sync-matched tasks only exist in memory while leased; write them back before unloading so a
 	// graceful shutdown does not lose them (library addition; backlog tasks are already durable).
 	e.syncLeasesLock.Lock()
+	e.syncLeasesClosed = true
 	leases := make([]*Delivery, 0, len(e.syncLeases))
 	for d := range e.syncLeases {
 		leases = append(leases, d)
@@ -128,6 +136,10 @@ func (e *Engine) Stop() {
 			d.release()
 			e.respoolSyncTaskLocked(d, true)
 		}
+	}
+
+	if e.testHookStopAfterSyncLeases != nil {
+		e.testHookStopAfterSyncLeases()
 	}
 
 	e.partitionsLock.Lock()
@@ -324,7 +336,7 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 				continue
 			}
 		}
-		return e.newDelivery(task, dbq, queue, opts.LeaseDuration), nil
+		return e.newDelivery(task, dbq, queue, opts.LeaseDuration)
 	}
 }
 
