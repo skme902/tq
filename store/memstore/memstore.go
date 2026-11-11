@@ -40,6 +40,8 @@ const (
 	OpGetQueueConfig        = "GetQueueConfig"
 	OpPutQueueConfig        = "PutQueueConfig"
 	OpListQueueConfigs      = "ListQueueConfigChanges"
+	OpListCurrentConfigs    = "ListCurrentQueueConfigs"
+	OpQueueConfigHistory    = "QueueConfigHistory"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -701,6 +703,24 @@ func (s *Store) ListQueueConfigChanges(ctx context.Context, afterSeq int64, limi
 	return out, nil
 }
 
+// ListCurrentQueueConfigs implements store.QueueConfigStore.
+func (s *Store) ListCurrentQueueConfigs(ctx context.Context) ([]store.QueueConfigRecord, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpListCurrentConfigs); err != nil {
+		return nil, err
+	}
+	out := make([]store.QueueConfigRecord, 0, len(s.configCurrent))
+	for _, i := range s.configCurrent {
+		out = append(out, cloneConfigRecord(s.configHistory[i]))
+	}
+	slices.SortFunc(out, func(a, b store.QueueConfigRecord) int { return cmp.Compare(a.Seq, b.Seq) })
+	return out, nil
+}
+
 // QueueConfigHistory implements store.QueueConfigStore.
 func (s *Store) QueueConfigHistory(ctx context.Context, key store.QueueKey, limit int) ([]store.QueueConfigRecord, error) {
 	if err := ctxErr(ctx); err != nil {
@@ -711,6 +731,9 @@ func (s *Store) QueueConfigHistory(ctx context.Context, key store.QueueKey, limi
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.faultLocked(OpQueueConfigHistory); err != nil {
+		return nil, err
+	}
 	var out []store.QueueConfigRecord
 	for i := len(s.configHistory) - 1; i >= 0 && len(out) < limit; i-- {
 		if s.configHistory[i].Key == key {

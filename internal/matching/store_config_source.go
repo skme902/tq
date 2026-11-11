@@ -51,6 +51,8 @@ type QueueConfigVersion struct {
 	UpdatedBy  string
 	Reason     string
 	UpdateTime time.Time
+	// Err is set (and Config is zero) when this version's stored blob does not decode.
+	Err error
 }
 
 // StoreQueueConfigSource caches every queue's persisted config in memory, serves
@@ -95,7 +97,7 @@ func NewStoreQueueConfigSource(ctx context.Context, st store.QueueConfigStore, o
 		version: make(map[store.QueueKey]int64),
 		done:    make(chan struct{}),
 	}
-	if err := s.Refresh(ctx); err != nil {
+	if err := s.loadCurrent(ctx); err != nil {
 		return nil, err
 	}
 	pollCtx, cancel := context.WithCancel(context.Background())
@@ -179,6 +181,31 @@ func (s *StoreQueueConfigSource) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// loadCurrent installs every queue's current config and moves the feed position to the
+// newest of them, so startup reads one row per queue instead of the whole history (which the
+// library never trims); polling then reads only later changes.
+func (s *StoreQueueConfigSource) loadCurrent(ctx context.Context) error {
+	recs, err := s.st.ListCurrentQueueConfigs(ctx)
+	if err != nil {
+		return err
+	}
+	var seq int64
+	for _, r := range recs {
+		seq = max(seq, r.Seq)
+		cfg, err := decodeQueueConfig(r.Config)
+		if err != nil {
+			s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
+			s.opts.Logger.Error("ignoring undecodable queue config", "queue", r.Key.String(), "version", r.Version, "error", err)
+			continue
+		}
+		s.install(r.Key, r.Version, cfg)
+	}
+	s.mu.Lock()
+	s.seq = max(s.seq, seq)
+	s.mu.Unlock()
+	return nil
+}
+
 // install caches cfg as the queue's config if version is newer than the cached one, then
 // notifies watchers with no lock of this source held: a watcher may call back into the source
 // (QueueConfig, Update, Refresh), and one queue's notification does not block other queues.
@@ -212,10 +239,14 @@ func (s *StoreQueueConfigSource) Update(ctx context.Context, queue store.QueueKe
 		rec, err := s.st.GetQueueConfig(ctx, queue)
 		switch {
 		case err == nil:
-			if cur, err = decodeQueueConfig(rec.Config); err != nil {
-				return QueueConfig{}, err
-			}
 			curVersion = rec.Version
+			if cur, err = decodeQueueConfig(rec.Config); err != nil {
+				// Repairable through the API: mutate starts from defaults and the write
+				// replaces the bad blob (CAS on its version still applies).
+				s.opts.Logger.Warn("replacing undecodable queue config", "queue", queue.String(),
+					"version", rec.Version, "error", err)
+				cur = QueueConfig{}
+			}
 		case !store.IsNotFound(err):
 			return QueueConfig{}, err
 		}
@@ -267,12 +298,9 @@ func (s *StoreQueueConfigSource) History(ctx context.Context, queue store.QueueK
 	}
 	out := make([]QueueConfigVersion, 0, len(recs))
 	for _, r := range recs {
-		cfg, err := decodeQueueConfig(r.Config)
-		if err != nil {
-			return nil, err
-		}
+		cfg, err := decodeQueueConfig(r.Config) // one bad row does not hide the others
 		out = append(out, QueueConfigVersion{Queue: r.Key, Version: r.Version, Config: cfg,
-			UpdatedBy: r.UpdatedBy, Reason: r.Reason, UpdateTime: r.UpdateTime})
+			UpdatedBy: r.UpdatedBy, Reason: r.Reason, UpdateTime: r.UpdateTime, Err: err})
 	}
 	return out, nil
 }

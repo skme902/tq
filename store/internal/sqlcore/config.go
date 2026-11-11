@@ -16,7 +16,7 @@ import (
 var _ store.QueueConfigStore = (*Store)(nil)
 
 type configQueries struct {
-	get, lock, insertHistory, upsert, changes, history string
+	get, lock, insertHistory, upsert, changes, history, current string
 }
 
 const configCols = `namespace, name, partition, version, config, updated_by, reason, update_time`
@@ -35,6 +35,7 @@ func buildConfigQueries(d Dialect) configQueries {
 		changes: `SELECT ` + configCols + `, seq FROM tq_queue_config_history WHERE seq > ? ORDER BY seq LIMIT ?`,
 		history: `SELECT ` + configCols + `, seq FROM tq_queue_config_history WHERE ` + key +
 			` ORDER BY version DESC LIMIT ?`,
+		current: `SELECT ` + configCols + `, seq FROM tq_queue_config ORDER BY seq`,
 	}
 	if d.NumberedPlaceholders {
 		q.get, q.lock, q.insertHistory = rebind(q.get, 0), rebind(q.lock, 0), rebind(q.insertHistory, 0)
@@ -126,6 +127,11 @@ func (s *Store) queryConfigs(ctx context.Context, op, query string, args ...any)
 		return nil, s.wrap(op, err)
 	}
 	return out, nil
+}
+
+// ListCurrentQueueConfigs implements store.QueueConfigStore.
+func (s *Store) ListCurrentQueueConfigs(ctx context.Context) ([]store.QueueConfigRecord, error) {
+	return s.queryConfigs(ctx, "ListCurrentQueueConfigs", s.cq.current)
 }
 
 // ListQueueConfigChanges implements store.QueueConfigStore.

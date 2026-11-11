@@ -361,6 +361,11 @@ hist, _ := src.History(ctx, q, 20) // newest first: Version, Config, UpdatedBy, 
   (migration `0003_queue_config`). Writes are serialised (a transaction-scoped advisory lock on
   Postgres) so the change feed's sequence numbers are in commit order and a poll cannot skip one.
 - Metrics: `queue_config_updates`, `queue_config_refresh_failures` (no queue tags).
+- Startup loads one current row per queue (`ListCurrentQueueConfigs`), not the history, then
+  follows the change feed from the newest of those rows.
+- A stored version that does not decode is skipped by the cache (logged, counted in
+  `queue_config_refresh_failures`), reported per version in `History` (`QueueConfigVersion.Err`),
+  and replaced by the next `Update`, whose callback then starts from the default config.
 - The history is never trimmed by the library. Config rows are kept when a queue is deleted
   (`DeleteQueue`) or swept as idle, so a queue recreated under the same key keeps its pause and
   limits.

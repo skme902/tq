@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	taskqueue "github.com/skme902/tq"
+	"github.com/skme902/tq/store"
 	"github.com/skme902/tq/store/memstore"
 )
 
@@ -108,4 +109,67 @@ func TestUpdateValidatesPausedKeys(t *testing.T) {
 	require.Error(t, set(strings.Repeat("k", 65)), "too long")
 	require.NoError(t, set("b", "a", "b"))
 	require.Equal(t, []string{"a", "b"}, src.QueueConfig(q).PausedFairnessKeys, "sorted and deduplicated")
+}
+
+// feedCounter counts the change-feed rows a source reads.
+type feedCounter struct {
+	*memstore.Store
+	mu   sync.Mutex
+	rows int
+}
+
+func (f *feedCounter) ListQueueConfigChanges(ctx context.Context, after int64, limit int) ([]store.QueueConfigRecord, error) {
+	recs, err := f.Store.ListQueueConfigChanges(ctx, after, limit)
+	f.mu.Lock()
+	f.rows += len(recs)
+	f.mu.Unlock()
+	return recs, err
+}
+
+// A new source loads the current rows, not the whole history, and then reads only later
+// changes (review config r1 P1).
+func TestStartupReadsCurrentRowsNotHistory(t *testing.T) {
+	st := memstore.New()
+	ctx := context.Background()
+	a := manualStoreSource(t, st)
+	for i := range 30 {
+		_, err := a.Update(ctx, q, taskqueue.ConfigChange{Identity: "a"}, pause(i%2 == 0))
+		require.NoError(t, err)
+	}
+	fc := &feedCounter{Store: st}
+	b, err := taskqueue.NewStoreQueueConfigSource(ctx, fc, taskqueue.StoreQueueConfigSourceOptions{PollInterval: time.Hour})
+	require.NoError(t, err)
+	t.Cleanup(b.Close)
+	require.Equal(t, a.QueueConfig(q), b.QueueConfig(q))
+	require.Zero(t, fc.rows, "no history replay at startup")
+	_, err = a.Update(ctx, q, taskqueue.ConfigChange{Identity: "a"}, pause(true))
+	require.NoError(t, err)
+	require.NoError(t, b.Refresh(ctx))
+	require.True(t, b.QueueConfig(q).Paused)
+	require.Equal(t, 1, fc.rows, "only the later change")
+}
+
+// An undecodable stored version neither hides the other versions from History nor blocks
+// Update from replacing it (review config r1 P2).
+func TestUndecodableConfigRowRepairable(t *testing.T) {
+	st := memstore.New()
+	ctx := context.Background()
+	src := manualStoreSource(t, st)
+	_, err := src.Update(ctx, q, taskqueue.ConfigChange{Identity: "a"}, pause(true))
+	require.NoError(t, err)
+	_, err = st.PutQueueConfig(ctx, &store.PutQueueConfigRequest{Key: q, ExpectedVersion: 1,
+		Config: []byte("{bad"), UpdatedBy: "corrupt", UpdateTime: time.Now()})
+	require.NoError(t, err)
+	hist, err := src.History(ctx, q, 10)
+	require.NoError(t, err)
+	require.Len(t, hist, 2)
+	require.Error(t, hist[0].Err)
+	require.NoError(t, hist[1].Err)
+	require.True(t, hist[1].Config.Paused)
+	got, err := src.Update(ctx, q, taskqueue.ConfigChange{Identity: "fix"}, pause(false))
+	require.NoError(t, err)
+	require.False(t, got.Paused)
+	rec, err := st.GetQueueConfig(ctx, q)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, rec.Version)
 }

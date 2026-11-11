@@ -133,3 +133,25 @@ func testQueueConfigConcurrentPut(_ *testing.T, s *suite) {
 		s.True(found, "seq %d missing from the change feed", q)
 	}
 }
+
+// ListCurrentQueueConfigs returns one row per queue, at its current version and Seq.
+func testQueueConfigCurrent(_ *testing.T, s *suite) {
+	c := s.qcs()
+	a, b := s.key, s.key
+	b.Partition += 7
+	_, err := s.putConfig(c, a, 0, `{"a":1}`)
+	s.NoError(err)
+	rb, err := s.putConfig(c, b, 0, `{"b":1}`)
+	s.NoError(err)
+	ra, err := s.putConfig(c, a, 1, `{"a":2}`)
+	s.NoError(err)
+	cur, err := c.ListCurrentQueueConfigs(s.ctx)
+	s.NoError(err)
+	var mine []store.QueueConfigRecord
+	for _, r := range cur {
+		if r.Key == a || r.Key == b {
+			mine = append(mine, r)
+		}
+	}
+	s.Equal([]store.QueueConfigRecord{*rb, *ra}, mine, "current versions, in Seq order")
+}

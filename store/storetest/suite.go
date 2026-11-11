@@ -75,6 +75,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"Sweep_LevelOrder", testSweepLevelOrder},
 		{"Sweep_ExpiredTasks", testSweepExpiredTasks},
 		{"QueueConfig_Versions", testQueueConfigVersions},
+		{"QueueConfig_Current", testQueueConfigCurrent},
 		{"QueueConfig_ConcurrentPut", testQueueConfigConcurrentPut},
 	}
 	for _, tc := range tests {

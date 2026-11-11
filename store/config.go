@@ -43,6 +43,10 @@ type QueueConfigStore interface {
 	// ListQueueConfigChanges returns up to limit history entries with Seq > afterSeq in Seq
 	// order (all queues). A reader that remembers the last Seq it saw misses no write.
 	ListQueueConfigChanges(ctx context.Context, afterSeq int64, limit int) ([]QueueConfigRecord, error)
+	// ListCurrentQueueConfigs returns the current version of every queue's config, each with
+	// the Seq of that version. Writes are serialised in Seq order, so the highest Seq returned
+	// is a feed position that covers every write these rows reflect.
+	ListCurrentQueueConfigs(ctx context.Context) ([]QueueConfigRecord, error)
 	// QueueConfigHistory returns up to limit versions of one queue's config, newest first.
 	QueueConfigHistory(ctx context.Context, key QueueKey, limit int) ([]QueueConfigRecord, error)
 }
