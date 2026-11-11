@@ -31,6 +31,7 @@ type (
 		UnloadFromPartitionManager(cause unloadCause)
 		AddSpooledTask(task *internalTask) error
 		GetFairnessWeightOverrides() fairnessWeightOverrides
+		PausedFairnessKeys() map[string]struct{}
 	}
 
 	fairBacklogManagerImpl struct {

@@ -26,9 +26,11 @@ func (tr *fairTaskReader) maxDelayedInMemory() int {
 	return tr.backlogMgr.config.MaxDelayedInMemory
 }
 
-// effectiveLoadedLocked is loadedTasks plus the delayed tasks past maxDelayedInMemory.
+// effectiveLoadedLocked is the count the reader limits: loaded tasks, not counting "held" ones
+// (delayed tasks and loaded tasks of paused fairness keys, see pause_hold.go) up to
+// maxDelayedInMemory.
 func (tr *fairTaskReader) effectiveLoadedLocked() int {
-	return tr.loadedTasks + max(0, tr.delayedTasks-tr.maxDelayedInMemory())
+	return tr.loadedTasks - tr.pausedLoaded + max(0, tr.delayedTasks+tr.pausedLoaded-tr.maxDelayedInMemory())
 }
 
 // armDelayLocked starts the timer that makes a delayed task matchable at visibleAt. Arming and
@@ -57,7 +59,7 @@ func (tr *fairTaskReader) delayLocked(task *internalTask, visibleAt time.Time) b
 		return false
 	}
 	task.delayed = true
-	tr.loadedTasks--
+	tr.addLoadedLocked(task, -1)
 	tr.delayedTasks++
 	tr.armDelayLocked(task, visibleAt)
 	tr.backlogMgr.metricsHandler.Counter(metrics.TasksDelayed, 1)
@@ -140,7 +142,7 @@ func (tr *fairTaskReader) delayFired(task *internalTask, gen uint64) {
 		tr.lock.Unlock() // no longer tracked by this reader: a re-read owns the row
 		return
 	}
-	tr.loadedTasks++
+	tr.addLoadedLocked(task, 1)
 	// Reset the matcher state under the lock: a trim that runs once the lock is dropped then
 	// marks the task evicted, and the matcher refuses it. Resetting after the unlock (as
 	// addTaskToMatcher does) would wipe that eviction, and the trimmed row would be matched

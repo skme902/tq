@@ -11,6 +11,7 @@ package matching
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -68,6 +69,7 @@ func (s *MemoryQueueConfigSource) QueueConfig(queue store.QueueKey) QueueConfig 
 	if r, ok := s.nsRates[queue.Namespace]; ok {
 		cfg.AdminNamespaceDispatchRate = &r
 	}
+	cfg.PausedFairnessKeys = slices.Clone(cfg.PausedFairnessKeys) // the caller may keep or modify it
 	return cfg
 }
 
@@ -171,6 +173,57 @@ func (s *MemoryQueueConfigSource) SetMaxTaskAge(queue store.QueueKey, d *time.Du
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", *d)}
 	}
 	s.update(queue, func(cfg *QueueConfig) { cfg.MaxTaskAge = clonePtr(d) })
+	return nil
+}
+
+// SetPaused pauses or resumes dispatch from the queue (QueueConfig.Paused). Like the other
+// setters it applies to one partition key.
+func (s *MemoryQueueConfigSource) SetPaused(queue store.QueueKey, paused bool) {
+	s.mu.Lock()
+	cfg := s.cfgs[queue]
+	if cfg.Paused == paused {
+		s.mu.Unlock()
+		return // unchanged: no notification (it would reprocess every task in the matcher)
+	}
+	cfg.Paused = paused
+	s.cfgs[queue] = cfg
+	s.mu.Unlock()
+	s.notifyQueue(queue)
+}
+
+// SetFairnessKeyPaused pauses or resumes dispatch of one fairness key in the queue
+// (QueueConfig.PausedFairnessKeys). The key must be non-empty and at most 64 bytes, like a
+// fairness weight override key, and at most the override limit (default 1000) keys can be
+// paused per queue. A call that does not change the set does not notify watchers.
+func (s *MemoryQueueConfigSource) SetFairnessKeyPaused(queue store.QueueKey, key string, paused bool) error {
+	if key == "" {
+		return &store.InvalidArgumentError{Msg: "paused fairness key must not be empty"}
+	}
+	if len(key) > fairnessKeyMaxLength {
+		return &store.InvalidArgumentError{Msg: "fairness key length exceeds limit"}
+	}
+	s.mu.Lock()
+	cfg := s.cfgs[queue]
+	if slices.Contains(cfg.PausedFairnessKeys, key) == paused {
+		s.mu.Unlock()
+		return nil // unchanged
+	}
+	keys := slices.DeleteFunc(slices.Clone(cfg.PausedFairnessKeys), func(k string) bool { return k == key })
+	if paused {
+		if len(keys) >= s.maxOverrides {
+			s.mu.Unlock()
+			return &store.InvalidArgumentError{Msg: fmt.Sprintf("too many paused fairness keys: maximum %d", s.maxOverrides)}
+		}
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	if len(keys) == 0 {
+		keys = nil
+	}
+	cfg.PausedFairnessKeys = keys
+	s.cfgs[queue] = cfg
+	s.mu.Unlock()
+	s.notifyQueue(queue)
 	return nil
 }
 

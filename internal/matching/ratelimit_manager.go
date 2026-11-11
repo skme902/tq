@@ -19,6 +19,7 @@ package matching
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skme902/tq/clock"
@@ -88,8 +89,12 @@ type (
 		perKeyLimit     simpleLimiterParams
 		perKeyReady     *cache.LRU[string, simpleLimiter]
 		perKeyOverrides fairnessWeightOverrides // TODO(fairness): get this from config
-		cancels         []func()
-		stopped         bool // set by Stop; guarded by mu
+
+		// Deviation (pause, library addition): QueueConfig.Paused / PausedFairnessKeys,
+		// read lock-free by findMatch. pausedKeys is nil when no key is paused.
+		pause   atomic.Pointer[pauseSnapshot]
+		cancels []func()
+		stopped bool // set by Stop; guarded by mu
 	}
 )
 
@@ -163,7 +168,9 @@ func (r *rateLimitManager) Start(onChange func()) {
 	defer r.mu.Unlock()
 
 	// Overall system rate limit will be the min of the two configs that are partition wise times the number of partitons.
-	r.adminNsRate, r.adminTqRate = r.adminRates(r.queueConfig())
+	cfg := r.queueConfig()
+	r.adminNsRate, r.adminTqRate = r.adminRates(cfg)
+	r.setPause(cfg)
 	// Defaulting to 1 partition if misconfigured (upstream does this in setNumReadPartitions).
 	r.numReadPartitions = max(r.config.NumReadPartitions, 1)
 	if w, ok := r.configSource.(QueueConfigWatcher); ok && onChange != nil && !r.stopped {
@@ -284,6 +291,35 @@ func (r *rateLimitManager) trySetRPSFromUserDataLocked() {
 		r.fairnessKeyRateLimitDefault = &val
 	}
 	r.perKeyOverrides = config.FairnessWeightOverrides
+	r.setPause(config)
+}
+
+// pauseSnapshot is one immutable QueueConfig pause setting. It is published as a single
+// pointer, so a reader never sees the queue flag of one update with the key set of another.
+type pauseSnapshot struct {
+	paused bool
+	keys   map[string]struct{} // nil when no key is paused
+}
+
+// setPause caches the queue's pause settings (library addition).
+func (r *rateLimitManager) setPause(cfg QueueConfig) {
+	p := &pauseSnapshot{paused: cfg.Paused}
+	if len(cfg.PausedFairnessKeys) > 0 {
+		p.keys = make(map[string]struct{}, len(cfg.PausedFairnessKeys))
+		for _, k := range cfg.PausedFairnessKeys {
+			p.keys[k] = struct{}{}
+		}
+	}
+	r.pause.Store(p)
+}
+
+// pauseState reports whether the queue is paused and the paused fairness keys (nil if none),
+// from one snapshot.
+func (r *rateLimitManager) pauseState() (bool, map[string]struct{}) {
+	if p := r.pause.Load(); p != nil {
+		return p.paused, p.keys
+	}
+	return false, nil
 }
 
 // UpdateSimpleRateLimit updates the overall queue rate limits for the simpleRateLimiter implementation

@@ -62,11 +62,17 @@ type (
 		// MaxTaskAge overrides Config.MaxTaskAge for this queue (library addition). nil means
 		// the Config value; 0 means no cap.
 		MaxTaskAge *time.Duration
+		// Paused stops dispatch from this queue (library addition): AddTask still accepts
+		// tasks (they are spooled, never sync-matched) and polls wait as if it were empty.
+		Paused bool
+		// PausedFairnessKeys stops dispatch of tasks with these fairness keys only; other
+		// keys are dispatched as usual (library addition).
+		PausedFairnessKeys []string
 	}
 
 	// QueueConfigSource replaces userDataManager for per-queue config. A loaded queue reads
 	// QueueConfig once when it loads and again only when notified through QueueConfigWatcher:
-	// every field (rate limits, admin dispatch rates, fairness weight overrides) is cached in
+	// every field (rate limits, admin dispatch rates, fairness weight overrides, Paused, PausedFairnessKeys) is cached in
 	// the queue's rate limit manager. A source that changes values without implementing
 	// QueueConfigWatcher takes effect only after the queue unloads and reloads.
 	QueueConfigSource interface {
@@ -75,8 +81,8 @@ type (
 
 	// QueueConfigWatcher is optionally implemented by a QueueConfigSource to push changes
 	// (replaces userDataManager's onUserDataChanged and dynamic config Subscribe). A loaded
-	// queue re-reads its QueueConfig and re-applies rate limits and fairness weight overrides
-	// on every onChange call (upstream's onUserDataChanged).
+	// queue re-reads its QueueConfig and re-applies rate limits, fairness weight overrides and
+	// pause on every onChange call (upstream's onUserDataChanged).
 	QueueConfigWatcher interface {
 		WatchQueueConfig(queue store.QueueKey, onChange func()) (cancel func())
 	}

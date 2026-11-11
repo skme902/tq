@@ -473,6 +473,13 @@ func (d *matcherData) findMatch(allowForwarding bool, now int64) (matchedTask *i
 	// don't arm the rate-limit timer in cases where the full scan would have found nothing.
 	// TODO: reaching into the rate limiter's state like this breaks its encapsulation;
 	// refactor the rate limit logic so findMatch doesn't need to know about it.
+	// Deviation (pause, library addition): a paused queue matches nothing; resuming
+	// reprocesses all tasks (UserDataChanged), which rematches.
+	paused, pausedKeys := d.rateLimitManager.pauseState()
+	if paused {
+		return nil, nil, 0
+	}
+
 	wholeQueueReady, perKeyLimited := d.rateLimitManager.rateLimitState()
 	if !perKeyLimited && d.tasks.Len() > 0 && d.pollers.Len() > 0 {
 		if delay := wholeQueueReady.delay(now); delay > 0 {
@@ -480,7 +487,7 @@ func (d *matcherData) findMatch(allowForwarding bool, now int64) (matchedTask *i
 		}
 	}
 
-	d.tasks.tree.Scan(func(task *internalTask) bool {
+	visit := func(task *internalTask) bool {
 		// disallow normal poll forwarding when allowForwarding is false, but allow the
 		// "priority backlog poll forwarders".
 		if !allowForwarding && task.pollForwarderType == parentPollForwarder {
@@ -527,7 +534,23 @@ func (d *matcherData) findMatch(allowForwarding bool, now int64) (matchedTask *i
 
 		matchedTask, matchedPoller = task, matched
 		return false
-	})
+	}
+	// Deviation (pause): filter paused fairness keys in a wrapper so the common path (no paused
+	// keys) scans with the upstream visit closure unchanged. Checking pausedKeys inside visit
+	// cost about 12% memstore backlog throughput (BenchmarkEngine backlog-p64, n=10): the scan
+	// runs about 1260 visits per task under the matcher lock.
+	if pausedKeys == nil {
+		d.tasks.tree.Scan(visit)
+	} else {
+		d.tasks.tree.Scan(func(task *internalTask) bool {
+			if !task.isPollForwarder() {
+				if _, p := pausedKeys[task.getPriority().FairnessKey]; p {
+					return true // Deviation (pause): this fairness key is paused
+				}
+			}
+			return visit(task)
+		})
+	}
 	return
 }
 

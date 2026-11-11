@@ -148,6 +148,9 @@ const (
 	TasksDelayed         = "tasks_delayed"
 	DelayPersistFailures = "delay_persist_failures"
 
+	// QueuePaused is 1 while the queue is paused (QueueConfig.Paused), per queue.
+	QueuePaused = "queue_paused"
+
 	// Task admin (library-only), per queue.
 	TasksAdminDeleted = "tasks_admin_deleted"
 	QueuePurges       = "queue_purges"

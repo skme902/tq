@@ -93,7 +93,7 @@ func (tr *fairTaskReader) adminDeleteTask(ctx context.Context, tas store.TaskAdm
 				tr.undelayLocked(e.task)
 				e.task.adminRemove()
 			} else {
-				tr.loadedTasks--
+				tr.addLoadedLocked(e.task, -1)
 				e.task.adminRemove() // out of the matcher (a poll that already took it still delivers it)
 			}
 		}
@@ -165,7 +165,7 @@ func (tr *fairTaskReader) adminPurge(ctx context.Context) (leased []*internalTas
 			tr.undelayLocked(o.task)
 			o.task.adminRemove()
 		} else {
-			tr.loadedTasks--
+			tr.addLoadedLocked(o.task, -1)
 			o.task.adminRemove()
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,12 @@ import (
 )
 
 type taskQueuePartitionManagerImpl struct {
+	// Deviation (pause): cfgMu serialises config callbacks with Stop; stopped (under cfgMu)
+	// makes a callback that was already on its way when Stop began a no-op, so it cannot set
+	// queue_paused again or start reads on a stopping queue.
+	cfgMu   sync.Mutex
+	stopped bool
+
 	engine         *Engine
 	partition      store.QueueKey
 	config         *taskQueueConfig
@@ -66,6 +73,7 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 	pm.rateLimitManager.Start(pm.userDataChanged)
 	// initial user data load (upstream: userDataManager.Start -> onUserDataChanged)
 	pm.rateLimitManager.UserDataChanged()
+	pm.emitPausedGauge()
 	pm.defaultQueue.Start()
 	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 {
 		go pm.emitLogicalBacklogMetrics(pm.metricsCtx)
@@ -75,6 +83,10 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
 	pm.metricsCancel()
 	pm.rateLimitManager.Stop()
+	pm.cfgMu.Lock() // waits for an in-flight config callback
+	pm.stopped = true
+	pm.metricsHandler.Gauge(metrics.QueuePaused, 0) // an unloaded queue does not report paused
+	pm.cfgMu.Unlock()
 	pm.defaultQueue.Stop(unloadCause)
 	pm.emitZeroLogicalBacklog()
 }
@@ -125,9 +137,15 @@ func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog() {
 
 // userDataChanged is called on QueueConfigWatcher notifications.
 func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
+	pm.cfgMu.Lock()
+	defer pm.cfgMu.Unlock()
+	if pm.stopped {
+		return
+	}
 	pm.refreshQueueConfig()
 	// Update rateLimits if any change is userData.
 	pm.rateLimitManager.UserDataChanged()
+	pm.emitPausedGauge()
 	pm.defaultQueue.UserDataChanged()
 }
 
@@ -149,6 +167,16 @@ func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
 		}
 	}
 	pm.maxTaskAge.Store(int64(max(age, 0)))
+}
+
+// emitPausedGauge sets queue_paused from the cached pause state (what dispatch uses), after
+// each refresh of that cache, independent of refreshQueueConfig's early return.
+func (pm *taskQueuePartitionManagerImpl) emitPausedGauge() {
+	paused := 0.0
+	if p, _ := pm.rateLimitManager.pauseState(); p {
+		paused = 1
+	}
+	pm.metricsHandler.Gauge(metrics.QueuePaused, paused)
 }
 
 // refreshMaxAttempts is split out so that an ignored negative MaxAttempts does not also skip

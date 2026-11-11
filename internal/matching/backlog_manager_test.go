@@ -49,6 +49,7 @@ func (f *fakePQM) AddSpooledTask(t *internalTask) error {
 	return nil
 }
 func (f *fakePQM) GetFairnessWeightOverrides() fairnessWeightOverrides { return nil }
+func (f *fakePQM) PausedFairnessKeys() map[string]struct{}             { return nil }
 
 type BacklogManagerTestSuite struct {
 	suite.Suite

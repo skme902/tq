@@ -40,7 +40,7 @@ Reference points:
 | 2 | Task admin: peek and browse, delete one task, purge a queue — **done** (feat/ops-admin) | P0 | M |
 | 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
 | 4 | Retry backoff and delayed visibility on Nack — **done** (feat/ops-backoff) | P1 | M |
-| 5 | Pause and resume of a queue or a fairness key | P1 | M |
+| 5 | Pause and resume of a queue or a fairness key — **done** (feat/ops-pause) | P1 | M |
 | 6 | Shared, persisted runtime config with an audit trail | P1 | M–L |
 | 7 | Health and readiness checks — **done** (feat/ops-health) | P1 | S |
 | 8 | Retention and GC of idle queue rows and expired tasks — **done** (feat/ops-retention) | P1 | S–M |
@@ -205,7 +205,16 @@ policy and a timer wheel were not built):
   - Interaction with fairness: a delayed task keeps its pass. Document that it can come back "early" relative to
     newer tasks of the same key.
 
-## 5. Pause and resume a queue or a fairness key — P1, M
+## 5. Pause and resume a queue or a fairness key — P1, M — done
+
+**Status: implemented in feat/ops-pause** (README §Pause and resume): `QueueConfig.Paused`,
+`QueueConfig.PausedFairnessKeys`, `MemoryQueueConfigSource.SetPaused` / `SetFairnessKeyPaused`, DescribeQueue fields
+and the `queue_paused` gauge. Refinement: the hook is a check in `findMatch` rather than a never-admitting per-key
+limiter, so a paused key does not consume or distort the per-key limiter cache and resume is immediate. Persisting
+pause across processes comes with 6.
+
+Original analysis (superseded by the status above):
+
 
 - **Today.**
   - A queue rate limit ≤ 1e-9 never dispatches, so `SetQueueRateLimit(q, 0)` would pause a queue. But 0 is defined
