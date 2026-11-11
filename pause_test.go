@@ -2,6 +2,7 @@ package taskqueue_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,15 +37,22 @@ func TestPauseQueue(t *testing.T) {
 
 	got := make(chan *taskqueue.Delivery, 2)
 	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	defer wg.Wait() // after cancel (defers run last-in first-out), before the engine cleanup
 	defer cancel()
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for ctx.Err() == nil {
 			if d, err := e.PollTask(ctx, q, taskqueue.PollOptions{}); err == nil {
 				got <- d
 			}
 		}
 	}()
-	time.Sleep(100 * time.Millisecond)
+	require.Eventually(t, func() bool { // a poller is waiting before the add
+		desc, err := e.DescribeQueue(context.Background(), q)
+		return err == nil && desc.WaitingPollers > 0
+	}, 3*time.Second, time.Millisecond)
 	require.False(t, add(t, e, task("b")), "no sync match while paused")
 	select {
 	case <-got:

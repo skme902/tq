@@ -11,6 +11,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,12 @@ import (
 )
 
 type taskQueuePartitionManagerImpl struct {
+	// Deviation (pause): cfgMu serialises config callbacks with Stop; stopped (under cfgMu)
+	// makes a callback that was already on its way when Stop began a no-op, so it cannot set
+	// queue_paused again or start reads on a stopping queue.
+	cfgMu   sync.Mutex
+	stopped bool
+
 	engine         *Engine
 	partition      store.QueueKey
 	config         *taskQueueConfig
@@ -76,7 +83,10 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
 	pm.metricsCancel()
 	pm.rateLimitManager.Stop()
+	pm.cfgMu.Lock() // waits for an in-flight config callback
+	pm.stopped = true
 	pm.metricsHandler.Gauge(metrics.QueuePaused, 0) // an unloaded queue does not report paused
+	pm.cfgMu.Unlock()
 	pm.defaultQueue.Stop(unloadCause)
 	pm.emitZeroLogicalBacklog()
 }
@@ -127,6 +137,11 @@ func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog() {
 
 // userDataChanged is called on QueueConfigWatcher notifications.
 func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
+	pm.cfgMu.Lock()
+	defer pm.cfgMu.Unlock()
+	if pm.stopped {
+		return
+	}
 	pm.refreshQueueConfig()
 	// Update rateLimits if any change is userData.
 	pm.rateLimitManager.UserDataChanged()

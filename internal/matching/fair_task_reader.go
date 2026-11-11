@@ -49,6 +49,10 @@ type (
 		delayedTasks     int                            // == number of delayed entries in outstandingTasks (library addition)
 		// delayStopped is set when the queue stops: delay timers are stopped and no new one is armed.
 		delayStopped bool
+		// Deviation (pause): countedKeys is the paused-key set pausedLoaded counts against
+		// (refreshed by pauseChanged); pausedLoaded is the loaded tasks of those keys.
+		countedKeys  map[string]struct{}
+		pausedLoaded int
 		readLevel    fairLevel // == highest level in outstandingTasks, or if empty, the level we should read next
 		ackLevel     fairLevel // inclusive: task exactly at ackLevel _has_ been acked
 		atEnd        bool      // whether we believe outstandingTasks represents the entire queue right now
@@ -159,6 +163,7 @@ func newFairTaskReader(
 func (tr *fairTaskReader) Start() {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
+	tr.recountPausedLocked() // Deviation (pause): adopt the pause set at load
 	tr.maybeReadTasksLocked()
 }
 
@@ -260,7 +265,7 @@ func (tr *fairTaskReader) completeTaskLocked(task *internalTask) {
 	} else if task.delayed {
 		tr.undelayLocked(task)
 	} else {
-		tr.loadedTasks--
+		tr.addLoadedLocked(task, -1)
 		softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
 	}
 
@@ -284,7 +289,7 @@ func (tr *fairTaskReader) leaseTask(task *internalTask) {
 		softAssert(tr.logger, false, "leased task is not the loaded task")
 	default:
 		task.leased = true
-		tr.loadedTasks--
+		tr.addLoadedLocked(task, -1)
 		tr.leasedTasks++
 		softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
 		tr.maybeReadTasksLocked()
@@ -298,7 +303,7 @@ func (tr *fairTaskReader) unleaseLocked(task *internalTask) {
 	}
 	task.leased = false
 	tr.leasedTasks--
-	tr.loadedTasks++
+	tr.addLoadedLocked(task, 1)
 }
 
 func (tr *fairTaskReader) maybeReadTasksLocked() {
@@ -314,10 +319,14 @@ func (tr *fairTaskReader) maybeReadTasksLocked() {
 }
 
 func (tr *fairTaskReader) shouldReadMoreLocked() bool {
+	return tr.shouldReadMoreWith(tr.effectiveLoadedLocked())
+}
+
+func (tr *fairTaskReader) shouldReadMoreWith(loaded int) bool {
 	if tr.atEnd {
 		// If we have the whole backlog in memory, we don't need to read anything.
 		return false
-	} else if tr.effectiveLoadedLocked() > tr.backlogMgr.config.GetTasksReloadAt {
+	} else if loaded > tr.backlogMgr.config.GetTasksReloadAt {
 		// Too many loaded already. We'll get called again when loadedTasks drops.
 		return false
 	}
@@ -328,10 +337,12 @@ func (tr *fairTaskReader) readTasksImpl() {
 	var lastErr error
 	for {
 		tr.lock.Lock()
-		if lastErr != nil || !tr.shouldReadMoreLocked() {
+		// One sample of the count decides and sizes the read (it can change between calls).
+		loadedTasks := tr.effectiveLoadedLocked()
+		if lastErr != nil || !tr.shouldReadMoreWith(loadedTasks) {
 			break // with lock still held
 		}
-		readLevel, loadedTasks := tr.readLevel, tr.effectiveLoadedLocked()
+		readLevel := tr.readLevel
 		tr.lock.Unlock()
 
 		lastErr = tr.readTaskBatch(readLevel, loadedTasks)
@@ -603,13 +614,14 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	// batchSize, cut stays at maxFairLevel, meaning nothing is trimmed.
 	cut := outstandingTask{level: maxFairLevel}
 	loaded, delayed := 0, 0
+	pausedKeys := tr.countedKeys // the set pausedLoaded counts against
 	merged.Scan(func(o outstandingTask) bool {
 		if o.acked() || o.task.leased {
 			// Leased tasks don't count either: their slot is held by the lease holder.
 			return true
-		} else if o.task.delayed {
-			// Deviation (delay): up to maxDelayedInMemory delayed tasks don't count, so they
-			// don't block reading the ready tasks behind them.
+		} else if o.task.delayed || isPausedKeyTask(pausedKeys, o.task) {
+			// Deviation (delay, pause): up to maxDelayedInMemory held tasks (delayed, or of a
+			// paused key) don't count, so they don't block reading the ready tasks behind them.
 			if delayed++; delayed <= tr.maxDelayedInMemory() {
 				return true
 			}
@@ -648,7 +660,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			tr.armDelayLocked(task, task.event.Data.VisibleAt)
 			return true
 		}
-		tr.loadedTasks++
+		tr.addLoadedLocked(task, 1)
 		return false
 	})
 
@@ -671,7 +683,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			// removed (then setEvicted is a no-op); otherwise it's removed from the matcher.
 			// Lock order: task reader lock < matcher lock, so this is okay.
 			tr.backlogAge.record(o.task.event.Data.CreateTime, -1)
-			tr.loadedTasks--
+			tr.addLoadedLocked(o.task, -1)
 			o.task.setEvicted()
 		} else {
 			// An ack above the cut. Cache it so if we re-read the task we can skip it, rather

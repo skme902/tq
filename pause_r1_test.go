@@ -107,3 +107,69 @@ func TestSetFairnessKeyPausedValidation(t *testing.T) {
 	require.NoError(t, src.SetFairnessKeyPaused(q, "a", false))
 	require.Equal(t, []string{"b"}, src.QueueConfig(q).PausedFairnessKeys)
 }
+
+// A paused key with more loaded tasks than GetTasksReloadAt does not stop the reader: tasks of
+// other keys behind them are still read and delivered (review pause r1 P0).
+func TestPausedKeyDoesNotStallReader(t *testing.T) {
+	src := taskqueue.NewMemoryQueueConfigSource(0)
+	require.NoError(t, src.SetFairnessKeyPaused(q, "p", true))
+	e := newEngine(t, memstore.New(), func(c *taskqueue.Config) {
+		c.GetTasksBatchSize = 10
+		c.GetTasksReloadAt = 3
+	}, withConfigSource(src))
+	for range 40 {
+		for _, k := range []string{"p", "b"} {
+			tk := task(k)
+			tk.Priority = store.Priority{FairnessKey: k}
+			add(t, e, tk)
+		}
+	}
+	for range 40 {
+		d := pollFrom(t, e, q)
+		require.Equal(t, "b", string(d.Task.Payload))
+		require.NoError(t, d.Ack())
+	}
+	requireNoTask(t, e, q)
+	require.NoError(t, src.SetFairnessKeyPaused(q, "p", false))
+	for range 40 {
+		d := pollFrom(t, e, q)
+		require.Equal(t, "p", string(d.Task.Payload))
+		require.NoError(t, d.Ack())
+	}
+}
+
+// A lease handed out before the pause can still be acked while paused (review pause r1 P1).
+func TestLeaseAckWhilePaused(t *testing.T) {
+	src := taskqueue.NewMemoryQueueConfigSource(0)
+	e := newEngine(t, memstore.New(), nil, withConfigSource(src))
+	add(t, e, task("a"))
+	d := pollFrom(t, e, q)
+	src.SetPaused(q, true)
+	require.NoError(t, d.Ack())
+	requireNoTask(t, e, q)
+}
+
+// Pausing a key whose tasks fill the reader's window makes the reader load past them at once;
+// no other event would wake it (review pause r1 P0, the pause-change path).
+func TestPauseChangeWakesStoppedReader(t *testing.T) {
+	src := taskqueue.NewMemoryQueueConfigSource(0)
+	// A heavy key's tasks get small pass increments, so all of them sort before the other key's.
+	require.NoError(t, src.UpdateFairnessWeightOverrides(q, map[string]float32{"p": 1000}, nil))
+	e := newEngine(t, memstore.New(), func(c *taskqueue.Config) {
+		c.GetTasksBatchSize = 10
+		c.GetTasksReloadAt = 3
+	}, withConfigSource(src))
+	for _, k := range []string{"p", "b"} {
+		for range 20 {
+			tk := task(k)
+			tk.Priority = store.Priority{FairnessKey: k}
+			add(t, e, tk)
+		}
+	}
+	require.NoError(t, src.SetFairnessKeyPaused(q, "p", true))
+	for range 20 {
+		d := pollFrom(t, e, q)
+		require.Equal(t, "b", string(d.Task.Payload))
+		require.NoError(t, d.Ack())
+	}
+}

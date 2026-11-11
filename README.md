@@ -314,12 +314,22 @@ src.SetPaused(q, false)                   // resume: waiting pollers are matched
 
 - A paused queue still accepts `AddTask`: tasks are spooled (never sync-matched) and polls wait
   as if the queue were empty. Leases already handed out are unaffected.
-- A paused fairness key is skipped by the matcher; other keys keep their fairness order.
+- A paused fairness key is skipped by the matcher; other keys keep their fairness order. Its
+  loaded tasks stay in memory but do not count toward the read batch, so they do not stop the
+  reader from loading other keys' tasks behind them. They share `Config.MaxDelayedInMemory` with
+  delayed tasks: past that many held tasks per subqueue they count as loaded, which bounds
+  memory; ready tasks of other keys behind such a prefix then wait until the key resumes. Like delayed tasks, they hold the ack level, so acked rows behind them are not
+  garbage-collected until the key resumes.
 - Pause is part of `QueueConfig` (`Paused`, `PausedFairnessKeys`), so any `QueueConfigSource`
   can provide it. It applies per partition key, like the other `QueueConfig` settings. Like
   rate limits, a loaded queue picks up a change only through `QueueConfigWatcher` (see Rate
   limits); `MemoryQueueConfigSource` notifies. `SetFairnessKeyPaused` takes the same keys as
   fairness weight overrides (non-empty, at most 64 bytes), at most the override limit of them.
+- As in upstream, sync match is off while the oldest backlog task in the matcher is older than
+  `BacklogNegligibleAge` (5s), and a paused key's tasks count: a key paused with an old backlog
+  makes `AddTask` of other keys spool instead of sync-matching. They are still delivered, through
+  the backlog. (Upstream counts every backlog task in the matcher the same way, dispatchable or
+  not, such as a rate-limited key's.)
 - `DescribeQueue` reports `Paused` and `PausedFairnessKeys` (for a loaded queue, the state
   dispatch uses); gauge `queue_paused` (per queue, 0 once the queue unloads).
 

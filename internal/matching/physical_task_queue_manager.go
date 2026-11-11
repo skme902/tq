@@ -342,6 +342,13 @@ func getOrSetNewStats(m map[int32]*QueueStats, k int32) *QueueStats {
 // also what wakes a matcher whose rate-limit timer was armed under the old rate).
 func (c *physicalTaskQueueManagerImpl) UserDataChanged() {
 	c.priMatcher.ReprocessAllTasks()
+	c.backlogMgr.pauseChanged() // Deviation (pause): paused-key tasks no longer hold the reader
+}
+
+// PausedFairnessKeys is the paused fairness keys of the cached pause snapshot (nil if none).
+func (c *physicalTaskQueueManagerImpl) PausedFairnessKeys() map[string]struct{} {
+	_, keys := c.partitionMgr.GetRateLimitManager().pauseState()
+	return keys
 }
 
 // GetFairnessWeightOverrides is upstream's (physical_task_queue_manager.go:876-878): the
