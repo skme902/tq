@@ -68,8 +68,15 @@ func TestPeekTasks(t *testing.T) {
 	require.Equal(t, []string{"lo0", "lo1", "lo2", "lo3", "lo4", "hi1"},
 		peekPayloads(peekAll(t, e, taskqueue.PeekOptions{FairnessKey: "k", PageSize: 1})))
 
-	d := poll(t, e) // hi0: priority 1 first
-	require.Equal(t, "hi0", string(d.Task.Payload))
+	// hi0 is dispatched before the priority-5 tasks once the priority-1 subqueue's initial read
+	// has merged it; until then (an async window, as upstream) a poll can get a priority-5 task.
+	// Hold any such lease and poll again: at most the 5 priority-5 tasks.
+	d := poll(t, e)
+	for i := 0; string(d.Task.Payload) != "hi0"; i++ {
+		require.Less(t, i, 5, "hi0 never dispatched")
+		require.Equal(t, int32(5), d.Task.Priority.PriorityKey, "only the async window explains a non-hi0 first")
+		d = poll(t, e)
+	}
 	got := peekAll(t, e, taskqueue.PeekOptions{Priority: 1})
 	require.True(t, got[0].Leased)
 	require.False(t, got[1].Leased)

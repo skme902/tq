@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,14 +83,16 @@ func releaseFirstUnblock(t *testing.T, ch chan struct{}) {
 // failUpdate fails UpdateTask with err once, then delegates.
 type failUpdate struct {
 	*memstore.Store
-	err  error
-	once sync.Once
+	err   error
+	once  sync.Once
+	fired atomic.Bool // the injected failure was returned
 }
 
 func (f *failUpdate) UpdateTask(ctx context.Context, req *store.UpdateTaskRequest) error {
 	fail := false
 	f.once.Do(func() { fail = true })
 	if fail {
+		f.fired.Store(true)
 		return f.err
 	}
 	return f.Store.UpdateTask(ctx, req)
@@ -374,7 +377,14 @@ func TestAttemptFenceReturnsNoDelivery(t *testing.T) {
 	require.Len(t, before, 1)
 	require.Zero(t, before[0].Data.Attempts)
 
-	d, err := e.PollTask(context.Background(), q, taskqueue.PollOptions{NoWait: true})
+	// A waiting poll, not NoWait: right after add() loads the queue its initial backlog read
+	// can still be in flight, holding the new task back from the matcher, and a NoWait poll
+	// then returns ErrNoTasks without ever reaching the attempt write. This poll returns as
+	// soon as the fenced attempt write refuses the delivery; the timeout only bounds a bug.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	d, err := e.PollTask(ctx, q, taskqueue.PollOptions{})
+	require.True(t, st.fired.Load(), "the poll must reach the attempt write")
 	require.Nil(t, d)
 	require.ErrorIs(t, err, taskqueue.ErrNoTasks)
 	require.Empty(t, deadTasks(t, e))

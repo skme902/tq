@@ -358,6 +358,10 @@ func (e *Engine) DeleteTask(ctx context.Context, queue store.QueueKey, ref TaskR
 	return found, nil
 }
 
+// testHookPurgeBeforeDelete, if set, runs after PurgeQueue has purged each reader in memory
+// and before it persists and deletes the purged range. Tests only.
+var testHookPurgeBeforeDelete func(readers []*fairTaskReader)
+
 // PurgeQueue deletes every backlog task of a queue and returns how many rows it deleted. It
 // loads the queue on this Engine (taking it over from another owner, like AddTask). Each
 // priority level is purged up to its highest written task once no write is in flight there,
@@ -391,8 +395,12 @@ func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, err
 		}
 		leased = append(leased, l...)
 		bounds = append(bounds, b)
+		defer tr.releasePurgeHold()
 	}
 	e.endLeases(leased)
+	if testHookPurgeBeforeDelete != nil {
+		testHookPurgeBeforeDelete(readers[:len(bounds)])
+	}
 	if len(bounds) == 0 {
 		return 0, waitErr
 	}
