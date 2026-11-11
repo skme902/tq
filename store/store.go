@@ -261,6 +261,23 @@ type DeleteDeadTasksRequest struct {
 	DeadBefore time.Time
 }
 
+// DeleteTaskRequest deletes one backlog task, identified by its full key, under the rangeID
+// fence.
+type DeleteTaskRequest struct {
+	Key      QueueKey
+	RangeID  int64 // fence: *ConditionFailedError if the stored rangeID differs
+	Subqueue int
+	Pass     int64
+	ID       int64
+}
+
+// TaskAdminStore is implemented by stores that can delete a single backlog task (memstore,
+// sqlite and postgres do). Engine.DeleteTask needs it.
+type TaskAdminStore interface {
+	// DeleteTask deletes the task and reports whether it existed.
+	DeleteTask(ctx context.Context, req *DeleteTaskRequest) (bool, error)
+}
+
 // DeadLetterStore is implemented by stores that support max attempts and dead-lettering
 // (memstore, sqlite and postgres do). The dead-letter set belongs to the queue: DeleteQueue
 // removes it too. Dead-letter reads and deletes are not fenced, since no engine owns them.

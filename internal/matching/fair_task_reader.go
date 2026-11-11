@@ -62,6 +62,11 @@ type (
 		// by the number of outstanding leases; entries leave on Ack, Nack or expiry.
 		leasedEvicted map[fairLevel]*internalTask
 
+		// Deviation (task admin, library addition): levels deleted by Engine.DeleteTask. A read
+		// that fetched the row before the delete committed must not load it. Pruned once the ack
+		// level passes them; nil until the first delete.
+		adminDeleted map[fairLevel]struct{}
+
 		// Hold tasks written while a read is pending so we make sure to account for them in
 		// our read level.
 		newlyWrittenTasks []*store.TaskInfo
@@ -380,6 +385,9 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 // call with_out_ lock held
 func (tr *fairTaskReader) addTaskToMatcher(task *internalTask) {
 	task.resetMatcherState()
+	if task.adminDeleted.Load() {
+		return // Deviation (task admin): deleted or purged; see internalTask.adminRemove
+	}
 	err := tr.backlogMgr.addSpooledTask(task)
 	if err == nil {
 		return
@@ -425,6 +433,9 @@ func (tr *fairTaskReader) retryAddAfterError(task *internalTask) {
 	_ = backoff.ThrottleRetryContext(
 		tr.backlogMgr.tqCtx,
 		func(context.Context) error {
+			if task.adminDeleted.Load() {
+				return nil // Deviation (task admin)
+			}
 			if isTaskExpired(task.event.TaskInfo, tr.backlogMgr.timeSource.Now()) {
 				task.finish(taskFinishResult{})
 				return nil
@@ -512,6 +523,10 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 		} else if _, have := merged.GetHint(outstandingTask{level: level}, &hint); have {
 			// On a write/read race or a re-read of a range we may see a task we already have
 			// (loaded or acked). Ignore tasks we already track.
+			continue
+		} else if _, deleted := tr.adminDeleted[level]; deleted {
+			// Deviation (task admin): deleted by Engine.DeleteTask; the backlog count was
+			// already adjusted there.
 			continue
 		} else if leased, ok := tr.leasedEvicted[level]; ok {
 			// Deviation (delivery leases): a leased task we trimmed earlier. Reinstate its entry
@@ -696,6 +711,11 @@ func (tr *fairTaskReader) advanceAckLevelLocked() {
 	}
 
 	if numAcked > 0 {
+		for level := range tr.adminDeleted {
+			if !tr.ackLevel.less(level) {
+				delete(tr.adminDeleted, level)
+			}
+		}
 		tr.numToGC += int(numAcked)
 		tr.maybeGCLocked()
 

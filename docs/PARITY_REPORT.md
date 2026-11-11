@@ -303,6 +303,15 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     writes and keeps upstream's redelivery path. Fair order, the limiter, sync match vs backlog and fencing are
     unchanged; a dead-lettered task is finished like an ack, so the ack level advances past it as usual.
 
+27. **Task admin (feat/ops-admin).** `PeekTasks`, `DeleteTask` and `PurgeQueue` are library-only (upstream has
+    `tdbg taskqueue list-tasks` but no delete or purge). The reader gains `adminDeleted` levels that a racing read
+    skips, and a deleted task is flagged so `addTaskToMatcher` does not re-add it. Purge moves the ack level to the
+    max written level, which is safe for later writes because the writer's pass base is the ack level and task IDs
+    only grow. One upstream race is fixed on the way: a task evicted between `priTaskMatcher.AddTask`'s
+    `setRemoveFunc` and `EnqueueTaskNoWait` was still queued (its remove ran while it was not queued yet), so a
+    trimmed task could be delivered twice; `EnqueueTaskNoWait` now skips evicted tasks
+    (`TestEvictedBeforeEnqueueIsNotQueued`). `setEvicted` tolerates a task that was never added.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

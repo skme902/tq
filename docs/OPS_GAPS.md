@@ -37,7 +37,7 @@ Reference points:
 | # | Gap | Priority | Effort |
 |---|---|---|---|
 | 1 | Max attempts, poison tasks and a DLQ (with redrive) — **done** (feat/ops-dlq) | P0 | M–L |
-| 2 | Task admin: peek and browse, delete one task, purge a queue | P0 | M |
+| 2 | Task admin: peek and browse, delete one task, purge a queue — **done** (feat/ops-admin) | P0 | M |
 | 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
 | 4 | Retry backoff and delayed visibility on Nack | P1 | M |
 | 5 | Pause and resume of a queue or a fairness key | P1 | M |
@@ -95,7 +95,13 @@ takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count
   - Migration 0002.
   - Upstream reference: the history DLQ v2 API shape (read, purge, merge) for the admin verbs.
 
-## 2. Task admin: peek and browse, delete, purge — P0, M
+## 2. Task admin: peek and browse, delete, purge — P0, M — done
+
+**Status: implemented in feat/ops-admin** (README §Task admin). Refinements: `DeleteTask` takes a `TaskRef`
+(subqueue, pass, ID) from `PeekTasks`, so the store delete is a primary-key delete. Purge persists the new ack
+levels before deleting rows, so a failed delete never resurrects tasks (GC retries it). Fairness counters and TopK
+are not reset by a purge (they are approximate and age out).
+
 
 - **Today.**
   - `ListQueues` and `DescribeQueue` give counts and ages.

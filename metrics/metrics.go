@@ -142,6 +142,10 @@ const (
 	TasksRedriven             = "tasks_redriven"
 	TaskAttemptRecordFailures = "task_attempt_record_failures"
 
+	// Task admin (library-only), per queue.
+	TasksAdminDeleted = "tasks_admin_deleted"
+	QueuePurges       = "queue_purges"
+
 	// Engine-level (no queue tags), library-only.
 	// EngineDraining is 1 while Engine.Shutdown drains and 0 once it stops.
 	EngineDraining = "engine_draining"

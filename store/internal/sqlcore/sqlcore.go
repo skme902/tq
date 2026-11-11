@@ -741,3 +741,21 @@ func (s *Store) CountDeadTasks(ctx context.Context, key store.QueueKey) (int64, 
 	}
 	return n, nil
 }
+
+// DeleteTask deletes one backlog task under the rangeID fence.
+func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (bool, error) {
+	id, hash := queueIDAndHash(req.Key)
+	var n int64
+	err := s.txExecute(ctx, "DeleteTask", func(tx *sql.Tx) error {
+		if err := s.lockTaskQueue(ctx, tx, id, hash, req.RangeID); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, s.q.deleteTask, int64(hash), id, req.Subqueue, req.Pass, req.ID)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return n > 0, err
+}

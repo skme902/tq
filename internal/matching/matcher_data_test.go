@@ -892,3 +892,25 @@ func gosched(n int) {
 		runtime.Gosched()
 	}
 }
+
+// Deviation regression: a task evicted after priTaskMatcher.AddTask set its remove func but
+// before EnqueueTaskNoWait took the lock (its remove ran while it was not queued) must not be
+// queued, or it is delivered after the reader dropped it.
+func (s *MatcherDataSuite) TestEvictedBeforeEnqueueIsNotQueued() {
+	t := s.newBacklogTask(1, 0, func(*internalTask, taskResponse) {})
+	t.resetMatcherState()
+	s.True(t.setRemoveFunc(func() { s.md.RemoveTask(t) }))
+	t.setEvicted() // remove is a no-op: not queued yet
+	s.NoError(s.md.EnqueueTaskNoWait(t))
+	s.Zero(s.md.tasks.Len())
+	s.Nil(s.pollRealTime(10 * time.Millisecond).task)
+
+	// A task added before eviction is removed by it, as before.
+	t2 := s.newBacklogTask(2, 0, func(*internalTask, taskResponse) {})
+	t2.resetMatcherState()
+	s.True(t2.setRemoveFunc(func() { s.md.RemoveTask(t2) }))
+	s.NoError(s.md.EnqueueTaskNoWait(t2))
+	s.Equal(1, s.md.tasks.Len())
+	t2.setEvicted()
+	s.Zero(s.md.tasks.Len())
+}

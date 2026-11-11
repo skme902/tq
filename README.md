@@ -221,6 +221,36 @@ d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was 
   `tasks_redriven`, `task_attempt_record_failures`. There is no dead-letter gauge: poll
   `DescribeQueue().DeadTasks`, which is a `COUNT` query.
 
+## Task admin
+
+```go
+page, next, _ := e.PeekTasks(ctx, queue, taskqueue.PeekOptions{PageSize: 50, FairnessKey: "tenant-7"})
+for _, t := range page {
+	log.Print(t.Ref, t.Priority, t.Task.Attempts, t.Leased)
+}
+ok, _ := e.DeleteTask(ctx, queue, page[0].Ref) // one poison task
+n, _ := e.PurgeQueue(ctx, queue)               // the whole backlog
+```
+
+- `PeekTasks` pages the unacked backlog in dispatch order within each priority (subqueue by
+  subqueue). Filters: `Priority`, `FairnessKey` (applied while scanning, so a page can be short
+  with a `NextPageToken`). It reads the store only: it never loads the queue, takes it over or
+  bumps its rangeID. On the owning engine it also hides tasks acked but not yet deleted and sets
+  `Leased`.
+- `DeleteTask` and `PurgeQueue` change the backlog, so they run on the owner: they load the queue
+  on the calling engine, taking it over from another owner like `AddTask` does (the old owner's
+  next fenced write fails and it unloads). A queue that was never persisted gives
+  `*store.NotFoundError` and is not created.
+- `DeleteTask` takes the task out of memory and the matcher and deletes its row under the rangeID
+  fence. A lease on it ends: `Ack`/`Nack` return `ErrLeaseLost` and nothing is redelivered. A poll
+  that matched the task an instant before the delete still delivers it once. Needs a store that
+  implements `store.TaskAdminStore` (memstore, sqlite and postgres do).
+- `PurgeQueue` moves every subqueue's ack level to its highest written task, persists it, then
+  deletes the rows, and returns the count. Leases on purged tasks end like above. Tasks added
+  while it runs may or may not be purged; tasks added after it returns are kept. Dead tasks
+  (`PurgeDeadTasks`) and sync-matched leases are not touched.
+- Metrics, queue-tagged: `tasks_admin_deleted`, `queue_purges`.
+
 ## Observability
 
 ### Metrics
