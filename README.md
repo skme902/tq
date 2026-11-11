@@ -333,6 +333,46 @@ src.SetPaused(q, false)                   // resume: waiting pollers are matched
 - `DescribeQueue` reports `Paused` and `PausedFairnessKeys` (for a loaded queue, the state
   dispatch uses); gauge `queue_paused` (per queue, 0 once the queue unloads).
 
+## Persisted queue config
+
+```go
+src, err := taskqueue.NewStoreQueueConfigSource(ctx, st, taskqueue.StoreQueueConfigSourceOptions{}) // st: memstore, sqlite or postgres
+if err != nil {
+	return err
+}
+defer src.Close() // stops the poll goroutine; without Close it runs for the process lifetime
+opts.QueueConfigSource = src
+
+// Read-modify-write with an audit record; retried on a concurrent write by another process.
+src.Update(ctx, q, taskqueue.ConfigChange{Identity: "alice", Reason: "INC-42"}, func(c *taskqueue.QueueConfig) error {
+	c.Paused = true
+	return nil
+})
+hist, _ := src.History(ctx, q, 20) // newest first: Version, Config, UpdatedBy, Reason, UpdateTime
+```
+
+- Opt-in: `MemoryQueueConfigSource` remains the in-process source (tests, single process).
+- Every process on the same database sees the same config. A change applies to this process before
+  `Update` returns and to other processes on their next poll (`PollInterval`, default 5s); loaded queues
+  are notified through `QueueConfigWatcher` as with the memory source.
+- Each write is a new version (compare-and-set on the version, up to 10 attempts; `mutate` may run once per attempt, so it must depend only on the config it is given) and a history row.
+  The whole `QueueConfig` is validated before it is written: the memory source's setter rules
+  (rate limits, fairness weight overrides, paused fairness keys, MaxAttempts and MaxTaskAge
+  non-negative), and in addition admin dispatch rates must be non-negative (the memory source's
+  `SetAdmin*DispatchRate` setters accept any value).
+- Stored as JSON of `QueueConfig` (Go field names) in `tq_queue_config` / `tq_queue_config_history`
+  (migration `0003_queue_config`). Writes are serialised (a transaction-scoped advisory lock on
+  Postgres) so the change feed's sequence numbers are in commit order and a poll cannot skip one.
+- Metrics: `queue_config_updates`, `queue_config_refresh_failures` (no queue tags).
+- Startup loads one current row per queue (`ListCurrentQueueConfigs`), not the history, then
+  follows the change feed from the newest of those rows.
+- A stored version that does not decode is skipped by the cache (logged, counted in
+  `queue_config_refresh_failures`), reported per version in `History` (`QueueConfigVersion.Err`),
+  and replaced by the next `Update`, whose callback then starts from the default config.
+- The history is never trimmed by the library. Config rows are kept when a queue is deleted
+  (`DeleteQueue`) or swept as idle, so a queue recreated under the same key keeps its pause and
+  limits.
+
 ## Delays and retry backoff
 
 ```go

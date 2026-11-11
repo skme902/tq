@@ -56,6 +56,8 @@ var dialect = sqlcore.Dialect{
 	LockSuffix:           " FOR UPDATE",
 	// Arbitrary constant key: 0x74716d696772 ("tqmigr").
 	MigrationLockSQL: "SELECT pg_advisory_xact_lock(128030515750770)",
+	// Arbitrary constant key: 0x7471636667 ("tqcfg").
+	ConfigLockSQL: "SELECT pg_advisory_xact_lock(500118546023)",
 	// 7 bind params per row; Postgres allows 65535.
 	MaxRowsPerInsert: 1000,
 	RowRef:           "ctid",
