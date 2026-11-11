@@ -6,7 +6,7 @@
 // limiting (whole-queue and per-fairness-key next-ready-time limiters).
 //
 // Stop ends an engine immediately. Shutdown(ctx) drains outstanding leases and in-flight
-// polls, then stops.
+// polls, then stops; if ctx ends first it stops anyway and returns ctx's error.
 //
 // See README.md for usage and docs/UPSTREAM_MAP.md for the upstream mapping.
 //

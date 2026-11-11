@@ -130,7 +130,8 @@ are not reset by a purge (they are approximate and age out).
 
 **Status: implemented in feat/ops-drain** as `Engine.Shutdown(ctx)` / `Engine.Draining()` / `ErrEngineDraining`
 (README §Graceful shutdown). Refinement: there is no separate `Drain` that leaves the engine running; Shutdown
-drains then stops. Readiness is wired in with item 7.
+drains then stops. Readiness is not part of this item: a readiness check (item 7) should report not-ready while
+`Draining()` is true.
 
 Original analysis (superseded by the status above):
 
