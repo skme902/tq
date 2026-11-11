@@ -146,6 +146,7 @@ func newPhysicalTaskQueueManager(
 		pqMgr.onRateLimited,
 		pqMgr.MarkAlive,
 	)
+	pqMgr.priMatcher.data.draining = &e.draining
 	return pqMgr
 }
 
