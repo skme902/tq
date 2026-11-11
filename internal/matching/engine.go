@@ -67,20 +67,38 @@ type Engine struct {
 	partitions     map[store.QueueKey]*taskQueuePartitionManagerImpl
 	stopped        bool
 
-	// leases holds every outstanding Delivery (backlog and sync-matched). leasesClosed is set by
-	// Stop (under leasesLock) before it snapshots leases; no task is leased after that.
+	// leases holds every outstanding Delivery (backlog and sync-matched). leasesClosed is set
+	// under leasesLock when Shutdown decides the drain is over and when Stop snapshots leases;
+	// newDelivery refuses a lease after that.
 	leasesLock   sync.Mutex
 	leases       map[*Delivery]struct{}
 	leasesClosed bool
-	// leasesDrained is set by Shutdown and closed (under leasesLock) when leases becomes
-	// empty while it is set.
+	// leasesDrained is allocated by Shutdown and closed (under leasesLock) when no leases
+	// remain and no PollTask is in flight. newDelivery does not touch it.
 	leasesDrained chan struct{}
+	// activePolls counts PollTask calls that passed the draining fast-path and have not
+	// returned. Shutdown waits for it so a match cannot commit after the drain decision.
+	activePolls int
 
 	// draining is set by Shutdown; drainCtx is cancelled at the same time, which ends every
 	// waiting poll (library addition, see Shutdown).
 	draining    atomic.Bool
 	drainCtx    context.Context
 	drainCancel context.CancelFunc
+
+	// shutdownOnce single-flights the Stop that ends a drain. The caller that stops records
+	// shutdownErr (nil when the drain finished) and closes shutdownDone. shutdownClaimed is
+	// set before that Stop so a later Shutdown can tell a direct Stop (return nil) from an
+	// in-progress drain.
+	shutdownOnce    sync.Once
+	shutdownClaimed atomic.Bool
+	shutdownErr     error
+	shutdownDone    chan struct{}
+	// drainStart is when the first Shutdown began (UnixNano), for engine_drain_duration.
+	drainStart atomic.Int64
+	// stopDone is closed when Stop has finished respooling and unloading; a concurrent or
+	// later Stop, and a Shutdown that finds the engine stopped, wait on it.
+	stopDone chan struct{}
 
 	// queueTags holds the queues (namespace, name) granted a real taskqueue metrics tag,
 	// at most config.MetricsQueueTagLimit of them.
@@ -90,6 +108,11 @@ type Engine struct {
 	// testHookStopAfterSyncLeases, if set, runs in Stop after sync leases are re-spooled and
 	// before queues unload (tests only).
 	testHookStopAfterSyncLeases func()
+	// testHookBeforeDrainSelect, if set, runs in Shutdown after a wait is armed and before
+	// selecting on it (tests only).
+	testHookBeforeDrainSelect func()
+	// testHookBeforeRespool, if set, runs at the start of respoolSyncTaskLocked.
+	testHookBeforeRespool func(shuttingDown bool)
 }
 
 // NewEngine validates options and returns an engine. Queues load lazily on first use.
@@ -136,6 +159,8 @@ func NewEngine(opts Options) (*Engine, error) {
 		cancel:         cancel,
 		partitions:     make(map[store.QueueKey]*taskQueuePartitionManagerImpl),
 		leases:         make(map[*Delivery]struct{}),
+		shutdownDone:   make(chan struct{}),
+		stopDone:       make(chan struct{}),
 		queueTags:      make(map[[2]string]struct{}),
 	}, nil
 }
@@ -191,59 +216,153 @@ func (e *Engine) Config() Config { return e.config }
 // lifecycle and history retries). Draining means:
 //   - PollTask returns ErrEngineDraining, and polls already waiting return it at once, so no
 //     new leases are handed out and AddTask can no longer sync-match: it writes to the backlog.
-//   - AddTask, Ack, Nack and ExtendLease keep working. A nacked or expired lease goes back to
-//     its queue (backlog tasks) or is spooled (sync-matched tasks) as usual.
+//   - AddTask, Ack, Nack and ExtendLease keep working. A nacked or expired backlog lease goes
+//     back to the backlog; a nacked or expired sync-matched lease is spooled.
 //
-// Shutdown waits until every outstanding lease is settled or ctx is done, then calls Stop.
-// It returns nil after a clean drain, or ctx's error if leases were still outstanding; Stop
-// then ends those leases as it always does (backlog tasks are redelivered after the next load,
-// sync-matched ones are spooled). Calling it again, or concurrently, waits the same way; after
-// Stop it returns nil at once.
+// Shutdown waits until every outstanding lease is settled and every PollTask that passed the
+// draining check has returned, or until ctx is done, then calls Stop. It returns nil after a
+// finished drain, including when ctx is already done but nothing is left in flight, or ctx's
+// error if it gave up with work still in flight. Stop then ends any leases still outstanding
+// (backlog tasks are redelivered after the next load, sync-matched ones are spooled).
+// Concurrent callers share that result: the one that calls Stop records it, and the others
+// return the same error once the engine has stopped. A caller whose own ctx ends first is the
+// one that stops. Shutdown after a direct Stop returns nil.
 func (e *Engine) Shutdown(ctx context.Context) error {
-	e.partitionsLock.RLock()
-	stopped := e.stopped
-	e.partitionsLock.RUnlock()
-	if stopped {
-		return nil
+	if done, err := e.finishedShutdown(); done {
+		return err
 	}
-	start := e.timeSource.Now()
 	if !e.draining.Swap(true) {
+		e.drainStart.Store(e.timeSource.Now().UnixNano())
 		e.metricsHandler.Gauge(metrics.EngineDraining, 1)
 		e.logger.Info("draining", "leases", e.outstandingLeaseCount())
 	}
 	e.drainCancel()
 
-	var err error
-	for err == nil {
-		// A poll that matched just before the cancel can still lease its task (newDelivery
-		// then re-opens leasesDrained), so re-check after every wake-up.
+	remaining, err := e.waitDrain(ctx)
+	return e.completeShutdown(err, remaining)
+}
+
+// finishedShutdown reports the result of a Shutdown that has already stopped the engine.
+// A direct Stop, with no Shutdown in progress, reports nil. done is false when the caller
+// should run the drain.
+func (e *Engine) finishedShutdown() (bool, error) {
+	select {
+	case <-e.shutdownDone:
+		return true, e.shutdownErr
+	default:
+	}
+	e.partitionsLock.RLock()
+	stopped := e.stopped
+	e.partitionsLock.RUnlock()
+	if !stopped {
+		return false, nil
+	}
+	<-e.stopDone // a Stop in progress may still be respooling
+	if e.shutdownClaimed.Load() {
+		<-e.shutdownDone
+		return true, e.shutdownErr
+	}
+	select {
+	case <-e.shutdownDone:
+		return true, e.shutdownErr
+	default:
+		return true, nil // stopped by Stop, not by Shutdown
+	}
+}
+
+// waitDrain blocks until no lease and no in-flight poll remains, or ctx is done.
+// The lease count is sampled under leasesLock at that decision. A finished drain wins
+// over a done ctx. Leasing is closed before returning so newDelivery cannot admit a
+// lease in the window before Stop.
+func (e *Engine) waitDrain(ctx context.Context) (int, error) {
+	for {
 		e.leasesLock.Lock()
-		if len(e.leases) == 0 {
+		remaining := len(e.leases)
+		if remaining == 0 && e.activePolls == 0 {
+			e.leasesClosed = true
+			e.maybeWakeDrainLocked()
 			e.leasesLock.Unlock()
-			break
+			return 0, nil
 		}
+		if cerr := ctx.Err(); cerr != nil {
+			e.leasesClosed = true
+			e.leasesLock.Unlock()
+			return remaining, cerr
+		}
+		// Only this loop allocates the wake channel. A previous wake can be stale
+		// (a lease dropped while a poll was still in flight), so replace a closed one.
 		if e.leasesDrained == nil || isClosed(e.leasesDrained) {
 			e.leasesDrained = make(chan struct{})
 		}
 		drained := e.leasesDrained
 		e.leasesLock.Unlock()
+		if e.testHookBeforeDrainSelect != nil {
+			e.testHookBeforeDrainSelect()
+		}
 		select {
 		case <-drained:
 		case <-ctx.Done():
-			err = ctx.Err()
 		}
 	}
-	remaining := e.outstandingLeaseCount()
-	e.metricsHandler.Gauge(metrics.EngineDrainLeases, float64(remaining))
-	e.metricsHandler.Timer(metrics.EngineDrainDuration, e.timeSource.Since(start))
-	if err != nil {
-		e.logger.Warn("drain deadline reached; stopping with leases outstanding", "leases", remaining, "error", err)
-	} else {
-		e.logger.Info("drained")
+}
+
+// completeShutdown runs Stop once. The caller that stops records err and emits the drain
+// metrics; every other caller returns that same recorded result.
+func (e *Engine) completeShutdown(err error, remaining int) error {
+	ran := false
+	e.shutdownOnce.Do(func() {
+		ran = true
+		e.shutdownClaimed.Store(true)
+		e.shutdownErr = err
+		e.metricsHandler.Gauge(metrics.EngineDrainLeases, float64(remaining))
+		e.metricsHandler.Timer(metrics.EngineDrainDuration, e.timeSource.Since(time.Unix(0, e.drainStart.Load())))
+		if err != nil {
+			e.logger.Warn("drain gave up (context done); stopping with leases outstanding", "leases", remaining, "error", err)
+		} else {
+			e.logger.Info("drained")
+		}
+		e.Stop() // waits for a concurrent Stop to finish
+		e.metricsHandler.Gauge(metrics.EngineDraining, 0)
+		close(e.shutdownDone)
+	})
+	if ran {
+		return err
 	}
-	e.Stop()
-	e.metricsHandler.Gauge(metrics.EngineDraining, 0)
-	return err
+	<-e.shutdownDone
+	return e.shutdownErr
+}
+
+// maybeWakeDrainLocked closes leasesDrained when a drain is waiting and nothing is in
+// flight. Caller holds e.leasesLock.
+func (e *Engine) maybeWakeDrainLocked() {
+	if e.leasesDrained != nil && len(e.leases) == 0 && e.activePolls == 0 && !isClosed(e.leasesDrained) {
+		close(e.leasesDrained)
+	}
+}
+
+// beginPoll counts a PollTask that passed the draining fast-path. Once Shutdown has closed
+// leasing, the poll is refused and not counted.
+func (e *Engine) beginPoll() error {
+	e.leasesLock.Lock()
+	closed := e.leasesClosed
+	if !closed {
+		e.activePolls++
+	}
+	e.leasesLock.Unlock()
+	if !closed {
+		return nil
+	}
+	if err := e.drainingErr(); err != nil {
+		return err
+	}
+	return ErrEngineStopped
+}
+
+func (e *Engine) endPoll() {
+	e.leasesLock.Lock()
+	e.activePolls--
+	e.maybeWakeDrainLocked()
+	e.leasesLock.Unlock()
 }
 
 // drainingErr is ErrEngineDraining during a drain, ErrEngineStopped once it has stopped.
@@ -268,7 +387,8 @@ func isClosed(ch chan struct{}) bool {
 	}
 }
 
-// Draining reports whether Shutdown has started.
+// Draining reports whether Shutdown has started. It stays true after Shutdown has stopped the
+// engine (the engine_draining gauge goes back to 0 then); PollTask then reports ErrEngineStopped.
 func (e *Engine) Draining() bool { return e.draining.Load() }
 
 func (e *Engine) outstandingLeaseCount() int {
@@ -278,15 +398,20 @@ func (e *Engine) outstandingLeaseCount() int {
 }
 
 // Stop re-spools outstanding sync-matched leases, then unloads every queue. It does not wait
-// for consumers; see Shutdown for a graceful drain.
+// for consumers; see Shutdown for a graceful drain. It does wait for an Ack, Nack or expiry
+// already in progress to finish its side effect (an ack, a redelivery or a respool), so that
+// side effect is not cut off by the unload. A concurrent or later Stop returns once the first
+// has finished.
 func (e *Engine) Stop() {
 	e.partitionsLock.Lock()
 	if e.stopped {
 		e.partitionsLock.Unlock()
+		<-e.stopDone
 		return
 	}
 	e.stopped = true
 	e.partitionsLock.Unlock()
+	defer close(e.stopDone)
 
 	// End every outstanding lease (library addition). Sync-matched tasks only exist in memory
 	// while leased; write them back before unloading so a graceful shutdown does not lose them.
@@ -299,14 +424,23 @@ func (e *Engine) Stop() {
 		leases = append(leases, d)
 	}
 	e.leasesLock.Unlock()
+	var settling []*Delivery
 	for _, d := range leases {
+		// A lease Ack, Nack or expiry already settled may still be in the map: its side
+		// effect is running and release has not removed it yet. settleWith fails, so Stop
+		// must not finish or re-spool it a second time; it waits for release instead.
 		if d.settleWith(ErrEngineStopped) {
 			d.stopTimer()
-			d.release()
 			if d.SyncMatched {
 				e.respoolSyncTaskLocked(d, true)
 			}
+			d.release()
+		} else {
+			settling = append(settling, d)
 		}
+	}
+	for _, d := range settling {
+		<-d.released // bounded: a respool gives up after 30s
 	}
 
 	if e.testHookStopAfterSyncLeases != nil {
@@ -474,14 +608,26 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 	if err := e.drainingErr(); err != nil {
 		return nil, err
 	}
-	pm, err := e.getTaskQueuePartitionManager(ctx, queue, true)
-	if err != nil {
+	if err := e.beginPoll(); err != nil {
 		return nil, err
 	}
-	// Shutdown cancels drainCtx: end this poll (waiting or not) so it hands out no new lease.
+	defer e.endPoll()
+
+	// Link the drain cancel before partition load so a poll blocked there ends too.
+	// The caller's ctx is kept aside: a drain must not hide the error it would return.
+	callerCtx := ctx
 	ctx, cancelPoll := context.WithCancel(ctx)
 	defer cancelPoll()
 	defer context.AfterFunc(e.drainCtx, cancelPoll)()
+
+	pm, err := e.getTaskQueuePartitionManager(ctx, queue, true)
+	if err != nil {
+		// A load cut short by the drain (not by the caller) reports the drain.
+		if derr := e.drainingErr(); derr != nil && callerCtx.Err() == nil && ctx.Err() != nil {
+			return nil, derr
+		}
+		return nil, err
+	}
 	pollMetadata := &pollMetadata{identity: opts.Identity, maxTasksPerSecond: opts.MaxTasksPerSecond}
 	if opts.MinPriority > 0 || opts.NoWait {
 		pollMetadata.conditions = &pollConditions{MinPriority: opts.MinPriority, NoWait: opts.NoWait}
@@ -508,8 +654,12 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 	for {
 		task, dbq, err := pm.PollTask(ctx, pollMetadata)
 		if err != nil {
-			if derr := e.drainingErr(); derr != nil && errors.Is(err, ErrNoTasks) {
-				return nil, derr
+			// Waiting polls end as ErrNoTasks. During a drain that is ErrEngineDraining,
+			// unless the caller's own ctx is done: then return ErrNoTasks, as with no drain.
+			if errors.Is(err, ErrNoTasks) {
+				if derr := e.drainingErr(); derr != nil && callerCtx.Err() == nil {
+					return nil, derr
+				}
 			}
 			return nil, err
 		}
@@ -558,6 +708,9 @@ func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
 // respoolSyncTask spools a sync-matched task whose lease ended; a non-zero visibleAt delays
 // it (library addition, see delay.go).
 func (e *Engine) respoolSyncTask(d *Delivery, shuttingDown bool, visibleAt time.Time) {
+	if e.testHookBeforeRespool != nil {
+		e.testHookBeforeRespool(shuttingDown)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	op := func(ctx context.Context) error {

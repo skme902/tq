@@ -132,6 +132,7 @@ are not reset by a purge (they are approximate and age out).
 (README §Graceful shutdown). Refinement: there is no separate `Drain` that leaves the engine running; Shutdown
 drains then stops. Readiness is wired in with item 7.
 
+Original analysis (superseded by the status above):
 
 - **Today.**
   - `Engine.Stop` ends every lease immediately with `ErrEngineStopped`. It re-spools sync-matched tasks and leaves
