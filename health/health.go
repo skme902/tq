@@ -2,9 +2,9 @@
 //
 //	mux.Handle("/", health.Handler(engine, health.Options{}))
 //
-// GET /livez returns 200 while the engine is not stopped, else 503, without touching the
-// store. GET /readyz returns 200 when Engine.Health reports Ready, else 503, with the report as
-// JSON. A HEAD request gets the status only.
+// GET /livez returns 200 while the engine is not stopped, else 503, with {"live":bool} and
+// without touching the store. GET /readyz returns 200 when Engine.Health reports Ready, else 503, with the report as
+// JSON. A HEAD request gets the status only; other methods get 405.
 package health
 
 import (
@@ -53,12 +53,22 @@ func Handler(c Checker, opts Options) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		if !allowed(w, r) {
+			return
+		}
 		// Liveness does not touch the store: a store outage makes the engine unready, and
-		// restarting it would not help.
+		// restarting it would not help. The body carries liveness only.
 		live := c.Live()
-		write(w, r, live, taskqueue.HealthReport{Live: live})
+		status := http.StatusOK
+		if !live {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSON(w, r, status, liveReport{Live: live})
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !allowed(w, r) {
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), opts.Timeout)
 		defer cancel()
 		h := c.Health(ctx)
@@ -67,16 +77,34 @@ func Handler(c Checker, opts Options) http.Handler {
 	return mux
 }
 
-func write(w http.ResponseWriter, r *http.Request, ok bool, h taskqueue.HealthReport) {
-	status := http.StatusOK
-	if !ok {
-		status = http.StatusServiceUnavailable
+type liveReport struct {
+	Live bool `json:"live"`
+}
+
+// allowed admits GET and HEAD; anything else gets 405 without probing the engine.
+func allowed(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
 	}
+	w.Header().Set("Allow", "GET, HEAD")
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if r.Method == http.MethodHead {
 		return
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func write(w http.ResponseWriter, r *http.Request, ok bool, h taskqueue.HealthReport) {
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
 	}
 	rep := report{
 		Live: h.Live, Ready: h.Ready, Draining: h.Draining,
@@ -91,5 +119,5 @@ func write(w http.ResponseWriter, r *http.Request, ok bool, h taskqueue.HealthRe
 			LastError: p.LastError, At: p.At,
 		})
 	}
-	_ = json.NewEncoder(w).Encode(rep)
+	writeJSON(w, r, status, rep)
 }
