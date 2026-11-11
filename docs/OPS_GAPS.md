@@ -59,13 +59,30 @@ The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so b
 
 ## 1. Max attempts, poison tasks and a DLQ — P0, M–L — done
 
-**Status: implemented in feat/ops-dlq** (README §Dead letters). Refinements to the design below:
-`Attempts` lives in `store.Task` (the JSON blob, no column) and counts deliveries started, persisted with a
-fenced in-place `UpdateTask` on each backlog delivery when a limit is set, rather than a rewrite with a new ID
-(which would move the task in fair order). `Nack(NackReason(s))` records a string, not an error. `PurgeDeadTasks`
-takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count` gauge:
-`DescribeQueue().DeadTasks` reads the count.
+**Status: implemented in feat/ops-dlq** (README §Dead letters).
 
+What shipped:
+
+- `store.Task.Attempts` (in the task JSON, no column) counts deliveries started. `Delivery.Task.Attempts` is that
+  field. `AddTask` ignores a caller-supplied value and resets it to 0.
+- With `MaxAttempts > 0`, each backlog delivery does a fenced in-place `UpdateTask` (same id and pass, so fair
+  order does not move) before the lease timer is armed. A `ConditionFailed` on that write unloads the queue and
+  `PollTask` returns `ErrNoTasks` without a delivery; the backlog row is unchanged. Other write failures still
+  deliver the task.
+- `QueueConfig.MaxAttempts` overrides the engine default (`nil` = engine default, `0` = unlimited). A negative
+  override is ignored and the previous limit is kept.
+- Dead-lettering inserts into `tq_dead_tasks` and finishes the task like an ack. Ack-level GC deletes the backlog
+  row. A crash between the insert and the persisted ack level leaves the task both live and dead (at-least-once).
+- `Nack(NackReason(s))` records a string (`nack: s`), not an error. Reasons are `nack`, `lease_expired`, and
+  `attempts_exhausted`. A sync-matched last attempt is spooled and later dead-lettered as `attempts_exhausted`, so
+  that Nack reason is not kept.
+- `ListDeadTasks`, `DeleteDeadTasks`, `PurgeDeadTasks(queue, deadBefore)`, and `RedriveDeadTasks`. Redrive spools
+  onto the backlog (no sync match) and deletes dead rows only after that write commits. The count is rows
+  deleted. The call snapshots the highest dead task id and does not pick up tasks that die again during it.
+- Metrics: `tasks_dead_lettered{reason}`, `dead_letter_failures`, `tasks_redriven`, `task_attempt_record_failures`.
+  No `dlq_backlog_count` gauge: `DescribeQueue().DeadTasks` reads the count.
+
+### Original notes (superseded)
 
 - **Today.**
   - `Delivery.Nack`, lease expiry, and a Starter that returns a retryable error all redeliver the task. This is
@@ -102,6 +119,9 @@ takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count
 levels before deleting rows, so a failed delete never resurrects tasks (GC retries it). Fairness counters and TopK
 are not reset by a purge (they are approximate and age out).
 
+Original analysis (superseded by the status above). Two claims in it do not describe the implementation:
+there is no engine-level peek or delete (**superseded** — `PeekTasks`, `DeleteTask` and `PurgeQueue`), and
+purge resets TopK (**superseded** — a purge does not reset fairness counters or TopK).
 
 - **Today.**
   - `ListQueues` and `DescribeQueue` give counts and ages.
@@ -109,9 +129,11 @@ are not reset by a purge (they are approximate and age out).
   - `store.DeleteQueue` deletes a queue and all its tasks, but calling it under a loaded queue races the owner. No
     Engine method fences it.
   - There is no way to delete one bad task or purge a backlog without SQL.
+    **Superseded:** engine-level `PeekTasks`, `DeleteTask` and `PurgeQueue` (README §Task admin).
 - **Missing.** `PeekTasks` (read-only, paged, per subqueue/priority, optionally filtered by fairness key),
   `DeleteTask(queue, id)`, and `PurgeQueue(queue)`. Upstream has `tdbg taskqueue list-tasks`, SQS `PurgeQueue`,
   RabbitMQ get-messages and purge, and Asynq `Inspector.DeleteTask`.
+  **Superseded:** those engine methods exist.
 - **Design.**
   - **Peek.** It follows the same read-only path as `describeUnloaded`: `GetTasks` from the ack level with a page
     token of (subqueue, level). It never takes ownership, works on loaded and unloaded queues, and returns
@@ -121,7 +143,7 @@ are not reset by a purge (they are approximate and age out).
     - Delete: removes the task from the reader's loaded set if present, deletes the row conditioned on rangeID,
       and adjusts the backlog count.
     - Purge: `CompleteTasksLessThan(max level)` on every subqueue, sets the ack level to the max read level, and
-      resets the counts and TopK.
+      resets the counts and TopK. **Superseded:** purge does not reset the counts or TopK.
   - **Store.** Add `DeleteTask(queue, subqueue, level, rangeID)` to the store as a new optional interface with
     conformance tests.
   - **Leases.** In-flight leases on purged tasks become lost (`ErrLeaseLost` on Ack, harmless).

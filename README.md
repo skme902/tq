@@ -238,25 +238,51 @@ log.Print(d.Task.Attempts)                         // 1 on the first delivery
 d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was attempt 5
 ```
 
-- `Task.Attempts` counts deliveries started (`PollTask` returning the task). A delivery that ends
-  without `Ack` (Nack, lease expiry, `Stop`, a crash) used one. A `Starter` error does not count.
+- `Task.Attempts` counts once `PollTask` has returned a `Delivery`. A `PollTask` that returns an
+  error does not count. `Stop` during the attempt write rolls that write back, best effort. A
+  delivery that later ends without `Ack` (Nack, lease expiry, `Stop`, a crash) used one, because
+  `PollTask` already returned it. A `Starter` error returns no delivery, so it does not count.
   `AddTask` ignores the field.
-- With a limit, each backlog delivery writes its new count to the store before `PollTask`
-  returns (one extra fenced write per delivery), so a task that crashes its consumer is counted.
-- A Nack or expiry on the last attempt moves the task from the backlog to the dead-letter set in
-  one fenced write. A task matched with no attempts left (read back after a crash, or the limit
+- `Starter.Start` runs before the attempt write. If that write is fenced, `PollTask` returns
+  `ErrNoTasks` and no delivery, and `Start` has already run (at-least-once).
+- With a limit, each backlog delivery writes its new count to the store before the lease timer is
+  armed and before `PollTask` returns (one extra fenced write per delivery), so a task that crashes
+  its consumer is counted. Only a committed attempt write counts across restarts. A lost rangeID
+  fence on that write unloads the queue and `PollTask` returns `ErrNoTasks` with no delivery; the
+  backlog row is unchanged. Any other attempt-write failure still delivers the task, with the new
+  count only in memory.
+- A Nack or expiry on the last attempt inserts the task into the dead-letter set and finishes it
+  like an ack. The backlog row is removed later by ack-level GC, the same as an acked task. A crash
+  after the insert and before that ack level is persisted leaves the task both live and dead
+  (at-least-once). A task matched with no attempts left (read back after a crash, or the limit
   was lowered) is dead-lettered instead of delivered. A sync-matched task has no row to move: it
-  is spooled with its count and dead-lettered when next matched.
+  is spooled with its count and dead-lettered when next matched (`attempts_exhausted`).
 - If the dead-letter write fails the task is redelivered, never dropped
   (`dead_letter_failures`).
 - `DeadTask.Reason` is `nack` (or `nack: <NackReason>`), `lease_expired` or
-  `attempts_exhausted`.
+  `attempts_exhausted`. A sync-matched last attempt is spooled and later dead-lettered as
+  `attempts_exhausted`, so the Nack reason from that attempt is not kept.
+- A negative `QueueConfig.MaxAttempts` is ignored and the previous limit is kept (the engine
+  default on the first load). `0` is still unlimited. `nil` means the engine default.
 - Admin calls. `ListDeadTasks`, `DeleteDeadTasks`, `PurgeDeadTasks(queue, deadBefore)` (zero time =
   all) and `DescribeQueue().DeadTasks` read or write the store only: they do not load the queue,
   take it over, or bump its rangeID. `RedriveDeadTasks(queue, RedriveOptions{TaskIDs, Max})`
-  re-adds tasks as new ones (new ID, `Attempts` 0) through `AddTask`, so it loads the queue on the
-  calling engine, taking it over from another owner like any `AddTask`. It is at-least-once: a
-  dead entry is deleted after its task was added, so a failure in between can redrive it twice.
+  writes each task to the durable backlog (new ID, `Attempts` 0, original payload, priority and
+  create time) and never sync-matches, then deletes the dead row only after that write has
+  committed. It loads the queue on the calling engine, taking it over from another owner like any
+  `AddTask`. The returned count is the number of dead rows actually deleted; a delete error is
+  returned with the rows already deleted. The call snapshots the highest dead task id first, so a
+  task that dies again during the redrive is left for a later call. It is at-least-once: a crash
+  after the backlog write and before the delete can leave the task both live and dead. A redrive
+  during the window before ack-level GC removes the original backlog row can produce an
+  at-least-once duplicate after a reload: the original row and the redriven task are both live.
+  `RedriveDeadTasks` is serialized only within one engine process. Redrives from several processes
+  on one store are at-least-once. `Max` < 0 is an error; `0` means no cap.
+- Versus upstream, `MaxAttempts == 0` (the default) adds no writes and keeps the redelivery path:
+  fair order, the limiter, sync match versus backlog, and fencing match upstream. With
+  `MaxAttempts > 0` the poll path does one extra fenced write per backlog delivery, a sync-matched
+  last attempt is spooled and later dead-lettered as `attempts_exhausted`, and a lost fence on the
+  attempt write is reported as `ErrNoTasks`.
 - Needs a store that implements `store.DeadLetterStore` (memstore, sqlite and postgres do;
   migration `0002_dead_tasks`). With another store the limit is ignored (logged at start) and the
   admin calls fail with `*store.InvalidArgumentError`.
@@ -276,22 +302,38 @@ n, _ := e.PurgeQueue(ctx, queue)               // the whole backlog
 ```
 
 - `PeekTasks` pages the unacked backlog in dispatch order within each priority (subqueue by
-  subqueue). Filters: `Priority`, `FairnessKey` (applied while scanning, so a page can be short
-  with a `NextPageToken`). It reads the store only: it never loads the queue, takes it over or
-  bumps its rangeID. On the owning engine it also hides tasks acked but not yet deleted and sets
-  `Leased`.
+  subqueue). Filters: `Priority`, `FairnessKey` (applied while scanning). A `FairnessKey` filter
+  stops after 10 non-matching rows per returned slot, so a page can be short and still carry a
+  `NextPageToken`. Rows skipped because they are already acked, or because they are in the
+  dead-letter set, do not count against that budget. It reads the store only: it never loads the
+  queue, takes it over or bumps its rangeID. On the owning engine it also hides tasks acked but
+  not yet deleted and sets `Leased`. On any other engine, when the store implements
+  `store.DeadLetterStore`, it hides backlog rows whose IDs are in the dead-letter set. The store
+  has no lookup by ID, so each `PeekTasks` call pages the dead-letter set once in ID order, up to
+  the highest backlog ID it has read; a large dead-letter set makes a non-owner peek slower. That includes a dead-lettered task still sitting behind a lease,
+  whose ack level has not moved and whose backlog row ack-level GC has not deleted.
 - `DeleteTask` and `PurgeQueue` change the backlog, so they run on the owner: they load the queue
   on the calling engine, taking it over from another owner like `AddTask` does (the old owner's
   next fenced write fails and it unloads). A queue that was never persisted gives
   `*store.NotFoundError` and is not created.
 - `DeleteTask` takes the task out of memory and the matcher and deletes its row under the rangeID
   fence. A lease on it ends: `Ack`/`Nack` return `ErrLeaseLost` and nothing is redelivered. A poll
-  that matched the task an instant before the delete still delivers it once. Needs a store that
-  implements `store.TaskAdminStore` (memstore, sqlite and postgres do).
-- `PurgeQueue` moves every subqueue's ack level to its highest written task, persists it, then
-  deletes the rows, and returns the count. Leases on purged tasks end like above. Tasks added
-  while it runs may or may not be purged; tasks added after it returns are kept. Dead tasks
-  (`PurgeDeadTasks`) and sync-matched leases are not touched.
+  that matched the task an instant before the delete still delivers it once. `DeleteTask` returns
+  false for an already dead-lettered task and never touches the dead-letter copy (use
+  `PurgeDeadTasks`). Needs a store that implements `store.TaskAdminStore` (memstore, sqlite and
+  postgres do).
+- `PurgeQueue` waits, per priority level, until no write is in flight there, then moves that
+  level's ack level to its highest written task, persists it, and deletes the rows. Like SQS
+  `PurgeQueue`, a task whose `AddTask` returns while a purge is running may be purged, and
+  nothing is left below the new ack level. The purge is not atomic across priority levels: if
+  `ctx` ends while waiting on one level, the levels already purged stay purged and are
+  persisted, `PurgeQueue` returns their row count with the error, and later levels are
+  untouched. It returns how many rows that delete removed. The count can include
+  dead-lettered backlog rows that ack-level GC has not removed yet, so it can be higher than
+  `DescribeQueue`'s `ApproximateBacklogCount`. `DeadTasks` is unchanged; the dead-letter copies
+  stay until `PurgeDeadTasks`. Leases on purged tasks end like above. Tasks added after it returns
+  are kept. Sync-matched leases are not
+  in the backlog and are not affected.
 - Metrics, queue-tagged: `tasks_admin_deleted`, `queue_purges`.
 
 ## Observability
