@@ -346,7 +346,10 @@ res, err := engine.SweepIdleQueues(ctx, taskqueue.SweepOptions{
 
 - A queue is deleted only when it is not loaded on this Engine, its row was not written for
   `IdleFor`, it has no unexpired task above its ack level (expired tasks are deleted with the
-  queue, so an abandoned queue of expired tasks is reclaimed), and it has no dead tasks. The check and the
+  queue, so an abandoned queue of expired tasks is reclaimed), and it has no dead tasks. The
+  expiry check reads the rows above the ack level inside the delete transaction, so a huge
+  expired backlog holds SQLite's single writer while it runs. A queue whose task row cannot be
+  decoded is kept and listed in `SweepResult.Corrupt`. The check and the
   delete are one store transaction conditioned on the listed rangeID and the idle time
   (`store.QueueSweeper.DeleteQueueIfIdle`), so a queue another process loaded or wrote since
   the listing is kept. The sweep never loads or takes over a queue.

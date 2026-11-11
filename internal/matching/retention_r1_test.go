@@ -88,3 +88,34 @@ func TestSweepDeleteDoesNotBlockOtherLoads(t *testing.T) {
 	r := <-swept
 	require.Equal(t, []store.QueueKey{portQueue}, r.Deleted)
 }
+
+// A second sweep of a key that is already being deleted does not replace the reservation
+// (review retention r2 #3).
+func TestConcurrentSweepKeepsReservation(t *testing.T) {
+	st := &blockingSweepStore{Store: memstore.New(), entered: make(chan struct{}, 2), release: make(chan struct{})}
+	var once sync.Once
+	release := func() { once.Do(func() { close(st.release) }) }
+	t.Cleanup(release)
+	e := newR2Engine(t, st, nil, nil, nil)
+	ctx := context.Background()
+	first := make(chan error, 1)
+	go func() {
+		_, err := e.deleteIfIdle(ctx, st, portQueue, 1, time.Time{})
+		first <- err
+	}()
+	<-st.entered
+	e.partitionsLock.RLock()
+	ch := e.sweeping[portQueue]
+	e.partitionsLock.RUnlock()
+	ok, err := e.deleteIfIdle(ctx, st, portQueue, 1, time.Time{})
+	require.NoError(t, err)
+	require.False(t, ok, "second sweep of the same key backs off")
+	e.partitionsLock.RLock()
+	require.Equal(t, ch, e.sweeping[portQueue], "first sweep's reservation is intact")
+	e.partitionsLock.RUnlock()
+	release()
+	require.NoError(t, <-first)
+	e.partitionsLock.RLock()
+	require.Empty(t, e.sweeping)
+	e.partitionsLock.RUnlock()
+}

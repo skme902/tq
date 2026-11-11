@@ -6,6 +6,7 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -39,6 +40,9 @@ type SweepResult struct {
 	Scanned         int
 	Deleted         []store.QueueKey
 	DeadTasksPurged int
+	// Corrupt lists queues kept because a task row above the ack level could not be decoded
+	// (the store returned an InvalidArgumentError); the sweep logs each and goes on.
+	Corrupt []store.QueueKey
 }
 
 // SweepIdleQueues deletes queues that are idle and empty: not loaded on this Engine, row
@@ -103,6 +107,12 @@ func (e *Engine) SweepIdleQueues(ctx context.Context, opts SweepOptions) (SweepR
 				continue
 			}
 			deleted, err := e.deleteIfIdle(ctx, sweeper, q.Info.Key, q.RangeID, idleBefore)
+			var ia *store.InvalidArgumentError
+			if errors.As(err, &ia) {
+				e.logger.Warn("sweep kept a queue with an unreadable task row", "queue", q.Info.Key, "error", err)
+				res.Corrupt = append(res.Corrupt, q.Info.Key)
+				continue
+			}
 			if err != nil {
 				return res, err
 			}
@@ -133,6 +143,11 @@ func (e *Engine) deleteIfIdle(ctx context.Context, sw store.QueueSweeper, key st
 		e.partitionsLock.Unlock()
 		return false, nil
 	}
+	if _, busy := e.sweeping[key]; busy {
+		// Another SweepIdleQueues call is deleting it; that call reports the result.
+		e.partitionsLock.Unlock()
+		return false, nil
+	}
 	if e.sweeping == nil {
 		e.sweeping = make(map[store.QueueKey]chan struct{})
 	}
@@ -141,7 +156,7 @@ func (e *Engine) deleteIfIdle(ctx context.Context, sw store.QueueSweeper, key st
 	e.partitionsLock.Unlock()
 	defer func() {
 		e.partitionsLock.Lock()
-		delete(e.sweeping, key)
+		delete(e.sweeping, key) // ours: a second call for the key never replaces it
 		e.partitionsLock.Unlock()
 		close(done)
 	}()

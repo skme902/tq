@@ -524,11 +524,11 @@ func (e *Engine) getTaskQueuePartitionManager(
 
 	// If it gets here, write lock and check again in case a task queue is created between the two locks
 	e.partitionsLock.Lock()
-	if e.stopped {
-		e.partitionsLock.Unlock()
-		return nil, ErrEngineStopped
-	}
-	if ch, sweeping := e.sweeping[partition]; sweeping {
+	for {
+		ch, sweeping := e.sweeping[partition]
+		if !sweeping {
+			break
+		}
 		// SweepIdleQueues is deleting this queue's row: load it once that has finished.
 		e.partitionsLock.Unlock()
 		select {
@@ -536,7 +536,11 @@ func (e *Engine) getTaskQueuePartitionManager(
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		return e.getTaskQueuePartitionManager(ctx, partition, create)
+		e.partitionsLock.Lock()
+	}
+	if e.stopped {
+		e.partitionsLock.Unlock()
+		return nil, ErrEngineStopped
 	}
 	pm, ok = e.partitions[partition]
 	if ok {
