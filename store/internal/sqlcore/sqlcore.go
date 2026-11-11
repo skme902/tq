@@ -672,7 +672,11 @@ func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksReque
 			return nil, s.wrap("ListDeadTasks: scan", err)
 		}
 		if len(resp.Tasks) == req.PageSize {
-			resp.NextPageToken, _ = json.Marshal(resp.Tasks[len(resp.Tasks)-1].Task.ID)
+			tok, err := json.Marshal(resp.Tasks[len(resp.Tasks)-1].Task.ID)
+			if err != nil {
+				return nil, err
+			}
+			resp.NextPageToken = tok
 			break
 		}
 		if enc != DataEncoding {
@@ -691,6 +695,8 @@ func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksReque
 }
 
 // DeleteDeadTasks deletes by ID (TaskIDs non-nil) or by DeadBefore.
+// Every ID batch runs in one transaction. A later batch error rolls the earlier
+// batches back, and the deleted count is returned only after commit.
 func (s *Store) DeleteDeadTasks(ctx context.Context, req *store.DeleteDeadTasksRequest) (int, error) {
 	if req.TaskIDs == nil && req.DeadBefore.IsZero() {
 		return 0, &store.InvalidArgumentError{Msg: "DeleteDeadTasks: TaskIDs or DeadBefore is required"}
@@ -704,26 +710,36 @@ func (s *Store) DeleteDeadTasks(ctx context.Context, req *store.DeleteDeadTasksR
 		n, err := res.RowsAffected()
 		return int(n), s.wrap("DeleteDeadTasks", err)
 	}
-	total := 0
-	for start := 0; start < len(req.TaskIDs); start += s.d.MaxRowsPerInsert {
-		ids := req.TaskIDs[start:min(start+s.d.MaxRowsPerInsert, len(req.TaskIDs))]
-		q := `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND task_id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`
-		if s.d.NumberedPlaceholders {
-			q = rebind(q, 0)
+	if len(req.TaskIDs) == 0 {
+		return 0, nil
+	}
+	var total int
+	err := s.txExecute(ctx, "DeleteDeadTasks", func(tx *sql.Tx) error {
+		for start := 0; start < len(req.TaskIDs); start += s.d.MaxRowsPerInsert {
+			ids := req.TaskIDs[start:min(start+s.d.MaxRowsPerInsert, len(req.TaskIDs))]
+			q := `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND task_id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`
+			if s.d.NumberedPlaceholders {
+				q = rebind(q, 0)
+			}
+			args := make([]any, 0, 2+len(ids))
+			args = append(args, int64(hash), id)
+			for _, t := range ids {
+				args = append(args, t)
+			}
+			res, err := tx.ExecContext(ctx, q, args...)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			total += int(n)
 		}
-		args := []any{int64(hash), id}
-		for _, t := range ids {
-			args = append(args, t)
-		}
-		res, err := s.w.ExecContext(ctx, q, args...)
-		if err != nil {
-			return total, s.wrap("DeleteDeadTasks", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return total, s.wrap("DeleteDeadTasks", err)
-		}
-		total += int(n)
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return total, nil
 }

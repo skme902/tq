@@ -384,7 +384,11 @@ func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksReque
 	slices.Sort(ids)
 	for i, id := range ids {
 		if i == req.PageSize {
-			resp.NextPageToken, _ = json.Marshal(ids[i-1])
+			tok, err := json.Marshal(ids[i-1])
+			if err != nil {
+				return nil, err
+			}
+			resp.NextPageToken = tok
 			break
 		}
 		d := q.dead[id]
