@@ -198,6 +198,8 @@ func (pm *taskQueuePartitionManagerImpl) AddTask(
 		if spoolQueue == nil {
 			return false, errRemoteSyncMatchFailed
 		}
+		// Counted as added like every other add (TrySyncMatch does it there).
+		spoolQueue.incTaskTracker(spoolQueue.tasksAdded, priorityKey(syncMatchTask.getPriority().PriorityKey), 1)
 		err := spoolQueue.SpoolTask(taskInfo)
 		if err == nil {
 			pm.metricsHandler.Counter(metrics.TasksSpooled, 1)

@@ -917,7 +917,7 @@ func timeoutOn(parent context.Context, timeout time.Duration, ts clock.TimeSourc
 		return context.WithTimeout(parent, timeout)
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	timer := ts.AfterFunc(timeout, func() { cancel(context.DeadlineExceeded) })
+	timer := afterFunc(ts, timeout, func() { cancel(context.DeadlineExceeded) })
 	return ctx, func() {
 		timer.Stop()
 		cancel(context.Canceled)

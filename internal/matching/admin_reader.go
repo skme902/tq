@@ -176,6 +176,11 @@ func (tr *fairTaskReader) adminPurge(ctx context.Context) (leased []*internalTas
 			leased = append(leased, t)
 		}
 	}
+	for level := range tr.evictedDelays {
+		if !maxLevel.less(level) {
+			delete(tr.evictedDelays, level)
+		}
+	}
 	for {
 		l, ok := tr.evictedAcks.Min()
 		if !ok || maxLevel.less(l) {

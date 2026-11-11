@@ -187,16 +187,7 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 		// (after a failure) or skip it via evictedAcks (after success).
 		delete(tr.leasedEvicted, task.fairLevel())
 		if at := task.redeliverAt.Swap(0); at != 0 && err != nil && isTransientMatchError(err) {
-			if tr.evictedDelays == nil {
-				tr.evictedDelays = make(map[fairLevel]time.Time)
-			}
-			tr.evictedDelays[task.fairLevel()] = time.Unix(0, at)
-			for l := range tr.evictedDelays {
-				if len(tr.evictedDelays) <= evictedAcksCacheSize {
-					break
-				}
-				delete(tr.evictedDelays, l)
-			}
+			tr.recordEvictedDelayLocked(task.fairLevel(), time.Unix(0, at))
 		}
 		// Deviation: upstream relies on history to dedupe the re-read task. We remember the
 		// successful completion in evictedAcks so the re-read is skipped instead of redelivered.
@@ -594,8 +585,9 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			task.event.leaseFunc = tr.leaseTask
 			task.event.subqueue = tr.subqueue
 			tr.backlogMgr.setPriority(task)
-			if at, ok := tr.evictedDelays[level]; ok { // Deviation (delay): a trimmed lease's delay
-				delete(tr.evictedDelays, level)
+			// Deviation (delay): a trimmed task's in-memory delay. The entry is dropped once the
+			// task survives the cut below; an overflow task keeps it for the next read.
+			if at, ok := tr.evictedDelays[level]; ok {
 				if at.After(task.event.Data.VisibleAt) {
 					task.event.Data.VisibleAt = at
 				}
@@ -648,6 +640,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			merged.DeleteHint(outstandingTask{level: level}, &hint)
 			return true
 		}
+		delete(tr.evictedDelays, task.fairLevel())
 		tr.backlogAge.record(task.event.Data.CreateTime, 1)
 		if task.delayed {
 			// Deviation (delay): held until VisibleAt, not matched now.
@@ -672,10 +665,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			tr.leasedTasks--
 			tr.leasedEvicted[o.level] = o.task
 		} else if o.task != nil && o.task.delayed {
-			// Deviation (delay): a delayed task we're dropping; a re-read delays it again.
-			tr.backlogAge.record(o.task.event.Data.CreateTime, -1)
-			tr.undelayLocked(o.task)
-			o.task.setEvicted()
+			tr.evictDelayedLocked(o.task)
 		} else if o.task != nil {
 			// A loaded task we're dropping from memory. It may already have been matched and
 			// removed (then setEvicted is a no-op); otherwise it's removed from the matcher.
@@ -741,7 +731,7 @@ func (tr *fairTaskReader) retryReadAfter(duration time.Duration) {
 	defer tr.lock.Unlock()
 
 	if tr.backoffTimer == nil {
-		tr.backoffTimer = tr.backlogMgr.timeSource.AfterFunc(duration, func() {
+		tr.backoffTimer = afterFunc(tr.backlogMgr.timeSource, duration, func() {
 			tr.lock.Lock()
 			defer tr.lock.Unlock()
 			tr.backoffTimer = nil

@@ -293,7 +293,9 @@ d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was 
   fair order, the limiter, sync match versus backlog, and fencing match upstream. With
   `MaxAttempts > 0` the poll path does one extra fenced write per backlog delivery, a sync-matched
   last attempt is spooled and later dead-lettered as `attempts_exhausted`, and a lost fence on the
-  attempt write is reported as `ErrNoTasks`.
+  attempt write is reported as `ErrNoTasks`. Independently of `MaxAttempts`, a redelivery delay
+  (`NackDelay` or `RetryBackoff`) writes the row's `VisibleAt` with a fenced `UpdateTask`, which
+  also persists `Attempts` (see Delays and retry backoff).
 - Needs a store that implements `store.DeadLetterStore` (memstore, sqlite and postgres do;
   migration `0002_dead_tasks`). With another store the limit is ignored (logged at start) and the
   admin calls fail with `*store.InvalidArgumentError`.
@@ -326,7 +328,10 @@ cfg.RetryBackoff = taskqueue.RetryBackoff{Initial: time.Second, Max: 5 * time.Mi
   delay and dead-lettered when it is next matched, after `VisibleAt`.
 - A delayed task keeps its place in fairness order (its pass): when it becomes visible it can
   be delivered ahead of newer tasks of the same key. It also holds the ack level, so acked rows
-  behind it are not garbage-collected until it is delivered or deleted.
+  behind it are not garbage-collected until it is delivered or deleted. Expiry
+  (`MaxTaskAge`, `ExpireTime`) is checked when a task is read and when it is matched, not while
+  it waits: a task that expires while delayed holds the ack level until `VisibleAt`, and is then
+  dropped as expired.
 - Delayed tasks are held in memory by the queue's reader, each on a timer (the injected clock).
   Up to `Config.MaxDelayedInMemory` (default 10000) per subqueue do not count toward
   `GetTasksBatchSize`, so they do not hold back ready tasks behind them. Past that they count as

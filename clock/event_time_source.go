@@ -80,6 +80,14 @@ func (ts *EventTimeSource) AfterFunc(d time.Duration, f func()) Timer {
 	return timer
 }
 
+// AfterFuncAt is AfterFunc with an absolute deadline: unlike AfterFunc(deadline.Sub(Now())),
+// an Advance between reading the clock and arming cannot make the deadline late.
+func (ts *EventTimeSource) AfterFuncAt(deadline time.Time, f func()) Timer {
+	timer := &fakeTimer{timeSource: ts, deadline: deadline, callback: f}
+	ts.addTimer(timer)
+	return timer
+}
+
 // NewTimer creates a Timer that will send the current time on a channel after at least
 // duration d. It returns the channel and the Timer.
 func (ts *EventTimeSource) NewTimer(d time.Duration) (<-chan time.Time, Timer) {

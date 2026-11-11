@@ -223,7 +223,7 @@ func (c Config) validate() error {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("RetryBackoff needs non-negative durations and Multiplier 0 or >= 1, got %+v", b)}
 	}
 	if c.MaxDelayedInMemory < 0 {
-		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxDelayedInMemory must be non-negative (0 = default 10000), got %d", c.MaxDelayedInMemory)}
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxDelayedInMemory must be non-negative, got %d", c.MaxDelayedInMemory)}
 	}
 	if c.MaxTaskAge < 0 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", c.MaxTaskAge)}
