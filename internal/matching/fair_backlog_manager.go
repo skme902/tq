@@ -142,6 +142,12 @@ func isStoreProblem(err error) bool {
 
 func (c *fairBacklogManagerImpl) Stop() {
 	c.lastStoreErr.Store(nil) // an unloaded queue is not reported degraded
+	c.subqueueLock.Lock()
+	readers := slices.Clone(c.subqueues)
+	c.subqueueLock.Unlock()
+	for _, r := range readers {
+		r.stopDelayTimers()
+	}
 	// Maybe try to write one final update of ack level. Skip the update if we never
 	// initialized. Also skip if we're stopping due to lost ownership (the update will
 	// fail in that case). Ignore any errors. Don't bother with GC, the next reload will
