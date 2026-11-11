@@ -136,7 +136,7 @@ func buildQueries(d Dialect) queries {
 		deleteAllDead:    `DELETE FROM tq_dead_tasks WHERE ` + queueKey,
 		taskSubqueues:    `SELECT DISTINCT subqueue FROM tq_tasks WHERE ` + queueKey,
 		liveTaskExists:   `SELECT 1 FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?) LIMIT 1`,
-		liveTaskRows:     `SELECT data, data_encoding FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?)`,
+		liveTaskRows:     `SELECT pass, task_id, data, data_encoding FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?) ORDER BY pass, task_id`,
 		deadExists:       `SELECT 1 FROM tq_dead_tasks WHERE ` + queueKey + ` LIMIT 1`,
 	}
 	if d.RowRef != "" {
@@ -507,7 +507,8 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 }
 
 // unexpiredTaskAbove reports whether subqueue sq has a task above ack that has not expired at
-// now. A row that cannot be decoded counts as live: the sweep must not delete what it cannot read.
+// now, scanning in level order and stopping at the first unexpired row. A row that cannot be
+// decoded is an InvalidArgumentError: the queue is kept and the sweep reports why.
 func (s *Store) unexpiredTaskAbove(ctx context.Context, tx *sql.Tx, hash int64, id []byte, sq int, ack store.Level, now time.Time) (bool, error) {
 	rows, err := tx.QueryContext(ctx, s.q.liveTaskRows, hash, id, sq, ack.Pass, ack.ID)
 	if err != nil {
@@ -516,15 +517,20 @@ func (s *Store) unexpiredTaskAbove(ctx context.Context, tx *sql.Tx, hash int64, 
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			data []byte
-			enc  string
-			t    store.Task
+			pass, taskID int64
+			data         []byte
+			enc          string
+			t            store.Task
 		)
-		if err := rows.Scan(&data, &enc); err != nil {
+		if err := rows.Scan(&pass, &taskID, &data, &enc); err != nil {
 			return false, err
 		}
-		if enc != DataEncoding || json.Unmarshal(data, &t) != nil {
-			return true, nil
+		// A corrupt row keeps the queue, and says so instead of leaving it silently.
+		if enc != DataEncoding {
+			return false, &store.InvalidArgumentError{Msg: fmt.Sprintf("DeleteQueueIfIdle: task %d (pass %d): unsupported data_encoding %q", taskID, pass, enc)}
+		}
+		if err := json.Unmarshal(data, &t); err != nil {
+			return false, &store.InvalidArgumentError{Msg: fmt.Sprintf("DeleteQueueIfIdle: task %d (pass %d): decode: %v", taskID, pass, err)}
 		}
 		if !(t.ExpiryTime.Unix() > 0 && t.ExpiryTime.Before(now)) {
 			return true, nil

@@ -324,10 +324,13 @@ type DeleteQueueIfIdleRequest struct {
 // postgres do).
 type QueueSweeper interface {
 	// DeleteQueueIfIdle atomically deletes the queue row and its task rows if the stored
-	// rangeID equals req.RangeID, the row is idle per req.IdleBefore, no task row lies above its subqueue's FairAckLevel (rows at
-	// or below it are already acked and only wait for GC), and the queue has no dead tasks.
-	// It reports whether it deleted the queue; a missing queue, a rangeID mismatch or live
-	// work return (false, nil).
+	// rangeID equals req.RangeID, the row is idle per req.IdleBefore, no live task row lies
+	// above its subqueue's FairAckLevel (rows at or below it are already acked and only wait
+	// for GC; with req.Now set, an expired row is not live and is deleted with the queue), and
+	// the queue has no dead tasks. It reports whether it deleted the queue; a missing queue, a
+	// rangeID mismatch or live work return (false, nil). A task row that cannot be decoded
+	// while checking expiry returns an InvalidArgumentError naming it, and the queue is kept.
+	// The expiry check reads every row above the ack level inside the delete transaction.
 	DeleteQueueIfIdle(ctx context.Context, req *DeleteQueueIfIdleRequest) (bool, error)
 }
 

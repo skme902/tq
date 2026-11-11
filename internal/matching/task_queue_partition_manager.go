@@ -56,6 +56,8 @@ func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *t
 	pm.defaultQueue = newPhysicalTaskQueueManager(pm, partition)
 	// The engine default is the limit a negative QueueConfig override must not replace.
 	pm.maxAttempts.Store(config.MaxAttempts)
+	// Same for MaxTaskAge: a negative override on the first refresh keeps the engine default.
+	pm.maxTaskAge.Store(int64(max(config.MaxTaskAge, 0)))
 	return pm
 }
 

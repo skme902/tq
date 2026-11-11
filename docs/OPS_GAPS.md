@@ -262,8 +262,12 @@ lease flags were not built; see the status above.
 `store.QueueSweeper.DeleteQueueIfIdle`, `Config.MaxTaskAge`/`QueueConfig.MaxTaskAge`, and dead-task retention via
 `SweepOptions.DeadTaskRetention`. Refinements over the design below:
 - "Empty" means no unexpired task row above each subqueue's ack level (rows at or below it only await GC, and
-  expired rows go with the queue, as upstream's scavenger deletes expired tasks first), checked in the delete
-  transaction, rather than the approximate backlog count, which can stay stale after a crash.
+  expired rows go with the queue), checked in the delete transaction. Unlike upstream's scavenger, which deletes
+  expired tasks in id order even when a later unexpired task keeps the queue, expired rows are removed only when
+  every task above the ack level has expired and the queue itself is deleted; a mixed backlog keeps its expired rows
+  until the reader and ack GC reach them. The expiry check reads every row above the ack level inside the delete
+  transaction (on SQLite, the single writer), so sweeping a queue with a very large expired backlog holds writes
+  for that long. The check uses the rows, not the approximate backlog count, which can stay stale after a crash.
 - The delete is also conditioned on `LastUpdateTime < now - IdleFor` in the same transaction, and `IdleFor` must be
   at least 48h: a loaded queue rewrites its row only every 12h (48h tolerates a missed rewrite, as upstream's
   scavenger does), and a deleted-then-recreated queue restarts at
