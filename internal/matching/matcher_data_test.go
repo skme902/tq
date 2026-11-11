@@ -119,14 +119,6 @@ func (s *MatcherDataSuite) waitForPollers(n int) {
 	}, time.Second, time.Millisecond)
 }
 
-func (s *MatcherDataSuite) waitForTasks(n int) {
-	s.Eventually(func() bool {
-		s.md.lock.Lock()
-		defer s.md.lock.Unlock()
-		return s.md.tasks.Len() >= n
-	}, time.Second, time.Millisecond)
-}
-
 func (s *MatcherDataSuite) TestMatchBacklogTask() {
 	poller := &waitingPoller{startTime: s.now()}
 

@@ -436,11 +436,14 @@ func (s *Store) GetTasks(ctx context.Context, req *store.GetTasksRequest) (*stor
 		if err := rows.Scan(&t.Pass, &t.ID, &data, &enc); err != nil {
 			return nil, s.wrap("GetTasks: scan", err)
 		}
+		// A row that cannot be decoded is corrupt, not a store outage: report it as
+		// InvalidArgument naming the task (REVIEW L10). The reader keeps retrying the batch,
+		// as upstream does for a deserialization error, so the row is never skipped silently.
 		if enc != DataEncoding {
-			return nil, fmt.Errorf("task %d: unsupported data_encoding %q", t.ID, enc)
+			return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasks: task %d (pass %d): unsupported data_encoding %q", t.ID, t.Pass, enc)}
 		}
 		if err := json.Unmarshal(data, &t.Data); err != nil {
-			return nil, fmt.Errorf("task %d: decode: %w", t.ID, err)
+			return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasks: task %d (pass %d): decode: %v", t.ID, t.Pass, err)}
 		}
 		resp.Tasks = append(resp.Tasks, t)
 	}

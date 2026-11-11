@@ -1,7 +1,7 @@
 // Ported from temporalio/temporal v1.32.1 af08a5e5, service/matching/fair_task_reader.go
 // Changes: protos → store types; injected clock for GC/backoff timers; semaphore → channel;
-// versioning-related addSpooledTask error cases removed; finalGC (draining) removed; one
-// deviation in completeTask (marked inline).
+// versioning-related addSpooledTask error cases removed; finalGC (draining) removed; deviations
+// in completeTask and for delivery leases (leaseTask, leasedEvicted; marked inline).
 // Copyright (c) 2025 Temporal Technologies Inc. MIT License; see UPSTREAM_LICENSE and NOTICE.
 
 package matching
@@ -24,7 +24,9 @@ import (
 
 const concurrentAddRetries = 10 // pri_task_reader.go
 
-var addErrorRetryPolicy = backoff.Policy{Initial: 2 * time.Second, Expiration: backoff.NoInterval} // pri_task_reader.go
+// pri_task_reader.go: NewExponentialRetryPolicy(2s).WithExpirationInterval(NoInterval), which keeps
+// the constructor's 10s maximum interval.
+var addErrorRetryPolicy = backoff.Policy{Initial: 2 * time.Second, Max: 10 * time.Second, Expiration: backoff.NoInterval}
 
 type (
 	fairTaskReader struct {
@@ -42,7 +44,8 @@ type (
 
 		backlogAge       backlogAgeTracker
 		outstandingTasks *btree.BTreeG[outstandingTask] // level-ordered outstanding tasks and acks
-		loadedTasks      int                            // == number of loaded (unacked) entries in outstandingTasks
+		loadedTasks      int                            // == number of loaded (unacked, unleased) entries in outstandingTasks
+		leasedTasks      int                            // == number of leased entries in outstandingTasks
 		readLevel        fairLevel                      // == highest level in outstandingTasks, or if empty, the level we should read next
 		ackLevel         fairLevel                      // inclusive: task exactly at ackLevel _has_ been acked
 		atEnd            bool                           // whether we believe outstandingTasks represents the entire queue right now
@@ -52,6 +55,12 @@ type (
 		// helps avoid reprocessing tasks that we know were already acked but whose ack was
 		// evicted before it could be used to advance ackLevel.
 		evictedAcks btree.BTreeG[fairLevel]
+
+		// Deviation (delivery leases): leased tasks that a trim chopped from outstandingTasks.
+		// Upstream never trims a started task it still has to dedupe; here the lease holder still
+		// owns the task, so a re-read reinstates the entry instead of matching it again. Bounded
+		// by the number of outstanding leases; entries leave on Ack, Nack or expiry.
+		leasedEvicted map[fairLevel]*internalTask
 
 		// Hold tasks written while a read is pending so we make sure to account for them in
 		// our read level.
@@ -122,6 +131,7 @@ func newFairTaskReader(
 		readLevel:        initialAckLevel,
 		ackLevel:         initialAckLevel,
 		evictedAcks:      *btree.NewBTreeGOptions(fairLevel.less, btree.Options{NoLocks: true}),
+		leasedEvicted:    make(map[fairLevel]*internalTask),
 
 		// gc state
 		lastGCTime: backlogMgr.timeSource.Now(),
@@ -132,12 +142,6 @@ func (tr *fairTaskReader) Start() {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
 	tr.maybeReadTasksLocked()
-}
-
-func (tr *fairTaskReader) getOldestBacklogTime() time.Time {
-	tr.lock.Lock()
-	defer tr.lock.Unlock()
-	return tr.backlogAge.oldestTime()
 }
 
 func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
@@ -155,6 +159,9 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 	// duplicate when we try to RecordTaskStarted.
 	if entry, found := tr.outstandingTasks.Get(outstandingTask{level: task.fairLevel()}); !found {
 		tr.backlogMgr.metricsHandler.Counter(metrics.TaskCompletedMissing, 1)
+		// A leased task trimmed from memory: the lease is over, so a re-read may deliver it again
+		// (after a failure) or skip it via evictedAcks (after success).
+		delete(tr.leasedEvicted, task.fairLevel())
 		// Deviation: upstream relies on history to dedupe the re-read task. We remember the
 		// successful completion in evictedAcks so the re-read is skipped instead of redelivered.
 		if err == nil && tr.ackLevel.less(task.fairLevel()) {
@@ -177,6 +184,9 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 		return
 	}
 
+	// The lease (if any) is over: count the task as loaded again while it is re-matched or
+	// re-spooled.
+	tr.unleaseLocked(task)
 	tr.lock.Unlock()
 
 	// We can handle some transient errors by just putting the task back in the matcher to
@@ -208,11 +218,50 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 func (tr *fairTaskReader) completeTaskLocked(task *internalTask) {
 	tr.backlogAge.record(task.event.Data.CreateTime, -1)
 	tr.outstandingTasks.Set(outstandingTask{level: task.fairLevel()}) // replace loaded task with an ack
-	tr.loadedTasks--
-	softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
+	if task.leased {
+		task.leased = false
+		tr.leasedTasks--
+		softAssert(tr.logger, tr.leasedTasks >= 0, "leasedTasks went negative")
+	} else {
+		tr.loadedTasks--
+		softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
+	}
 
 	tr.advanceAckLevelLocked()
 	tr.maybeReadTasksLocked()
+}
+
+// leaseTask is called when a backlog task is handed out under a delivery lease (library
+// addition). The task stays in outstandingTasks, pinning the ack level, but no longer counts as
+// loaded, so held leases neither block reads nor shrink the read batch.
+func (tr *fairTaskReader) leaseTask(task *internalTask) {
+	tr.lock.Lock()
+	defer tr.lock.Unlock()
+	level := task.fairLevel()
+	entry, found := tr.outstandingTasks.Get(outstandingTask{level: level})
+	switch {
+	case !found:
+		// Trimmed between the match and the lease: remember it so a re-read skips it.
+		tr.leasedEvicted[level] = task
+	case entry.task != task || task.leased:
+		softAssert(tr.logger, false, "leased task is not the loaded task")
+	default:
+		task.leased = true
+		tr.loadedTasks--
+		tr.leasedTasks++
+		softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
+		tr.maybeReadTasksLocked()
+	}
+}
+
+// unleaseLocked turns a leased entry back into a loaded one (lease expired or nacked).
+func (tr *fairTaskReader) unleaseLocked(task *internalTask) {
+	if !task.leased {
+		return
+	}
+	task.leased = false
+	tr.leasedTasks--
+	tr.loadedTasks++
 }
 
 func (tr *fairTaskReader) maybeReadTasksLocked() {
@@ -283,6 +332,11 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 	readFrom := readLevel.max(fairLevel{pass: 1, id: 0}).inc()
 	res, err := tr.backlogMgr.db.GetFairTasks(tr.backlogMgr.tqCtx, tr.subqueue, readFrom, batchSize)
 	if err != nil {
+		var inv *store.InvalidArgumentError
+		if errors.As(err, &inv) {
+			// Most likely a corrupt row (REVIEW L10): it blocks this subqueue until repaired.
+			tr.logger.Error("backlog read failed on invalid data; retrying", "subqueue", tr.subqueue, "error", err)
+		}
 		// TODO: Should we ever stop retrying on db errors?
 		if tr.backlogMgr.signalIfFatal(err) || errors.Is(err, context.Canceled) {
 			// don't retry
@@ -438,7 +492,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	// re-read after their ack was evicted) go in as acks; the rest become loaded tasks. We create
 	// the internalTask now so the tree can order it by level, and remember the ones we created so
 	// we can drop any that don't survive the trim below.
-	var created []*internalTask
+	var created, reinstated []*internalTask
 	for _, t := range tasks {
 		level := fairLevelFromAllocatedTask(t)
 		if !tr.ackLevel.less(level) {
@@ -453,6 +507,12 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			// On a write/read race or a re-read of a range we may see a task we already have
 			// (loaded or acked). Ignore tasks we already track.
 			continue
+		} else if leased, ok := tr.leasedEvicted[level]; ok {
+			// Deviation (delivery leases): a leased task we trimmed earlier. Reinstate its entry
+			// so it pins the ack level again; its lease holder still owns it, so don't match it.
+			delete(tr.leasedEvicted, level)
+			merged.SetHint(outstandingTask{level: level, task: leased}, &hint)
+			reinstated = append(reinstated, leased)
 		} else if _, wasAcked := tr.evictedAcks.Delete(level); wasAcked {
 			// This task was already acked, but its ack was evicted from memory before it could
 			// advance the ack level, and now we've re-read it. Insert it as a pre-acked (nil) entry
@@ -464,6 +524,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			recordDroppedTask(tr.backlogMgr.metricsHandler, dropReasonExpiredRead)
 		} else {
 			task := newInternalTaskFromBacklog(t, tr.completeTask)
+			task.event.leaseFunc = tr.leaseTask
 			tr.backlogMgr.setPriority(task)
 			merged.SetHint(outstandingTask{level: level, task: task}, &hint)
 			created = append(created, task)
@@ -476,7 +537,8 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	cut := outstandingTask{level: maxFairLevel}
 	loaded := 0
 	merged.Scan(func(o outstandingTask) bool {
-		if o.acked() {
+		if o.acked() || o.task.leased {
+			// Leased tasks don't count either: their slot is held by the lease holder.
 			return true
 		} else if loaded++; loaded > batchSize {
 			cut = o
@@ -489,6 +551,16 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	// never added the overflow to the matcher, so we just drop them from the tree; only survivors
 	// are counted and returned to be matched. After we get to this point, each survivor must
 	// eventually call task.finish/finishForwarded, which calls tr.completeTask.
+	for _, task := range reinstated {
+		if level := task.fairLevel(); !level.less(cut.level) {
+			merged.DeleteHint(outstandingTask{level: level}, &hint)
+			tr.leasedEvicted[level] = task
+			continue
+		}
+		task.leased = true
+		tr.leasedTasks++
+		tr.backlogAge.record(task.event.Data.CreateTime, 1)
+	}
 	created = slices.DeleteFunc(created, func(task *internalTask) bool {
 		if level := task.fairLevel(); !level.less(cut.level) {
 			merged.DeleteHint(outstandingTask{level: level}, &hint)
@@ -504,7 +576,14 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	// When there's no cut, cut is maxFairLevel and this range is empty.
 	chopped := merged.DeleteRange(cut, outstandingTask{level: maxFairLevel}, nil)
 	chopped.Scan(func(o outstandingTask) bool {
-		if o.task != nil {
+		if o.task != nil && o.task.leased {
+			// A leased task above the cut: keep its lease, but drop it from memory like any other
+			// task. leasedEvicted keeps a re-read from matching it again.
+			tr.backlogAge.record(o.task.event.Data.CreateTime, -1)
+			o.task.leased = false
+			tr.leasedTasks--
+			tr.leasedEvicted[o.level] = o.task
+		} else if o.task != nil {
 			// A loaded task we're dropping from memory. It may already have been matched and
 			// removed (then setEvicted is a no-op); otherwise it's removed from the matcher.
 			// Lock order: task reader lock < matcher lock, so this is okay.
@@ -518,7 +597,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 		}
 		return true
 	})
-	softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
+	softAssert(tr.logger, tr.loadedTasks >= 0 && tr.leasedTasks >= 0, "loadedTasks or leasedTasks went negative")
 	// Trim the evicted-ack cache to max size by dropping the highest levels.
 	for tr.evictedAcks.Len() > evictedAcksCacheSize {
 		tr.evictedAcks.PopMax()
@@ -584,15 +663,6 @@ func (tr *fairTaskReader) getLoadedTasks() int {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
 	return tr.loadedTasks
-}
-
-// isDrained returns true if this subqueue has been fully drained:
-// - We've read to the end of the queue (atEnd is true)
-// - No tasks are loaded in memory
-func (tr *fairTaskReader) isDrained() bool {
-	tr.lock.Lock()
-	defer tr.lock.Unlock()
-	return tr.atEnd && tr.loadedTasks == 0
 }
 
 func (tr *fairTaskReader) ackLevelPinnedLocked() bool {
@@ -661,7 +731,8 @@ func (tr *fairTaskReader) getLevels() (readLevel, ackLevel fairLevel) {
 
 func (tr *fairTaskReader) knownCountLocked() int64 {
 	if tr.atEnd {
-		return int64(tr.loadedTasks)
+		// Leased tasks are still in the backlog until they are acked.
+		return int64(tr.loadedTasks + tr.leasedTasks)
 	}
 	return -1
 }

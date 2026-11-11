@@ -13,6 +13,9 @@ queries/Nexus, sticky queues, hooks/poller scaling, describe; see the report's g
 
 ## Usage
 
+The package is named `taskqueue` (the module path ends in `tq`), so import it as
+`taskqueue "github.com/skme902/tq"`.
+
 ```go
 eng, _ := taskqueue.New(taskqueue.Options{Store: memstore.New()}) // Config zero values = upstream defaults
 defer eng.Stop()
@@ -20,7 +23,7 @@ defer eng.Stop()
 key := taskqueue.QueueKey{Namespace: "acme", Name: "emails"}
 syncMatched, err := eng.AddTask(ctx, key, taskqueue.Task{
 	Payload:  []byte("hello"),
-	Priority: taskqueue.Priority{PriorityKey: 1}, // 1 (highest) .. 5; 0 = default (3)
+	Priority: taskqueue.Priority{PriorityKey: 1}, // 1 (highest) .. 5; 0 = default (3); >5 runs as 5
 })
 
 d, err := eng.PollTask(ctx, key, taskqueue.PollOptions{Identity: "w1"}) // long-polls up to ~1m
@@ -41,7 +44,10 @@ Semantics:
 - **Ordering.** Tasks are served by effective priority first, then by fairness pass within a priority (see
   Fairness). With no fairness keys, that is FIFO within a priority.
 - **At-least-once delivery.** If a lease expires or the task is nacked, it is redelivered. A sync-matched
-  task whose lease expires is written to the backlog. Duplicates are possible after a crash or a queue reload.
+  task whose lease expires is written to the backlog. While a lease is live, its task is not handed to another
+  poller. A task is delivered again after its lease ends without an Ack: on expiry, on Nack, or when the engine
+  stops or crashes, or the queue unloads, while the lease is held. So a consumer that is slower than its lease, or
+  that is cut off by a stop or crash, can see the task twice.
 - **Fencing.** Every write and delete is conditioned on the queue's rangeID. When the engine loses ownership,
   the queue unloads and the next call reloads it.
 - **Optional hooks** (`Options`):
@@ -114,7 +120,7 @@ eng.AddTask(ctx, key, taskqueue.Task{
   already in the backlog keep their pass (as upstream).
 - **Counter.** Pass state is tracked per priority subqueue by upstream's hybrid counter: an exact map up
   to 100 keys, then a count-min sketch (upstream parameters, random seed per counter). You can tune it with
-  `Config.FairnessCounter` (`DefaultCounterParams`). The top 100 keys are persisted as TopK in queue metadata
+  `Config.FairnessCounter` (`DefaultCounterParams()`). The top 100 keys are persisted as TopK in queue metadata
   at most once per `UpdateAckInterval` and restored on load, so a heavy key keeps its place after unload or
   reload. A key outside the TopK, or one whose counts weren't persisted since the last sync, restarts from
   the ack level. Upstream behaves the same way.
@@ -139,7 +145,8 @@ Dispatch from the matcher is paced by upstream's GCRA-style limiter. A limit of 
   gets twice the rate. Up to `Config.FairnessKeyRateLimitCacheSize` keys (default 2000, LRU) are tracked. A throttled
   key is skipped and doesn't block other keys. Without a per-key limit, a throttled queue stalls as a whole.
 - **Live changes.** A `QueueConfigSource` that also implements `QueueConfigWatcher` (`MemoryQueueConfigSource` does)
-  applies rate changes to loaded queues immediately and re-evaluates waiting tasks. Other sources are read only at load.
+  applies rate and weight-override changes to loaded queues immediately and re-evaluates waiting tasks. Other sources
+  are read only when a queue loads (like upstream, writers use the queue's cached overrides).
 - **Tokens.** A matched task that isn't used (the Starter returned `ErrDropTask` or another error) gives its token
   back. Forwarded tasks are not counted twice.
 - **Upstream quirk (kept by default).** A new limit is installed only when the effective rate *changes*. A queue with

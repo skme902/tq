@@ -57,16 +57,19 @@ type (
 		AdminQueueDispatchRate     *float64
 	}
 
-	// QueueConfigSource replaces userDataManager for per-queue config.
+	// QueueConfigSource replaces userDataManager for per-queue config. A loaded queue reads
+	// QueueConfig once when it loads and again only when notified through QueueConfigWatcher:
+	// every field (rate limits, admin dispatch rates, fairness weight overrides) is cached in
+	// the queue's rate limit manager. A source that changes values without implementing
+	// QueueConfigWatcher takes effect only after the queue unloads and reloads.
 	QueueConfigSource interface {
 		QueueConfig(queue store.QueueKey) QueueConfig
 	}
 
 	// QueueConfigWatcher is optionally implemented by a QueueConfigSource to push changes
 	// (replaces userDataManager's onUserDataChanged and dynamic config Subscribe). A loaded
-	// queue re-reads its QueueConfig and re-applies rate limits on every onChange call. Sources
-	// that don't implement it have their rate limit fields read only when a queue loads
-	// (fairness weight overrides are still read per write batch).
+	// queue re-reads its QueueConfig and re-applies rate limits and fairness weight overrides
+	// on every onChange call (upstream's onUserDataChanged).
 	QueueConfigWatcher interface {
 		WatchQueueConfig(queue store.QueueKey, onChange func()) (cancel func())
 	}

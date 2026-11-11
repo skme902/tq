@@ -159,6 +159,12 @@ func (c *physicalTaskQueueManagerImpl) Start() {
 // Stop does not unload the queue from its partition. It is intended to be called by the partition manager when
 // unloading a queues. For stopping and unloading a queue call UnloadFromPartitionManager instead.
 func (c *physicalTaskQueueManagerImpl) Stop(unloadCause unloadCause) {
+	if atomic.CompareAndSwapInt32(&c.status, daemonStatusInitialized, daemonStatusStopped) {
+		// Deviation (REVIEW M3): stopped before Start ran (the engine publishes a partition
+		// before starting it). Start is now a no-op; cancel tqCtx so waiters fail fast.
+		c.tqCtxCancel()
+		return
+	}
 	if !atomic.CompareAndSwapInt32(&c.status, daemonStatusStarted, daemonStatusStopped) {
 		return
 	}
@@ -172,7 +178,16 @@ func (c *physicalTaskQueueManagerImpl) Stop(unloadCause unloadCause) {
 }
 
 func (c *physicalTaskQueueManagerImpl) WaitUntilInitialized(ctx context.Context) error {
-	return c.backlogMgr.WaitUntilInitialized(ctx)
+	// Deviation (REVIEW M3): also return when the queue stops, which matters for a queue that
+	// was stopped before it started and so never initializes.
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(c.tqCtx, cancel)()
+	err := c.backlogMgr.WaitUntilInitialized(waitCtx)
+	if err != nil && ctx.Err() == nil && c.tqCtx.Err() != nil {
+		return errTaskQueueClosed
+	}
+	return err
 }
 
 func (c *physicalTaskQueueManagerImpl) SpoolTask(taskInfo *store.Task) error {
@@ -203,10 +218,6 @@ func (c *physicalTaskQueueManagerImpl) PollTask(
 		}
 		return task, nil
 	}
-}
-
-func (c *physicalTaskQueueManagerImpl) backlogCountHint() int64 {
-	return c.backlogMgr.BacklogCountHint()
 }
 
 func (c *physicalTaskQueueManagerImpl) MarkAlive() {
@@ -254,9 +265,8 @@ func (c *physicalTaskQueueManagerImpl) UserDataChanged() {
 	c.priMatcher.ReprocessAllTasks()
 }
 
+// GetFairnessWeightOverrides is upstream's (physical_task_queue_manager.go:876-878): the
+// rateLimitManager's snapshot, so writer weights match the per-key limiter (REVIEW L4).
 func (c *physicalTaskQueueManagerImpl) GetFairnessWeightOverrides() fairnessWeightOverrides {
-	if src := c.partitionMgr.engine.configSource; src != nil {
-		return src.QueueConfig(c.queue).FairnessWeightOverrides
-	}
-	return nil
+	return c.partitionMgr.GetRateLimitManager().GetFairnessWeightOverrides()
 }

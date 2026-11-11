@@ -308,7 +308,7 @@ func TestFairnessManyKeysBeyondMapLimit(t *testing.T) {
 	require.NoError(t, err)
 	topK := resp.Info.Subqueues[0].TopKFairnessCounts
 	t.Logf("persisted TopK entries: %d", len(topK))
-	require.Len(t, topK, taskqueue.DefaultCounterParams.MapLimit)
+	require.Len(t, topK, taskqueue.DefaultCounterParams().MapLimit)
 }
 
 func TestFairnessWeightOverrideChangeMidStream(t *testing.T) {

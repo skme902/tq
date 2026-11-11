@@ -5,6 +5,7 @@
 package matching
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/skme902/tq/internal/counter"
@@ -20,7 +21,8 @@ type Config struct {
 	MaxTaskQueueIdleTime time.Duration
 	// GetTasksBatchSize is the max tasks read per store call and kept in memory per subqueue (1000).
 	GetTasksBatchSize int
-	// GetTasksReloadAt triggers a read when fewer tasks than this are loaded (100).
+	// GetTasksReloadAt triggers a read when at most this many tasks are loaded (100). It must be
+	// in [0, GetTasksBatchSize).
 	GetTasksReloadAt int
 	// UpdateAckInterval is how often ack levels / metadata are synced to the store (1m).
 	UpdateAckInterval time.Duration
@@ -45,7 +47,7 @@ type Config struct {
 	// FairnessPassDither spreads new keys' initial pass (false).
 	FairnessPassDither bool
 	// FairnessCounter configures the per-subqueue fairness pass counter (upstream
-	// matching.fairnessCounter, default counter.DefaultCounterParams): an exact map for up to
+	// matching.fairnessCounter, default counter.DefaultCounterParams()): an exact map for up to
 	// MapLimit (100) keys, then a count-min sketch (W=100, D=5, growth up to W=10000, shadow-row
 	// reseed every 250000 increments). The zero value means the default; a non-zero value is
 	// used as given (so e.g. Grow.Threshold=0 disables growth like upstream).
@@ -106,7 +108,7 @@ func DefaultConfig() Config {
 		BacklogTaskForwardTimeout:       time.Minute,
 		PriorityLevels:                  5,
 		FairnessPassDither:              false,
-		FairnessCounter:                 counter.DefaultCounterParams,
+		FairnessCounter:                 counter.DefaultCounterParams(),
 		RangeSize:                       100000,
 		DeliveryLeaseDuration:           time.Minute,
 
@@ -160,6 +162,19 @@ func (c Config) WithDefaults() Config {
 	setI(&c.NumReadPartitions, d.NumReadPartitions)
 	setI(&c.FairnessKeyRateLimitCacheSize, d.FairnessKeyRateLimitCacheSize)
 	return c
+}
+
+// validate rejects settings the backlog reader cannot run with (REVIEW L7). It runs after
+// WithDefaults, so zero fields have their defaults.
+func (c Config) validate() error {
+	if c.GetTasksBatchSize < 1 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasksBatchSize must be positive, got %d", c.GetTasksBatchSize)}
+	}
+	if c.GetTasksReloadAt < 0 || c.GetTasksReloadAt >= c.GetTasksBatchSize {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf(
+			"GetTasksReloadAt must be in [0, GetTasksBatchSize=%d), got %d", c.GetTasksBatchSize, c.GetTasksReloadAt)}
+	}
+	return nil
 }
 
 // taskQueueConfig is the per-queue resolved config (upstream config.go taskQueueConfig).

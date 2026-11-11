@@ -34,7 +34,8 @@ type (
 
 	// Priority mirrors upstream commonpb.Priority.
 	Priority struct {
-		// PriorityKey: lower is dispatched first. 0 means the queue default.
+		// PriorityKey: lower is dispatched first. 0 means the queue default; keys above the
+		// queue's PriorityLevels are dispatched as the lowest level. Negative keys are rejected.
 		PriorityKey int32
 		// FairnessKey groups tasks for fair dispatch within a priority level.
 		FairnessKey string

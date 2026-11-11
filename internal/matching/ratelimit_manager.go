@@ -89,6 +89,7 @@ type (
 		perKeyReady     *cache.LRU[string, simpleLimiter]
 		perKeyOverrides fairnessWeightOverrides // TODO(fairness): get this from config
 		cancels         []func()
+		stopped         bool // set by Stop; guarded by mu
 	}
 )
 
@@ -165,7 +166,7 @@ func (r *rateLimitManager) Start(onChange func()) {
 	r.adminNsRate, r.adminTqRate = r.adminRates(r.queueConfig())
 	// Defaulting to 1 partition if misconfigured (upstream does this in setNumReadPartitions).
 	r.numReadPartitions = max(r.config.NumReadPartitions, 1)
-	if w, ok := r.configSource.(QueueConfigWatcher); ok && onChange != nil {
+	if w, ok := r.configSource.(QueueConfigWatcher); ok && onChange != nil && !r.stopped {
 		r.cancels = append(r.cancels, w.WatchQueueConfig(r.queue, onChange))
 	}
 	r.computeEffectiveRPSAndSourceLocked()
@@ -174,12 +175,6 @@ func (r *rateLimitManager) Start(onChange func()) {
 		// effective rate to change.
 		r.updateSimpleRateLimitWithBurstLocked(defaultBurstDuration)
 	}
-}
-
-func (r *rateLimitManager) computeEffectiveRPSAndSource() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.computeEffectiveRPSAndSourceLocked()
 }
 
 // Computes the effectiveRPS and its source by evaluating all possible rate limit configurations.
@@ -405,6 +400,7 @@ func (r *rateLimitManager) GetFairnessWeightOverrides() fairnessWeightOverrides 
 func (r *rateLimitManager) Stop() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.stopped = true // a Start after Stop must not register a watch (REVIEW M3)
 	for _, cancel := range r.cancels {
 		cancel()
 	}

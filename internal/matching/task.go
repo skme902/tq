@@ -49,6 +49,9 @@ type (
 	genericTaskInfo struct {
 		*store.TaskInfo
 		completionFunc func(*internalTask, taskResponse)
+		// leaseFunc, if set, is called when a backlog task is handed out under a delivery lease
+		// (library addition; see fairTaskReader.leaseTask).
+		leaseFunc func(*internalTask)
 	}
 
 	// internalTask represents a task from AddTask (sync match) or from the backlog.
@@ -70,6 +73,10 @@ type (
 		// allow inserting forwards in between priority levels.
 		effectivePriority priorityKey
 		pollForwarderType pollForwarderType
+
+		// leased is true while a backlog task is held under a delivery lease and tracked by the
+		// reader as leased rather than loaded. Guarded by the owning fairTaskReader's lock.
+		leased bool
 	}
 
 	// taskResponse is used to report the result of either a match with a local poller,
@@ -152,13 +159,6 @@ func (task *internalTask) isSyncMatchTask() bool {
 	return task.responseC != nil
 }
 
-func (task *internalTask) getCreateTime() time.Time {
-	if task.event != nil {
-		return task.event.Data.CreateTime
-	}
-	return time.Time{}
-}
-
 // getResponse waits for a response on the task's response channel.
 func (task *internalTask) getResponse() (taskResponse, bool) {
 	if task.responseC == nil {
@@ -207,11 +207,6 @@ func (task *internalTask) finish(r taskFinishResult) {
 		startErr:   r.err,
 		dropReason: r.dropReason,
 	}, r.consumedToken)
-}
-
-// finishForward must be called after forwarding a task.
-func (task *internalTask) finishForward(forwardErr error, consumedToken bool) {
-	task.finishInternal(taskResponse{forwarded: true, forwardErr: forwardErr}, consumedToken)
 }
 
 func (task *internalTask) finishInternal(res taskResponse, consumedToken bool) {

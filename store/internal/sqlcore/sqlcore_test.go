@@ -5,6 +5,7 @@ package sqlcore_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"testing"
@@ -197,4 +198,30 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 		}
 		require.Equal(t, 1, total, "exactly one migrator applied 0001")
 	})
+}
+
+// L10: a task row that cannot be decoded is reported as an InvalidArgumentError naming the
+// task, so callers can tell corruption from a transient store failure.
+func TestCorruptTaskRowIsInvalidArgument(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/corrupt.db"
+	st, err := sqlite.Open(ctx, path, sqlite.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(t, st.Migrate(ctx))
+	require.NoError(t, st.CreateQueue(ctx, &store.CreateQueueRequest{RangeID: 1, Info: info()}))
+	_, err = st.CreateTasks(ctx, &store.CreateTasksRequest{RangeID: 1, Info: info(), Tasks: tasks(1, 3), Subqueues: make([]int, 3)})
+	require.NoError(t, err)
+
+	raw, err := sql.Open("sqlite", path)
+	require.NoError(t, err)
+	defer raw.Close()
+	_, err = raw.ExecContext(ctx, `UPDATE tq_tasks SET data = ? WHERE task_id = 2`, []byte("{not json"))
+	require.NoError(t, err)
+
+	_, err = st.GetTasks(ctx, &store.GetTasksRequest{Key: key, InclusiveMin: store.Level{Pass: 1}, PageSize: 10})
+	var inv *store.InvalidArgumentError
+	require.ErrorAs(t, err, &inv)
+	require.Contains(t, err.Error(), "task 2")
+	require.False(t, store.IsTransient(err))
 }

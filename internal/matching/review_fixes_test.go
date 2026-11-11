@@ -1,0 +1,248 @@
+package matching
+
+// Regression tests for REVIEW_2026-11-04 M1-M3 and the Low findings that are internal.
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/skme902/tq/clock"
+	"github.com/skme902/tq/internal/backoff"
+	"github.com/skme902/tq/store"
+)
+
+// M1: a sync match that completes after Stop snapshotted the sync leases must not leave an
+// in-memory-only task behind: either the poller is refused and the task is spooled, or the
+// lease is re-spooled.
+func TestStopRaceSyncMatchNotLost(t *testing.T) {
+	ts := newTestStore()
+	e := newPortEngine(t, ts, nil)
+	pm, err := e.getTaskQueuePartitionManager(context.Background(), portQueue, true)
+	require.NoError(t, err)
+
+	type pollResult struct {
+		d   *Delivery
+		err error
+	}
+	polled := make(chan pollResult, 1)
+	go func() {
+		d, err := e.PollTask(context.Background(), portQueue, PollOptions{LeaseDuration: time.Hour})
+		polled <- pollResult{d, err}
+	}()
+	require.Eventually(t, func() bool { return pm.defaultQueue.priMatcher.HasWaitingPoller() }, 5*time.Second, time.Millisecond)
+
+	var addMatched bool
+	var addErr error
+	var res pollResult
+	e.testHookStopAfterSyncLeases = func() {
+		addMatched, addErr = pm.AddTask(context.Background(), &store.Task{Payload: []byte("x")}, nil)
+		res = <-polled
+	}
+	e.Stop()
+
+	if addErr != nil {
+		return // the producer knows the task was not accepted
+	}
+	if res.err == nil && addMatched {
+		require.Equal(t, 1, ts.TotalTaskCount(portQueue),
+			"sync-matched task handed out after Stop's lease snapshot is neither spooled nor re-spooled")
+		return
+	}
+	require.Error(t, res.err)
+	require.Equal(t, 1, ts.TotalTaskCount(portQueue), "refused sync match must be spooled")
+}
+
+func newFakeClockEngine(t *testing.T, ts *testStore) (*Engine, *clock.EventTimeSource) {
+	t.Helper()
+	src := clock.NewEventTimeSource().Update(time.Now())
+	src.UseAsyncTimers(true) // timer callbacks (idle unload) may block on other goroutines
+	e, err := NewEngine(Options{Config: DefaultConfig(), Store: ts, TimeSource: src, Logger: discardLogger()})
+	require.NoError(t, err)
+	t.Cleanup(e.Stop)
+	return e, src
+}
+
+func pollBacklogTask(t *testing.T, e *Engine, lease time.Duration) *Delivery {
+	t.Helper()
+	matched, err := e.AddTask(context.Background(), portQueue, store.Task{Payload: []byte("x")})
+	require.NoError(t, err)
+	require.False(t, matched)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d, err := e.PollTask(ctx, portQueue, PollOptions{LeaseDuration: lease})
+	require.NoError(t, err)
+	return d
+}
+
+// M2: an expiry callback that was already dispatched when ExtendLease won the lock must not
+// settle the extended lease; a non-positive extension is rejected.
+func TestExtendLeaseBeatsStaleExpiry(t *testing.T) {
+	e, src := newFakeClockEngine(t, newTestStore())
+	d := pollBacklogTask(t, e, time.Minute)
+
+	src.Advance(30 * time.Second)
+	require.NoError(t, d.ExtendLease(10*time.Minute))
+	d.expire() // the old timer's callback, scheduled before the extension
+	require.Equal(t, src.Now().Add(10*time.Minute), d.LeaseDeadline())
+
+	require.Error(t, d.ExtendLease(0))
+	require.Error(t, d.ExtendLease(-time.Second))
+
+	src.Advance(9 * time.Minute)
+	require.NoError(t, d.ExtendLease(time.Minute), "lease still live")
+	src.Advance(2 * time.Minute)
+	require.Eventually(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.settled
+	}, 5*time.Second, time.Millisecond, "extended lease expires on its new deadline")
+	require.ErrorIs(t, d.Ack(), ErrLeaseLost)
+}
+
+type countingWatcher struct {
+	mu     sync.Mutex
+	active int
+}
+
+func (w *countingWatcher) QueueConfig(store.QueueKey) QueueConfig { return QueueConfig{} }
+func (w *countingWatcher) WatchQueueConfig(store.QueueKey, func()) func() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.active++
+	return func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.active--
+	}
+}
+
+// M3: a partition published to e.partitions but stopped (engine Stop or unload) before its
+// Start ran must stay stopped: Start is then a no-op, and waiters fail fast.
+func TestPartitionStartAfterStopIsNoop(t *testing.T) {
+	w := &countingWatcher{}
+	e, err := NewEngine(Options{Config: DefaultConfig(), Store: newTestStore(), TimeSource: clock.NewRealTimeSource(),
+		Logger: discardLogger(), QueueConfigSource: w})
+	require.NoError(t, err)
+	t.Cleanup(e.Stop)
+
+	pm := newTaskQueuePartitionManager(e, portQueue, newTaskQueueConfig(e.config))
+	pm.Stop(unloadCauseShuttingDown) // the window between publish and Start
+	pm.Start()
+
+	require.Equal(t, daemonStatusStopped, atomic.LoadInt32(&pm.defaultQueue.status), "physical queue started after Stop")
+	w.mu.Lock()
+	require.Zero(t, w.active, "config watch registered after Stop")
+	w.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.Error(t, pm.WaitUntilInitialized(ctx))
+	require.NoError(t, ctx.Err(), "WaitUntilInitialized on a stopped queue must not wait for the caller's deadline")
+}
+
+// L1: upstream's addErrorRetryPolicy keeps NewExponentialRetryPolicy's 10s max interval.
+func TestAddErrorRetryPolicyCapped(t *testing.T) {
+	r := backoff.NewRetrier(addErrorRetryPolicy)
+	for i := range 100 {
+		d := r.NextBackOff()
+		require.Greater(t, d, time.Duration(0), "attempt %d", i)
+		require.LessOrEqual(t, d, 10*time.Second, "attempt %d", i)
+	}
+}
+
+type mutableSource struct {
+	mu  sync.Mutex
+	cfg QueueConfig
+}
+
+func (s *mutableSource) QueueConfig(store.QueueKey) QueueConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
+}
+
+// L4: like upstream, the writer takes fairness weight overrides from the partition's
+// rateLimitManager, so writer weights and per-key rate limits use the same snapshot.
+func TestWriterOverridesComeFromRateLimitManager(t *testing.T) {
+	src := &mutableSource{cfg: QueueConfig{FairnessWeightOverrides: fairnessWeightOverrides{"a": 2}}}
+	e, err := NewEngine(Options{Config: DefaultConfig(), Store: newTestStore(), TimeSource: clock.NewRealTimeSource(),
+		Logger: discardLogger(), QueueConfigSource: src})
+	require.NoError(t, err)
+	t.Cleanup(e.Stop)
+	_, err = e.AddTask(context.Background(), portQueue, store.Task{Payload: []byte("x")})
+	require.NoError(t, err)
+	pm, err := e.getTaskQueuePartitionManager(context.Background(), portQueue, false)
+	require.NoError(t, err)
+
+	src.mu.Lock()
+	src.cfg = QueueConfig{FairnessWeightOverrides: fairnessWeightOverrides{"a": 5}} // no watcher notification
+	src.mu.Unlock()
+	require.Equal(t, pm.GetRateLimitManager().GetFairnessWeightOverrides(), pm.defaultQueue.GetFairnessWeightOverrides())
+}
+
+// L6: Stop ends every outstanding lease. Ack/Nack/ExtendLease afterwards report
+// ErrEngineStopped instead of claiming an ack that a stopped reader can no longer persist;
+// the backlog task stays durable and is redelivered after the next load.
+func TestLeaseOpsAfterStopReportEngineStopped(t *testing.T) {
+	ts := newTestStore()
+	e, _ := newFakeClockEngine(t, ts)
+	d1 := pollBacklogTask(t, e, time.Minute)
+	d2 := pollBacklogTask(t, e, time.Minute)
+	d3 := pollBacklogTask(t, e, time.Minute)
+	e.Stop()
+	require.ErrorIs(t, d1.Ack(), ErrEngineStopped)
+	require.ErrorIs(t, d2.Nack(), ErrEngineStopped)
+	require.ErrorIs(t, d3.ExtendLease(time.Minute), ErrEngineStopped)
+	d1.mu.Lock()
+	stopped := d1.timer.Stop()
+	d1.mu.Unlock()
+	require.False(t, stopped, "Stop must stop the lease timer")
+
+	e2, err := NewEngine(Options{Config: DefaultConfig(), Store: ts, TimeSource: clock.NewRealTimeSource(), Logger: discardLogger()})
+	require.NoError(t, err)
+	t.Cleanup(e2.Stop)
+	seen := map[int64]bool{}
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		d, err := e2.PollTask(ctx, portQueue, PollOptions{})
+		cancel()
+		require.NoError(t, err)
+		seen[d.TaskID] = true
+		require.NoError(t, d.Ack())
+	}
+	require.Equal(t, map[int64]bool{d1.TaskID: true, d2.TaskID: true, d3.TaskID: true}, seen)
+}
+
+// L7: read-batch settings that would stall or hot-loop the reader are rejected.
+func TestNewEngineValidatesReadBatchConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		batch, reloadAt int
+		ok              bool
+	}{
+		{"defaults", 0, 0, true},
+		{"explicit", 20, 5, true},
+		{"reload just below batch", 20, 19, true},
+		{"negative batch", -1, 5, false},
+		{"negative reloadAt", 20, -1, false},
+		{"reloadAt equals batch", 20, 20, false},
+		{"reloadAt above batch", 50, 100, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.GetTasksBatchSize, cfg.GetTasksReloadAt = tc.batch, tc.reloadAt
+			e, err := NewEngine(Options{Config: cfg, Store: newTestStore(), Logger: discardLogger()})
+			if tc.ok {
+				require.NoError(t, err)
+				e.Stop()
+				return
+			}
+			var inv *store.InvalidArgumentError
+			require.ErrorAs(t, err, &inv)
+		})
+	}
+}
