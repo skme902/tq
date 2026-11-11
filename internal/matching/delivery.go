@@ -99,8 +99,8 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 // tasks (upstream emits that at RecordTaskStarted).
 func emitDispatchLatency(h metrics.Handler, task *internalTask, now time.Time) {
 	ct := task.event.Data.CreateTime
-	if ct.IsZero() {
-		return // should not happen but for safety
+	if ct.IsZero() || h == metrics.Noop {
+		return // zero: should not happen but for safety; Noop: skip building the tag slice
 	}
 	lat := now.Sub(ct)
 	source := metrics.SourceDBBacklog
