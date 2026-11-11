@@ -83,8 +83,9 @@ func TestLiveReadyLifecycle(t *testing.T) {
 	require.NoError(t, <-done)
 
 	// Stopped: not live.
-	code, _ = get(t, h, "/livez")
+	code, body = get(t, h, "/livez")
 	require.Equal(t, http.StatusServiceUnavailable, code)
+	require.Equal(t, map[string]any{"live": false}, body)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodHead, "/readyz", nil))
 	require.Equal(t, http.StatusServiceUnavailable, rr.Code)

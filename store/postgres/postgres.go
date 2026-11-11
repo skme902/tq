@@ -69,7 +69,10 @@ type Store struct {
 	closer bool
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store         = (*Store)(nil)
+	_ store.HealthChecker = (*Store)(nil)
+)
 
 // Open connects using a pgx DSN/URL. It does not create tables; call Migrate.
 func Open(ctx context.Context, dsn string, opts Options) (*Store, error) {
