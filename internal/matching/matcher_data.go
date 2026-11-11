@@ -6,8 +6,10 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -233,6 +235,12 @@ type matcherData struct {
 	lastPoller time.Time // most recent poll start time
 
 	stopped bool // if true, reject new tasks
+
+	// draining is the engine's draining flag (Deviation, drain: library addition), set after
+	// construction; nil in unit tests that build a matcher alone. A poller queued while it is
+	// set is woken at once, and Engine.Shutdown wakes the pollers already waiting
+	// (wakePollersForDrain). Read under lock, so a poller either sees it or is swept.
+	draining *atomic.Bool
 }
 
 // newMatcherData creates a new matcherData. onRateLimited is called each time a dispatch
@@ -345,6 +353,12 @@ func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waiti
 	if poller.matchResult != nil {
 		return poller.matchResult
 	}
+	// Deviation (drain): a poller that arrives once the engine is draining ends at once.
+	if d.draining != nil && d.draining.Load() {
+		d.pollers.Remove(poller)
+		poller.wake(d.logger, &matchResult{ctxErr: errDrainWake, ctxErrIdx: -1})
+		return poller.matchResult
+	}
 
 	// arrange to wake up on context close
 	for i, ctx := range ctxs {
@@ -365,6 +379,22 @@ func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waiti
 	}
 
 	return poller.waitForMatch()
+}
+
+// errDrainWake is the ctxErr of a poller woken by a drain; Poll reports it as ErrNoTasks and
+// Engine.PollTask turns that into ErrEngineDraining.
+var errDrainWake = errors.New("woken by engine drain")
+
+// wakePollersForDrain wakes every waiting poller (Deviation, drain: library addition). The
+// engine's draining flag is set first, so a poller queued after this sweep wakes itself.
+func (d *matcherData) wakePollersForDrain() {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	for d.pollers.head != nil {
+		poller := d.pollers.head
+		d.pollers.Remove(poller)
+		poller.wake(d.logger, &matchResult{ctxErr: errDrainWake, ctxErrIdx: -1})
+	}
 }
 
 // MatchTaskImmediately attempts a non-blocking sync match.

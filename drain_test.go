@@ -2,6 +2,7 @@ package taskqueue_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -511,3 +512,83 @@ func TestShutdownCanceledCtxIdle(t *testing.T) {
 	cancel()
 	require.NoError(t, e.Shutdown(ctx))
 }
+
+// Polls waiting in the matcher on several loaded queues all end with ErrEngineDraining when
+// the drain starts (they are woken through each matcher, not through a per-poll context).
+func TestShutdownEndsBlockedPollsOnLoadedQueues(t *testing.T) {
+	// A long poll far beyond the waits below, so only the drain can end these polls.
+	e := newEngine(t, memstore.New(), longPoll30s)
+	queues := []taskqueue.QueueKey{q, {Namespace: "ns", Name: "b"}, {Namespace: "ns2", Name: "c"}}
+	const perQueue = 4
+	pollErr := make(chan error, len(queues)*perQueue)
+	for _, qk := range queues {
+		for range perQueue {
+			go func() {
+				_, err := e.PollTask(context.Background(), qk, taskqueue.PollOptions{})
+				pollErr <- err
+			}()
+		}
+	}
+	require.Eventually(t, func() bool {
+		for _, qk := range queues {
+			if e.WaitingPollers(qk) != perQueue {
+				return false
+			}
+		}
+		return true
+	}, 3*time.Second, time.Millisecond)
+
+	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	shutErr := shutdownAsync(e, sctx)
+	for range len(queues) * perQueue {
+		select {
+		case err := <-pollErr:
+			require.ErrorIs(t, err, taskqueue.ErrEngineDraining)
+		case <-time.After(time.Second):
+			t.Fatal("a poll waiting in the matcher was not ended by drain")
+		}
+	}
+	require.NoError(t, <-shutErr)
+	for _, qk := range queues {
+		require.Zero(t, e.WaitingPollers(qk))
+	}
+}
+
+// Polls racing the drain start: every poll ends (ErrEngineDraining, or ErrEngineStopped once
+// stopped), none waits for its long-poll timeout, and Shutdown finishes.
+func TestShutdownRacingPollsAllEnd(t *testing.T) {
+	e := newEngine(t, memstore.New(), longPoll30s)
+	add(t, e, task("warm")) // load the partition
+	d := poll(t, e)
+	require.NoError(t, d.Ack())
+	const n = 32
+	var wg sync.WaitGroup
+	var bad atomic.Int32
+	start := make(chan struct{})
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := e.PollTask(context.Background(), q, taskqueue.PollOptions{})
+			if !errors.Is(err, taskqueue.ErrEngineDraining) && !errors.Is(err, taskqueue.ErrEngineStopped) {
+				bad.Add(1)
+			}
+		}()
+	}
+	close(start)
+	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	require.NoError(t, e.Shutdown(sctx))
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a poll racing the drain did not end")
+	}
+	require.Zero(t, bad.Load())
+}
+
+func longPoll30s(c *taskqueue.Config) { c.LongPollExpirationInterval = 30 * time.Second }

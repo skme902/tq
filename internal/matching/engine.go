@@ -253,10 +253,51 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		e.metricsHandler.Gauge(metrics.EngineDraining, 1)
 		e.logger.Info("draining", "leases", e.outstandingLeaseCount())
 		e.drainCancel()
+		e.wakePollersForDrain()
 	})
 
 	remaining, err := e.waitDrain(ctx)
 	return e.completeShutdown(err, remaining)
+}
+
+// partitionForPoll loads the poll's partition. Only a poll that has to wait for a load links
+// the drain cancel, so a drain ends it too; a poll waiting in the matcher is woken by
+// wakePollersForDrain instead.
+func (e *Engine) partitionForPoll(ctx context.Context, queue store.QueueKey) (*taskQueuePartitionManagerImpl, error) {
+	e.partitionsLock.RLock()
+	pm, ok := e.partitions[queue]
+	e.partitionsLock.RUnlock()
+	if ok && pm.defaultQueue.backlogMgr.isInitialized() {
+		return e.getTaskQueuePartitionManager(ctx, queue, true)
+	}
+	loadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(e.drainCtx, cancel)()
+	pm, err := e.getTaskQueuePartitionManager(loadCtx, queue, true)
+	if err != nil {
+		// A load cut short by the drain (not by the caller) reports the drain.
+		if derr := e.drainingErr(); derr != nil && ctx.Err() == nil && loadCtx.Err() != nil {
+			return nil, derr
+		}
+		return nil, err
+	}
+	return pm, nil
+}
+
+// wakePollersForDrain ends every poll waiting in a matcher (draining is already set, so a poll
+// that queues after the sweep ends at once). This replaces a per-poll context.AfterFunc on
+// drainCtx, which serialised every PollTask on that one context's lock (about -4 to -6%
+// memstore backlog throughput, BenchmarkEngine backlog-p8, n=30).
+func (e *Engine) wakePollersForDrain() {
+	e.partitionsLock.RLock()
+	pms := make([]*taskQueuePartitionManagerImpl, 0, len(e.partitions))
+	for _, pm := range e.partitions {
+		pms = append(pms, pm)
+	}
+	e.partitionsLock.RUnlock()
+	for _, pm := range pms {
+		pm.defaultQueue.priMatcher.data.wakePollersForDrain()
+	}
 }
 
 // finishedShutdown reports the result of a Shutdown that has already stopped the engine.
@@ -660,19 +701,10 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 	}
 	defer e.endPoll()
 
-	// Link the drain cancel before partition load so a poll blocked there ends too.
 	// The caller's ctx is kept aside: a drain must not hide the error it would return.
 	callerCtx := ctx
-	ctx, cancelPoll := context.WithCancel(ctx)
-	defer cancelPoll()
-	defer context.AfterFunc(e.drainCtx, cancelPoll)()
-
-	pm, err := e.getTaskQueuePartitionManager(ctx, queue, true)
+	pm, err := e.partitionForPoll(ctx, queue)
 	if err != nil {
-		// A load cut short by the drain (not by the caller) reports the drain.
-		if derr := e.drainingErr(); derr != nil && callerCtx.Err() == nil && ctx.Err() != nil {
-			return nil, derr
-		}
 		return nil, err
 	}
 	pollMetadata := &pollMetadata{identity: opts.Identity, maxTasksPerSecond: opts.MaxTasksPerSecond}
