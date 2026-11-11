@@ -54,8 +54,11 @@ type Delivery struct {
 // re-spool (REVIEW M1); a refused backlog task is returned to its reader.
 //
 // A backlog task with a max-attempts limit persists its new count before the lease timer is
-// armed, so a slow attempt write cannot lose the lease out from under the write. A fencing
-// failure (errAttemptFenced) settles the lease without acking and does not return a delivery.
+// armed, so a slow attempt write cannot lose the lease out from under the write. The lease
+// deadline is stamped in arm, when that timer starts. A fencing failure (errAttemptFenced)
+// settles the lease without acking and does not return a delivery. If Stop or a shutdown
+// give-up ends the lease during the write, the count is rolled back (best-effort; a failed
+// rollback leaves it one high, at-least-once) and PollTask returns ErrEngineStopped.
 func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) (*Delivery, error) {
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
@@ -70,7 +73,6 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		pqm:         pqm,
 		task:        task,
 		deliveredAt: now,
-		deadline:    now.Add(lease),
 		released:    make(chan struct{}),
 	}
 	if !d.SyncMatched {
@@ -102,7 +104,8 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 	}
 	e.leasesLock.Unlock()
 	if recordFirst {
-		if err := e.recordAttempt(pqm, task); err != nil && store.IsConditionFailed(err) {
+		err := e.recordAttempt(pqm, task)
+		if err != nil && store.IsConditionFailed(err) {
 			// The backlog row is unchanged and the queue is unloaded. Do not ack, and do not
 			// hand the poller a delivery. If Stop already settled this lease, it owns release.
 			if d.settle() {
@@ -113,6 +116,14 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		e.leasesLock.Lock()
 		if e.leasesClosed || d.isSettled() {
 			e.leasesLock.Unlock()
+			// The attempt write committed, but Stop or a shutdown give-up already ended
+			// this lease, so no Delivery is returned. Roll the durable count back with
+			// the same fenced write. Release/settle stays with whoever ended the lease.
+			// A failed rollback leaves the stored count one high (at-least-once).
+			if err == nil {
+				task.event.Data.Attempts--
+				e.rollbackAttemptCount(pqm, task)
+			}
 			return nil, ErrEngineStopped
 		}
 		d.arm(lease)
@@ -124,6 +135,11 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		task.finish(taskFinishResult{consumedToken: true})
 	}
 	emitDispatchLatency(pqm.metricsHandler, task, now)
+	// Count a dispatch only once a Delivery is returned. A task dead-lettered as
+	// attempts_exhausted, or refused after a lost fence or Stop, is not one. Polls are
+	// never forwarded, so this matches the old forwardedFrom == "" guard for every
+	// delivery this engine hands out.
+	pqm.incTaskTracker(pqm.tasksDispatched, priorityKey(task.getPriority().PriorityKey), 1)
 	return d, nil
 }
 
@@ -152,6 +168,10 @@ func emitDispatchLatency(h metrics.Handler, task *internalTask, now time.Time) {
 
 func (d *Delivery) arm(lease time.Duration) {
 	d.mu.Lock()
+	// Stamp the deadline when the timer starts. newDelivery may block in the attempt
+	// write between constructing the delivery and calling arm; the expire callback
+	// trusts this deadline, so it has to match the timer.
+	d.deadline = d.engine.timeSource.Now().Add(lease)
 	d.timer = d.engine.timeSource.AfterFunc(lease, d.expire)
 	d.mu.Unlock()
 }

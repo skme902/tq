@@ -82,7 +82,7 @@ What shipped:
 - Metrics: `tasks_dead_lettered{reason}`, `dead_letter_failures`, `tasks_redriven`, `task_attempt_record_failures`.
   No `dlq_backlog_count` gauge: `DescribeQueue().DeadTasks` reads the count.
 
-Original design (superseded by the status above):
+### Original notes (superseded)
 
 - **Today.**
   - `Delivery.Nack`, lease expiry, and a Starter that returns a retryable error all redeliver the task. This is

@@ -10,7 +10,10 @@ package matching
 //   - each backlog delivery writes its new count to the store before its lease timer is armed
 //     and before PollTask returns, so a task that crashes its consumer is still counted. The
 //     UpdateTask body is built inside the retry from the current task. A lost rangeID fence
-//     unloads the queue and does not hand the delivery back; the backlog row stays;
+//     unloads the queue and does not hand the delivery back; the backlog row stays. If Stop
+//     or a shutdown give-up ends the lease during that write, the count is rolled back with
+//     the same fenced write. A failed rollback leaves the stored count one high
+//     (at-least-once) and is logged;
 //   - a backlog delivery that is Nacked or expires on its last attempt inserts the task into
 //     the dead-letter set and finishes it like an ack. Ack-level GC deletes the backlog row.
 //     A crash after the insert and before that ack level is persisted leaves the task both
@@ -64,26 +67,48 @@ func (db *taskQueueDB) deadLetterTask(ctx context.Context, dls store.DeadLetterS
 	})
 }
 
-// recordAttempt persists a backlog delivery's attempt count when the queue has a limit.
+// writeAttempt persists task.event.Data.Attempts with the fenced UpdateTask recordAttempt uses.
 // Each retry reads the current task, so a stale attempt cannot overwrite a higher count.
-// A non-fencing failure is counted and logged; the caller still delivers the task. A fencing
-// failure unloads the queue and is returned so the caller does not hand out the delivery.
-func (e *Engine) recordAttempt(pqm *physicalTaskQueueManagerImpl, task *internalTask) error {
-	ctx, cancel := context.WithTimeout(pqm.tqCtx, persistenceOperationRetryPolicy.Expiration)
-	defer cancel()
+func (e *Engine) writeAttempt(ctx context.Context, pqm *physicalTaskQueueManagerImpl, task *internalTask) error {
 	db := pqm.backlogMgr.getDB()
-	err := backoff.ThrottleRetryContext(ctx, func(ctx context.Context) error {
+	return backoff.ThrottleRetryContext(ctx, func(ctx context.Context) error {
 		info := *task.event.TaskInfo
 		info.Data = task.event.Data
 		return db.recordAttempt(ctx, e.deadLetters, task.event.subqueue, info)
 	}, persistenceOperationRetryPolicy, isPersistenceTransient)
+}
+
+// recordAttempt persists a backlog delivery's attempt count when the queue has a limit.
+// A non-fencing failure is counted and logged; the caller still delivers the task. A fencing
+// failure unloads the queue (signalIfFatal already emits condition_failed) and is returned
+// so the caller does not hand out the delivery. It is not a task_attempt_record_failures.
+func (e *Engine) recordAttempt(pqm *physicalTaskQueueManagerImpl, task *internalTask) error {
+	ctx, cancel := context.WithTimeout(pqm.tqCtx, persistenceOperationRetryPolicy.Expiration)
+	defer cancel()
+	err := e.writeAttempt(ctx, pqm, task)
 	if err != nil {
-		pqm.metricsHandler.Counter(metrics.TaskAttemptRecordFailures, 1)
+		if !store.IsConditionFailed(err) {
+			pqm.metricsHandler.Counter(metrics.TaskAttemptRecordFailures, 1)
+		}
 		pqm.logger.Warn("failed to record task attempt",
 			"task_id", task.event.ID, "attempts", task.event.Data.Attempts, "error", err)
 		pqm.backlogMgr.signalIfFatal(err)
 	}
 	return err
+}
+
+// rollbackAttemptCount best-effort writes the current (already decremented) attempt count
+// after a delivery was refused. The context is not pqm.tqCtx: Stop cancels that once it can
+// take the db lock this write needs, which would drop the rollback. A failure is logged and
+// the stored count stays one high (at-least-once). It does not count as a record failure
+// and does not settle the lease; whoever ended the lease still owns release.
+func (e *Engine) rollbackAttemptCount(pqm *physicalTaskQueueManagerImpl, task *internalTask) {
+	ctx, cancel := context.WithTimeout(context.Background(), persistenceOperationRetryPolicy.Expiration)
+	defer cancel()
+	if err := e.writeAttempt(ctx, pqm, task); err != nil {
+		pqm.logger.Warn("failed to roll back task attempt count; count stays one high (at-least-once)",
+			"task_id", task.event.ID, "attempts", task.event.Data.Attempts+1, "error", err)
+	}
 }
 
 // deadLetter inserts a backlog task into the dead-letter set and finishes it as acked. The
