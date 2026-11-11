@@ -457,3 +457,57 @@ func TestShutdownWaitsForConcurrentStop(t *testing.T) {
 	st.armed.Store(false)
 	requireDelivered(t, st.Store, "held")
 }
+
+// Review r3: concurrent Shutdowns of an idle engine publish the drain start before either
+// finishes: a sane duration and engine_draining back at 0.
+func TestShutdownConcurrentIdle(t *testing.T) {
+	for range 50 {
+		rec := metricstest.New()
+		e := newEngine(t, memstore.New(), nil, withMetrics(rec))
+		a, b := shutdownAsync(e, context.Background()), shutdownAsync(e, context.Background())
+		require.NoError(t, <-a)
+		require.NoError(t, <-b)
+		ds := rec.TimerValues(metrics.EngineDrainDuration)
+		require.Len(t, ds, 1)
+		require.Less(t, ds[0], time.Minute)
+		v, _ := rec.GaugeValue(metrics.EngineDraining)
+		require.Equal(t, 0.0, v)
+	}
+}
+
+// Review r3: once one caller gives up, a peer with no deadline returns the same error at
+// once instead of waiting for a poll stuck in a Starter that ignores ctx.
+func TestShutdownPeerAdoptsGiveUp(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	starter := starterFunc(func(context.Context, *taskqueue.StartRequest) error {
+		once.Do(func() { close(started) })
+		<-release
+		return nil
+	})
+	e := newEngine(t, memstore.New(), nil, func(o *taskqueue.Options) { o.Starter = starter })
+	t.Cleanup(func() { close(release) })
+	add(t, e, task("stuck"))
+	go func() { _, _ = e.PollTask(context.Background(), q, taskqueue.PollOptions{}) }()
+	<-started
+
+	short, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	peer := shutdownAsync(e, context.Background())
+	require.ErrorIs(t, e.Shutdown(short), context.DeadlineExceeded)
+	select {
+	case err := <-peer:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer Shutdown did not adopt the give-up")
+	}
+	require.ErrorIs(t, e.Shutdown(context.Background()), context.DeadlineExceeded, "sticky")
+}
+
+// Review r3: an already-cancelled ctx with nothing in flight is a finished drain.
+func TestShutdownCanceledCtxIdle(t *testing.T) {
+	e := newEngine(t, memstore.New(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, e.Shutdown(ctx))
+}
