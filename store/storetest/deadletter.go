@@ -200,9 +200,9 @@ func testDeadLetterInvalidArgs(_ *testing.T, s *suite) {
 	s.ErrorAs(err, &ia)
 }
 
-// DeadLetterTask removes the backlog row in the same write, and only that row; a row that is
-// already gone (GC'd) is not an error.
-func testDeadLetterMovesFromBacklog(_ *testing.T, s *suite) {
+// DeadLetterTask records the dead entry and leaves every backlog row. Ack-level GC removes
+// the row later. Recording the same id again overwrites the dead entry.
+func testDeadLetterKeepsBacklog(_ *testing.T, s *suite) {
 	d := s.dls()
 	rangeID := randRangeID()
 	info := s.createQueue(rangeID)
@@ -211,14 +211,18 @@ func testDeadLetterMovesFromBacklog(_ *testing.T, s *suite) {
 	t1.Data.Attempts = 3
 	s.NoError(d.DeadLetterTask(s.ctx, &store.DeadLetterTaskRequest{Key: s.key, RangeID: rangeID, Subqueue: 0, Task: t1, Reason: "r", DeadTime: s.now()}))
 	left := s.getAll(0)
-	s.Len(left, 1)
-	s.Equal(t2.ID, left[0].ID)
+	s.Len(left, 2)
+	s.Equal(t1.ID, left[0].ID)
+	s.Equal(t2.ID, left[1].ID)
+	s.Zero(left[0].Data.Attempts, "the backlog row is not rewritten")
 	got, _ := s.deadAll(d, 10)
 	s.Len(got, 1)
 	s.Equal(t1, got[0].Task)
-	// Again (row already gone): still fine, still one dead entry.
+	s.Equal("r", got[0].Reason)
+	// Again: still both backlog rows, one dead entry, reason overwritten.
 	s.NoError(d.DeadLetterTask(s.ctx, &store.DeadLetterTaskRequest{Key: s.key, RangeID: rangeID, Subqueue: 0, Task: t1, Reason: "r2", DeadTime: s.now()}))
 	got, _ = s.deadAll(d, 10)
 	s.Len(got, 1)
-	s.Len(s.getAll(0), 1)
+	s.Equal("r2", got[0].Reason)
+	s.Len(s.getAll(0), 2)
 }

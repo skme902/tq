@@ -714,7 +714,8 @@ func (s *Store) UpdateTask(ctx context.Context, req *store.UpdateTaskRequest) er
 	})
 }
 
-// DeadLetterTask upserts the dead-letter row under the rangeID fence.
+// DeadLetterTask upserts the dead-letter row under the rangeID fence and leaves the backlog
+// row for ack-level GC.
 func (s *Store) DeadLetterTask(ctx context.Context, req *store.DeadLetterTaskRequest) error {
 	blob, err := json.Marshal(&req.Task.Data)
 	if err != nil {
@@ -725,11 +726,8 @@ func (s *Store) DeadLetterTask(ctx context.Context, req *store.DeadLetterTaskReq
 		if err := s.lockTaskQueue(ctx, tx, id, hash, req.RangeID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, s.q.insertDead, int64(hash), id, req.Task.ID, req.Task.Pass,
-			req.DeadTime.UnixNano(), req.Reason, blob, DataEncoding); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, s.q.deleteTask, int64(hash), id, req.Subqueue, req.Task.Pass, req.Task.ID)
+		_, err := tx.ExecContext(ctx, s.q.insertDead, int64(hash), id, req.Task.ID, req.Task.Pass,
+			req.DeadTime.UnixNano(), req.Reason, blob, DataEncoding)
 		return err
 	})
 }
@@ -769,7 +767,11 @@ func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksReque
 			return nil, s.wrap("ListDeadTasks: scan", err)
 		}
 		if len(resp.Tasks) == req.PageSize {
-			resp.NextPageToken, _ = json.Marshal(resp.Tasks[len(resp.Tasks)-1].Task.ID)
+			tok, err := json.Marshal(resp.Tasks[len(resp.Tasks)-1].Task.ID)
+			if err != nil {
+				return nil, err
+			}
+			resp.NextPageToken = tok
 			break
 		}
 		if enc != DataEncoding {
@@ -788,6 +790,8 @@ func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksReque
 }
 
 // DeleteDeadTasks deletes by ID (TaskIDs non-nil) or by DeadBefore.
+// Every ID batch runs in one transaction. A later batch error rolls the earlier
+// batches back, and the deleted count is returned only after commit.
 func (s *Store) DeleteDeadTasks(ctx context.Context, req *store.DeleteDeadTasksRequest) (int, error) {
 	if req.TaskIDs == nil && req.DeadBefore.IsZero() {
 		return 0, &store.InvalidArgumentError{Msg: "DeleteDeadTasks: TaskIDs or DeadBefore is required"}
@@ -801,26 +805,36 @@ func (s *Store) DeleteDeadTasks(ctx context.Context, req *store.DeleteDeadTasksR
 		n, err := res.RowsAffected()
 		return int(n), s.wrap("DeleteDeadTasks", err)
 	}
-	total := 0
-	for start := 0; start < len(req.TaskIDs); start += s.d.MaxRowsPerInsert {
-		ids := req.TaskIDs[start:min(start+s.d.MaxRowsPerInsert, len(req.TaskIDs))]
-		q := `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND task_id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`
-		if s.d.NumberedPlaceholders {
-			q = rebind(q, 0)
+	if len(req.TaskIDs) == 0 {
+		return 0, nil
+	}
+	var total int
+	err := s.txExecute(ctx, "DeleteDeadTasks", func(tx *sql.Tx) error {
+		for start := 0; start < len(req.TaskIDs); start += s.d.MaxRowsPerInsert {
+			ids := req.TaskIDs[start:min(start+s.d.MaxRowsPerInsert, len(req.TaskIDs))]
+			q := `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND task_id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`
+			if s.d.NumberedPlaceholders {
+				q = rebind(q, 0)
+			}
+			args := make([]any, 0, 2+len(ids))
+			args = append(args, int64(hash), id)
+			for _, t := range ids {
+				args = append(args, t)
+			}
+			res, err := tx.ExecContext(ctx, q, args...)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			total += int(n)
 		}
-		args := []any{int64(hash), id}
-		for _, t := range ids {
-			args = append(args, t)
-		}
-		res, err := s.w.ExecContext(ctx, q, args...)
-		if err != nil {
-			return total, s.wrap("DeleteDeadTasks", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return total, s.wrap("DeleteDeadTasks", err)
-		}
-		total += int(n)
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return total, nil
 }
@@ -853,17 +867,16 @@ func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (b
 	return n > 0, err
 }
 
-// CheckHealth pings both pools and reads the applied schema version; want is the highest
-// embedded migration.
+// CheckHealth pings the read pool and reads the applied schema version; want is the highest
+// embedded migration. It deliberately never checks out the write pool: on sqlite that pool is
+// a single connection that every write holds until commit (up to the busy timeout), so a
+// probe on it would report unready while writes succeed, and would block writes while it ran.
+// A failing writer shows up as degraded queues in Engine.Health instead. On postgres the read
+// and write pools are the same pool.
 func (s *Store) CheckHealth(ctx context.Context, want int) (store.StoreHealth, error) {
 	h := store.StoreHealth{WantSchemaVersion: want}
-	if err := s.w.PingContext(ctx); err != nil {
+	if err := s.r.PingContext(ctx); err != nil {
 		return h, s.wrap("Ping", err)
-	}
-	if s.r != s.w {
-		if err := s.r.PingContext(ctx); err != nil {
-			return h, s.wrap("Ping", err)
-		}
 	}
 	var v sql.NullInt64
 	if err := s.r.QueryRowContext(ctx, `SELECT MAX(version) FROM tq_schema_version`).Scan(&v); err != nil {

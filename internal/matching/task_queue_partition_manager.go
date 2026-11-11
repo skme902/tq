@@ -54,6 +54,8 @@ func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *t
 	pm.metricsCtx, pm.metricsCancel = context.WithCancel(context.Background())
 	pm.rateLimitManager = newRateLimitManager(e.configSource, partition, config, e.timeSource)
 	pm.defaultQueue = newPhysicalTaskQueueManager(pm, partition)
+	// The engine default is the limit a negative QueueConfig override must not replace.
+	pm.maxAttempts.Store(config.MaxAttempts)
 	return pm
 }
 
@@ -128,15 +130,10 @@ func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
 }
 
 // refreshQueueConfig caches the library-only QueueConfig fields (the rate limit manager caches
-// the upstream ones).
+// the upstream ones). A negative MaxAttempts override is ignored: 0 already means unlimited, so
+// clamping a negative value would drop the queue's limit.
 func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
-	n := pm.config.MaxAttempts
-	if src := pm.engine.configSource; src != nil {
-		if v := src.QueueConfig(pm.partition).MaxAttempts; v != nil {
-			n = *v
-		}
-	}
-	pm.maxAttempts.Store(max(n, 0))
+	pm.refreshMaxAttempts()
 	age := pm.config.MaxTaskAge
 	if src := pm.engine.configSource; src != nil {
 		if v := src.QueueConfig(pm.partition).MaxTaskAge; v != nil {
@@ -144,6 +141,23 @@ func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
 		}
 	}
 	pm.maxTaskAge.Store(int64(max(age, 0)))
+}
+
+// refreshMaxAttempts is split out so that an ignored negative MaxAttempts does not also skip
+// the MaxTaskAge refresh.
+func (pm *taskQueuePartitionManagerImpl) refreshMaxAttempts() {
+	n := pm.config.MaxAttempts
+	if src := pm.engine.configSource; src != nil {
+		if v := src.QueueConfig(pm.partition).MaxAttempts; v != nil {
+			if *v < 0 {
+				pm.logger.Warn("ignoring negative QueueConfig.MaxAttempts; keeping the previous limit",
+					"max_attempts", *v, "limit", pm.maxAttempts.Load())
+				return
+			}
+			n = *v
+		}
+	}
+	pm.maxAttempts.Store(n)
 }
 
 // GetRateLimitManager returns the partition's rate limit manager.
@@ -204,6 +218,18 @@ func (pm *taskQueuePartitionManagerImpl) AddTask(
 		pm.metricsHandler.Counter(metrics.TasksSpooled, 1)
 	}
 	return false, err
+}
+
+// spoolBacklog persists task without a sync match. Redrive uses it so a waiting poller cannot
+// hold the only copy. Public AddTask is unchanged.
+func (pm *taskQueuePartitionManagerImpl) spoolBacklog(taskInfo *store.Task) error {
+	pm.metricsHandler.Counter(metrics.TasksAdded, 1)
+	pm.defaultQueue.incTaskTracker(pm.defaultQueue.tasksAdded, priorityKey(taskInfo.Priority.PriorityKey), 1)
+	err := pm.defaultQueue.SpoolTask(taskInfo) // also markAlive
+	if err == nil {
+		pm.metricsHandler.Counter(metrics.TasksSpooled, 1)
+	}
+	return err
 }
 
 func (pm *taskQueuePartitionManagerImpl) PollTask(ctx context.Context, pollMetadata *pollMetadata) (*internalTask, *physicalTaskQueueManagerImpl, error) {

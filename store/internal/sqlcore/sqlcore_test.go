@@ -288,7 +288,7 @@ func TestCheckHealthSchemaVersion(t *testing.T) {
 	h, err := st.CheckHealth(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, h.SchemaVersion)
-	require.Equal(t, len(ms), h.WantSchemaVersion)
+	require.Equal(t, sqlcore.LatestMigration(ms), h.WantSchemaVersion)
 	require.NoError(t, st.Migrate(ctx))
 	h, err = st.CheckHealth(ctx)
 	require.NoError(t, err)

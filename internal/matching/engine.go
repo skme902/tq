@@ -114,6 +114,10 @@ type Engine struct {
 	queueTagsLock sync.Mutex
 	queueTags     map[[2]string]struct{}
 
+	// redriveMu serializes RedriveDeadTasks. Without it, two goroutines can both spool a
+	// dead row before either deletes it and the backlog gets a duplicate.
+	redriveMu sync.Mutex
+
 	// testHookStopAfterSyncLeases, if set, runs in Stop after sync leases are re-spooled and
 	// before queues unload (tests only).
 	testHookStopAfterSyncLeases func()
@@ -122,6 +126,9 @@ type Engine struct {
 	testHookBeforeDrainSelect func()
 	// testHookBeforeRespool, if set, runs at the start of respoolSyncTaskLocked.
 	testHookBeforeRespool func(shuttingDown bool)
+	// testHookAfterDeadSnapshot, if set, runs after RedriveDeadTasks has snapshotted the max
+	// dead task id and before it redrives (tests only).
+	testHookAfterDeadSnapshot func()
 }
 
 // NewEngine validates options and returns an engine. Queues load lazily on first use.
@@ -610,6 +617,31 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 	}
 }
 
+// spoolTask writes task to the durable backlog and never sync-matches. Redrive uses it so the
+// task is persisted before its dead row is deleted. Public AddTask still sync-matches.
+func (e *Engine) spoolTask(ctx context.Context, queue store.QueueKey, task store.Task) error {
+	if err := e.validatePriority(task.Priority); err != nil {
+		return err
+	}
+	task.Attempts = 0 // owned by the queue, same as AddTask
+	if task.CreateTime.IsZero() {
+		task.CreateTime = e.timeSource.Now()
+	}
+	for attempt := 1; ; attempt++ {
+		pm, err := e.getTaskQueuePartitionManager(ctx, queue, true)
+		if err != nil {
+			return err
+		}
+		t := task
+		err = pm.spoolBacklog(&t)
+		// Same unload/conflict retries as AddTask. A waiting poller is not offered the task.
+		if err != nil && attempt < addTaskMaxAttempts && isShutdownOrConflict(err) && ctx.Err() == nil {
+			continue
+		}
+		return err
+	}
+}
+
 // PollOptions are per-poll options.
 type PollOptions struct {
 	Identity string
@@ -709,20 +741,25 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 			}
 		}
 		d, err := e.newDelivery(task, dbq, queue, opts.LeaseDuration)
-		if err == nil && !d.SyncMatched && dbq.maxAttempts() > 0 {
-			e.recordAttempt(dbq, task)
+		if errors.Is(err, errAttemptFenced) {
+			// Ownership was lost while recording the attempt. The backlog row is unchanged
+			// and the queue is unloaded. Do not hand the caller a delivery it could ack.
+			if derr := e.drainingErr(); derr != nil && callerCtx.Err() == nil {
+				return nil, derr
+			}
+			return nil, ErrNoTasks
 		}
 		return d, err
 	}
 }
 
-// respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
 func (e *Engine) isStopped() bool {
 	e.partitionsLock.RLock()
 	defer e.partitionsLock.RUnlock()
 	return e.stopped
 }
 
+// respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
 func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
 	e.respoolSyncTask(d, shuttingDown, time.Time{})
 }

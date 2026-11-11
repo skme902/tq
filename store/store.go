@@ -51,7 +51,7 @@ type (
 		// ExpiryTime: zero means never expires.
 		ExpiryTime time.Time
 		// Attempts is the number of deliveries of this task that have started (set by the
-		// queue; AddTask ignores it). See Delivery.Attempt and Config.MaxAttempts.
+		// queue; AddTask ignores it). See Delivery.Task.Attempts and Config.MaxAttempts.
 		Attempts int32 `json:",omitzero"`
 		// VisibleAt, if in the future, keeps the task from being delivered before then (library
 		// addition: delayed enqueue and Nack backoff). Zero or past means deliverable now.
@@ -229,10 +229,11 @@ type UpdateTaskRequest struct {
 	Task     TaskInfo
 }
 
-// DeadLetterTaskRequest moves Task from the backlog (Subqueue, Task.Pass, Task.ID) to the
-// queue's dead-letter set in one atomic write, so a reload cannot read it back. A backlog row
-// that is already gone (deleted by ack-level GC) is not an error. Recording the same task ID
-// again overwrites the dead entry, so a retry does not duplicate it.
+// DeadLetterTaskRequest records Task in the queue's dead-letter set. It does not remove the
+// backlog row: the engine finishes the task like an ack, and ack-level GC deletes the row.
+// A crash after this write and before that ack level is persisted leaves the task both live
+// and dead (at-least-once). A backlog row that is already gone is not an error. Recording
+// the same task ID again overwrites the dead entry, so a retry does not duplicate it.
 type DeadLetterTaskRequest struct {
 	Key      QueueKey
 	RangeID  int64 // fence: *ConditionFailedError if the stored rangeID differs

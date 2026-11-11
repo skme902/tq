@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	msqlite "modernc.org/sqlite" // registers driver "sqlite"
@@ -78,7 +79,10 @@ type Store struct {
 	w, r *sql.DB
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store         = (*Store)(nil)
+	_ store.HealthChecker = (*Store)(nil)
+)
 
 // Open opens (creating if needed) the database file at path. In-memory databases are not
 // supported (the writer and reader pools must see the same database); use store/memstore.
@@ -184,18 +188,28 @@ func isBusy(err error) bool {
 	return c == 5 || c == 6 // SQLITE_BUSY, SQLITE_LOCKED
 }
 
-// Migrate applies pending embedded migrations in one BEGIN IMMEDIATE transaction (which
-// serialises concurrent migrators). Safe to call on every start-up.
-// CheckHealth implements store.HealthChecker: a ping of the pool(s) and the applied schema
+// latestMigration is the newest embedded migration, computed once (the embedded files never
+// change at run time).
+var latestMigration = sync.OnceValues(func() (int, error) {
+	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
+	if err != nil {
+		return 0, err
+	}
+	return sqlcore.LatestMigration(ms), nil
+})
+
+// CheckHealth implements store.HealthChecker: a ping of the read pool and the applied schema
 // version against the newest embedded migration.
 func (s *Store) CheckHealth(ctx context.Context) (store.StoreHealth, error) {
-	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
+	want, err := latestMigration()
 	if err != nil {
 		return store.StoreHealth{}, err
 	}
-	return s.Store.CheckHealth(ctx, sqlcore.LatestMigration(ms))
+	return s.Store.CheckHealth(ctx, want)
 }
 
+// Migrate applies pending embedded migrations in one BEGIN IMMEDIATE transaction (which
+// serialises concurrent migrators). Safe to call on every start-up.
 func (s *Store) Migrate(ctx context.Context) error {
 	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
 	if err != nil {
