@@ -36,8 +36,12 @@ func pollAdvancing(t *testing.T, e *taskqueue.Engine, ts *clock.EventTimeSource)
 	var d *taskqueue.Delivery
 	require.Eventually(t, func() bool {
 		ts.Advance(time.Millisecond)
+		// Bound the poll in real time: a NoWait poll that finds nothing waits on the fake
+		// clock, and timer callbacks (the matcher's rematch) run asynchronously after Advance.
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
 		var err error
-		d, err = e.PollTask(context.Background(), q, taskqueue.PollOptions{NoWait: true})
+		d, err = e.PollTask(ctx, q, taskqueue.PollOptions{NoWait: true})
 		return err == nil
 	}, 5*time.Second, time.Millisecond)
 	return d

@@ -33,7 +33,14 @@ type trackedTimer struct {
 func (t *trackedTimer) Stop() bool { t.stopped.Store(true); return t.Timer.Stop() }
 
 func (c *longTimerClock) AfterFunc(d time.Duration, f func()) clock.Timer {
-	t := c.EventTimeSource.AfterFunc(d, f)
+	return c.track(c.EventTimeSource.AfterFunc(d, f), d)
+}
+
+func (c *longTimerClock) AfterFuncAt(deadline time.Time, f func()) clock.Timer {
+	return c.track(c.EventTimeSource.AfterFuncAt(deadline, f), deadline.Sub(c.Now()))
+}
+
+func (c *longTimerClock) track(t clock.Timer, d time.Duration) clock.Timer {
 	if d < time.Hour {
 		return t
 	}

@@ -681,7 +681,7 @@ func (rt *resettableTimer) set(ts clock.TimeSource, f func(), delay time.Duratio
 	if delay <= 0 {
 		rt.unset()
 	} else if rt.timer == nil {
-		rt.timer = ts.AfterFunc(delay, f)
+		rt.timer = afterFunc(ts, delay, f)
 	} else {
 		rt.timer.Reset(delay)
 	}

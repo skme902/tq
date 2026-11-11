@@ -190,7 +190,7 @@ func (d *Delivery) arm(lease time.Duration) {
 	// write between constructing the delivery and calling arm; the expire callback
 	// trusts this deadline, so it has to match the timer.
 	d.deadline = d.engine.timeSource.Now().Add(lease)
-	d.timer = d.engine.timeSource.AfterFunc(lease, d.expire)
+	d.timer = afterFunc(d.engine.timeSource, lease, d.expire)
 	d.mu.Unlock()
 }
 
@@ -359,7 +359,7 @@ func (d *Delivery) expire() {
 func (d *Delivery) redeliver(err error, reason, detail string, delay time.Duration) {
 	var visibleAt time.Time
 	if delay > 0 {
-		visibleAt = d.engine.timeSource.Now().Add(delay)
+		visibleAt = redeliveryTime(d.engine.timeSource.Now(), delay)
 	}
 	if d.SyncMatched {
 		d.engine.respoolSyncTask(d, false, visibleAt)
