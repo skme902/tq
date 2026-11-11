@@ -94,8 +94,17 @@ type Engine struct {
 	shutdownClaimed atomic.Bool
 	shutdownErr     error
 	shutdownDone    chan struct{}
+	// drainBegin publishes the drain start (draining, drainStart, the engine_draining gauge)
+	// once; later callers block in it until the first has published, so all of it happens
+	// before any caller reaches completeShutdown.
+	drainBegin sync.Once
 	// drainStart is when the first Shutdown began (UnixNano), for engine_drain_duration.
 	drainStart atomic.Int64
+	// gaveUp is the first give-up decision (a caller's ctx ended with work in flight), under
+	// leasesLock. Every other waiter adopts it, so all callers share one result.
+	gaveUp          bool
+	gaveUpErr       error
+	gaveUpRemaining int
 	// stopDone is closed when Stop has finished respooling and unloading; a concurrent or
 	// later Stop, and a Shutdown that finds the engine stopped, wait on it.
 	stopDone chan struct{}
@@ -231,12 +240,13 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	if done, err := e.finishedShutdown(); done {
 		return err
 	}
-	if !e.draining.Swap(true) {
+	e.drainBegin.Do(func() {
 		e.drainStart.Store(e.timeSource.Now().UnixNano())
+		e.draining.Store(true)
 		e.metricsHandler.Gauge(metrics.EngineDraining, 1)
 		e.logger.Info("draining", "leases", e.outstandingLeaseCount())
-	}
-	e.drainCancel()
+		e.drainCancel()
+	})
 
 	remaining, err := e.waitDrain(ctx)
 	return e.completeShutdown(err, remaining)
@@ -258,7 +268,9 @@ func (e *Engine) finishedShutdown() (bool, error) {
 		return false, nil
 	}
 	<-e.stopDone // a Stop in progress may still be respooling
-	if e.shutdownClaimed.Load() {
+	if e.shutdownClaimed.Load() || e.draining.Load() {
+		// A Shutdown is in progress (it may be between its drain decision and Stop when a
+		// direct Stop ran): share its result.
 		<-e.shutdownDone
 		return true, e.shutdownErr
 	}
@@ -271,14 +283,20 @@ func (e *Engine) finishedShutdown() (bool, error) {
 }
 
 // waitDrain blocks until no lease and no in-flight poll remains, or ctx is done.
-// The lease count is sampled under leasesLock at that decision. A finished drain wins
-// over a done ctx. Leasing is closed before returning so newDelivery cannot admit a
-// lease in the window before Stop.
+// The decision is made under leasesLock; remaining counts leases plus in-flight polls at
+// that point. A finished drain wins over a done ctx. Leasing is closed before returning so
+// newDelivery cannot admit a lease in the window before Stop. The first give-up is recorded
+// and wakes every other waiter, which returns that same decision.
 func (e *Engine) waitDrain(ctx context.Context) (int, error) {
 	for {
 		e.leasesLock.Lock()
-		remaining := len(e.leases)
-		if remaining == 0 && e.activePolls == 0 {
+		if e.gaveUp {
+			n, err := e.gaveUpRemaining, e.gaveUpErr
+			e.leasesLock.Unlock()
+			return n, err
+		}
+		remaining := len(e.leases) + e.activePolls
+		if remaining == 0 {
 			e.leasesClosed = true
 			e.maybeWakeDrainLocked()
 			e.leasesLock.Unlock()
@@ -286,6 +304,10 @@ func (e *Engine) waitDrain(ctx context.Context) (int, error) {
 		}
 		if cerr := ctx.Err(); cerr != nil {
 			e.leasesClosed = true
+			e.gaveUp, e.gaveUpErr, e.gaveUpRemaining = true, cerr, remaining
+			if e.leasesDrained != nil && !isClosed(e.leasesDrained) {
+				close(e.leasesDrained)
+			}
 			e.leasesLock.Unlock()
 			return remaining, cerr
 		}

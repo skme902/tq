@@ -193,9 +193,14 @@ if err := e.Shutdown(ctx); err != nil {
   engine has already unloaded, returns an error to the producer. The same holds for an `AddTask`
   whose sync match failed in `Starter` during a clean drain. Producers must treat an `AddTask`
   error as "not enqueued" and retry (on another engine during shutdown).
+- Delivery stays at-least-once: a task can still be delivered again after a drain. Two known
+  cases: an `Ack` of a backlog lease the reader had trimmed from memory is kept in memory only
+  until the ack level passes it, so it is redelivered after the next load; and an `AddTask`
+  whose spool write commits while the queue unloads can report an error (upstream's writer
+  behaviour), so a producer retry writes a second copy.
 - Metrics (no queue tags): `engine_draining` (1 while draining, 0 after),
-  `engine_drain_leases_remaining` (outstanding leases sampled under the lease lock when Shutdown
-  decides; 0 when the drain finishes), `engine_drain_duration`. The lease gauge and the duration
+  `engine_drain_leases_remaining` (outstanding leases plus in-flight polls, sampled under the
+  lease lock when Shutdown decides; 0 when the drain finishes), `engine_drain_duration`. The lease gauge and the duration
   are emitted once, by the call that stops the engine.
 
 ## Health
