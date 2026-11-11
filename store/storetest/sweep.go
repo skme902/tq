@@ -110,3 +110,36 @@ func testSweepLevelOrder(_ *testing.T, s *suite) {
 	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{s.randomTask(math.MaxInt64, 2)}, nil))
 	s.True(s.deleteIfIdle(d, rangeID), "every row is at or below the ack level")
 }
+
+// With Now set, tasks above the ack level that have expired do not keep the queue, and they go
+// with it; an unexpired or unset expiry does (review retention r1 P1).
+func testSweepExpiredTasks(_ *testing.T, s *suite) {
+	d := s.sweeper()
+	rangeID := randRangeID()
+	info := s.createQueue(rangeID)
+	s.setAckLevel(rangeID, info, 0, store.Level{Pass: 1, ID: 0})
+	expired := s.randomTask(1, 1)
+	expired.Data.ExpiryTime = s.now().Add(-time.Hour)
+	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{expired}, nil))
+	del := func(now time.Time) bool {
+		ok, err := d.DeleteQueueIfIdle(s.ctx, &store.DeleteQueueIfIdleRequest{Key: s.key, RangeID: rangeID, Now: now})
+		s.NoError(err)
+		return ok
+	}
+	s.False(del(time.Time{}), "without Now every row above the ack level is live")
+	s.True(del(s.now()), "only expired tasks: deleted")
+	s.False(s.queueExists())
+	info = s.createQueue(rangeID)
+	s.Empty(s.getAll(0), "expired rows go with the queue")
+	s.setAckLevel(rangeID, info, 0, store.Level{Pass: 1, ID: 0})
+
+	expired = s.randomTask(1, 1)
+	expired.Data.ExpiryTime = s.now().Add(-time.Hour)
+	noExpiry := s.randomTask(2, 1)
+	noExpiry.Data.ExpiryTime = time.Time{}
+	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{expired, noExpiry}, nil))
+	s.False(del(s.now()), "a task with no expiry is live")
+	unexpired := s.randomTask(3, 2)
+	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{unexpired}, nil))
+	s.Len(s.getAll(0), 3)
+}

@@ -97,3 +97,27 @@ func TestNegativeMaxTaskAgeOverrideIgnored(t *testing.T) {
 		require.NoError(t, d.Ack())
 	}
 }
+
+// An abandoned queue holding only expired tasks is swept, rows and all; one with an unexpired
+// task is kept (review r1 P1: expired rows above the ack level kept the queue forever).
+func TestSweepDeletesQueueOfExpiredTasks(t *testing.T) {
+	st := memstore.New()
+	ts := clock.NewEventTimeSource().Update(time.Now())
+	keep := taskqueue.QueueKey{Namespace: "ns", Name: "keep"}
+	e1 := newEngine(t, st, nil, withClock(ts))
+	stale := task("stale")
+	stale.ExpiryTime = ts.Now().Add(time.Hour)
+	_, err := e1.AddTask(context.Background(), q, stale)
+	require.NoError(t, err)
+	addTo(t, e1, keep, "no expiry")
+	e1.Stop()
+
+	ts.Advance(taskqueue.MinSweepIdle + time.Minute)
+	e2 := newEngine(t, st, nil, withClock(ts))
+	res, err := e2.SweepIdleQueues(context.Background(), taskqueue.SweepOptions{IdleFor: taskqueue.MinSweepIdle})
+	require.NoError(t, err)
+	require.Equal(t, []taskqueue.QueueKey{q}, res.Deleted)
+	require.False(t, queueExists(t, st, q))
+	require.Zero(t, st.TotalTaskCount(q))
+	require.True(t, queueExists(t, st, keep))
+}

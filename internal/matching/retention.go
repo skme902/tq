@@ -145,5 +145,5 @@ func (e *Engine) deleteIfIdle(ctx context.Context, sw store.QueueSweeper, key st
 		e.partitionsLock.Unlock()
 		close(done)
 	}()
-	return sw.DeleteQueueIfIdle(ctx, &store.DeleteQueueIfIdleRequest{Key: key, RangeID: rangeID, IdleBefore: idleBefore})
+	return sw.DeleteQueueIfIdle(ctx, &store.DeleteQueueIfIdleRequest{Key: key, RangeID: rangeID, IdleBefore: idleBefore, Now: e.timeSource.Now()})
 }

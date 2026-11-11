@@ -206,6 +206,9 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 			if ti.Pass == ack.Pass && ti.ID == ack.ID {
 				return true
 			}
+			if !req.Now.IsZero() && ti.Data.ExpiryTime.Unix() > 0 && ti.Data.ExpiryTime.Before(req.Now) {
+				return true // expired: goes with the queue
+			}
 			live = true
 			return false
 		})

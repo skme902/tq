@@ -261,8 +261,9 @@ lease flags were not built; see the status above.
 **Status: implemented in feat/ops-retention** (README §Retention): `Engine.SweepIdleQueues(ctx, SweepOptions)`,
 `store.QueueSweeper.DeleteQueueIfIdle`, `Config.MaxTaskAge`/`QueueConfig.MaxTaskAge`, and dead-task retention via
 `SweepOptions.DeadTaskRetention`. Refinements over the design below:
-- "Empty" means no task row above each subqueue's ack level (rows at or below it only await GC), checked in the
-  delete transaction, rather than the approximate backlog count, which can stay stale after a crash.
+- "Empty" means no unexpired task row above each subqueue's ack level (rows at or below it only await GC, and
+  expired rows go with the queue, as upstream's scavenger deletes expired tasks first), checked in the delete
+  transaction, rather than the approximate backlog count, which can stay stale after a crash.
 - The delete is also conditioned on `LastUpdateTime < now - IdleFor` in the same transaction, and `IdleFor` must be
   at least 48h: a loaded queue rewrites its row only every 12h (48h tolerates a missed rewrite, as upstream's
   scavenger does), and a deleted-then-recreated queue restarts at

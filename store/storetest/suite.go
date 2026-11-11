@@ -73,6 +73,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"Sweep_UntrackedSubqueue", testSweepUntrackedSubqueue},
 		{"Sweep_DeadTasks", testSweepDeadTasks},
 		{"Sweep_LevelOrder", testSweepLevelOrder},
+		{"Sweep_ExpiredTasks", testSweepExpiredTasks},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

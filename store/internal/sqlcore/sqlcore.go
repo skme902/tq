@@ -75,7 +75,7 @@ type queries struct {
 	listQueuesFirst, listQueuesAfter                                                   string
 	updateTask, deleteTask, insertDead, listDeadFirst, listDeadAfter, deleteDeadBefore string
 	countDead, deleteAllDead                                                           string
-	taskSubqueues, liveTaskExists, deadExists                                          string
+	taskSubqueues, liveTaskExists, liveTaskRows, deadExists                            string
 }
 
 // New returns a Store that writes through w and reads through r (r may be nil to use w).
@@ -136,6 +136,7 @@ func buildQueries(d Dialect) queries {
 		deleteAllDead:    `DELETE FROM tq_dead_tasks WHERE ` + queueKey,
 		taskSubqueues:    `SELECT DISTINCT subqueue FROM tq_tasks WHERE ` + queueKey,
 		liveTaskExists:   `SELECT 1 FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?) LIMIT 1`,
+		liveTaskRows:     `SELECT data, data_encoding FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?)`,
 		deadExists:       `SELECT 1 FROM tq_dead_tasks WHERE ` + queueKey + ` LIMIT 1`,
 	}
 	if d.RowRef != "" {
@@ -167,6 +168,7 @@ func buildQueries(d Dialect) queries {
 		q.deleteAllDead = rebind(q.deleteAllDead, 0)
 		q.taskSubqueues = rebind(q.taskSubqueues, 0)
 		q.liveTaskExists = rebind(q.liveTaskExists, 0)
+		q.liveTaskRows = rebind(q.liveTaskRows, 0)
 		q.deadExists = rebind(q.deadExists, 0)
 	}
 	return q
@@ -467,6 +469,16 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 			if sq < len(info.Subqueues) {
 				ack = info.Subqueues[sq].FairAckLevel
 			}
+			if !req.Now.IsZero() {
+				live, err := s.unexpiredTaskAbove(ctx, tx, int64(hash), id, sq, ack, req.Now)
+				if err != nil {
+					return err
+				}
+				if live {
+					return nil
+				}
+				continue
+			}
 			switch err := tx.QueryRowContext(ctx, s.q.liveTaskExists, int64(hash), id, sq, ack.Pass, ack.ID).Scan(&one); {
 			case err == nil:
 				return nil
@@ -492,6 +504,33 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 		return false, err
 	}
 	return deleted, nil
+}
+
+// unexpiredTaskAbove reports whether subqueue sq has a task above ack that has not expired at
+// now. A row that cannot be decoded counts as live: the sweep must not delete what it cannot read.
+func (s *Store) unexpiredTaskAbove(ctx context.Context, tx *sql.Tx, hash int64, id []byte, sq int, ack store.Level, now time.Time) (bool, error) {
+	rows, err := tx.QueryContext(ctx, s.q.liveTaskRows, hash, id, sq, ack.Pass, ack.ID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			data []byte
+			enc  string
+			t    store.Task
+		)
+		if err := rows.Scan(&data, &enc); err != nil {
+			return false, err
+		}
+		if enc != DataEncoding || json.Unmarshal(data, &t) != nil {
+			return true, nil
+		}
+		if !(t.ExpiryTime.Unix() > 0 && t.ExpiryTime.Before(now)) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) DeleteQueue(ctx context.Context, req *store.DeleteQueueRequest) error {
