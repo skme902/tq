@@ -52,6 +52,9 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"GetTasks_RejectsPassZero", testGetTasksRejectsPassZero},
 		{"CompleteTasksLessThan_Limit", testCompleteLimit},
 		{"Payload_NotAliased", testPayloadNotAliased},
+		{"ListQueues_Paged", testListQueuesPaged},
+		{"ListQueues_ReadOnly", testListQueuesReadOnly},
+		{"ListQueues_InvalidArgs", testListQueuesInvalidArgs},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -429,4 +432,81 @@ func testPayloadNotAliased(_ *testing.T, s *suite) {
 	task.Data.Payload[0] ^= 0xff
 	got := s.getAll(0)
 	s.Equal(want, got[0].Data.Payload)
+}
+
+func (s *suite) lister() store.QueueLister {
+	l, ok := s.store.(store.QueueLister)
+	if !ok {
+		s.t.Skip("store does not implement store.QueueLister")
+	}
+	return l
+}
+
+// listAll pages through ListQueues and returns the rows in this suite's namespace (the store
+// may be shared with other subtests).
+func (s *suite) listAll(pageSize int) (mine []store.ListedQueue, pages int) {
+	l := s.lister()
+	var tok []byte
+	for {
+		resp, err := l.ListQueues(s.ctx, &store.ListQueuesRequest{PageSize: pageSize, PageToken: tok})
+		s.NoError(err)
+		s.LessOrEqual(len(resp.Queues), pageSize)
+		pages++
+		for _, q := range resp.Queues {
+			if q.Info.Key.Namespace == s.key.Namespace {
+				mine = append(mine, q)
+			}
+		}
+		if resp.NextPageToken == nil {
+			return mine, pages
+		}
+		s.NotEmpty(resp.Queues, "a page with a next token must not be empty")
+		tok = resp.NextPageToken
+	}
+}
+
+func testListQueuesPaged(_ *testing.T, s *suite) {
+	s.lister()
+	want := map[store.QueueKey]int64{}
+	for i := range 7 {
+		s.key.Name = fmt.Sprintf("list-%d", i)
+		s.key.Partition = i % 2
+		rangeID := randRangeID()
+		s.createQueue(rangeID)
+		want[s.key] = rangeID
+	}
+	for _, pageSize := range []int{1, 3, 7, 1000} {
+		got, pages := s.listAll(pageSize)
+		s.Len(got, len(want), "page size %d", pageSize)
+		seen := map[store.QueueKey]bool{}
+		for _, q := range got {
+			s.False(seen[q.Info.Key], "queue %v listed twice", q.Info.Key)
+			seen[q.Info.Key] = true
+			s.Equal(want[q.Info.Key], q.RangeID)
+			s.Len(q.Info.Subqueues, 1)
+		}
+		if pageSize == 1 {
+			s.GreaterOrEqual(pages, len(want))
+		}
+	}
+}
+
+func testListQueuesReadOnly(_ *testing.T, s *suite) {
+	rangeID := randRangeID()
+	info := s.createQueue(rangeID)
+	got, _ := s.listAll(2)
+	s.Len(got, 1)
+	s.assertQueue(rangeID, info)
+	// The listed copy is not aliased to the store.
+	got[0].Info.Subqueues[0].ApproximateBacklogCount = -42
+	s.assertQueue(rangeID, info)
+}
+
+func testListQueuesInvalidArgs(_ *testing.T, s *suite) {
+	l := s.lister()
+	_, err := l.ListQueues(s.ctx, &store.ListQueuesRequest{PageSize: 0})
+	var ia *store.InvalidArgumentError
+	s.ErrorAs(err, &ia)
+	_, err = l.ListQueues(s.ctx, &store.ListQueuesRequest{PageSize: 1, PageToken: []byte("not a token")})
+	s.ErrorAs(err, &ia)
 }
