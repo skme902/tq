@@ -1,7 +1,7 @@
 // Ported from temporalio/temporal v1.32.1 af08a5e5, service/matching/db.go
 // Changes: fair-path only (classic CreateTasks/GetTasks/ack level and draining/migration and
-// partition scale state removed); protos replaced by store types; metrics gauges replaced by
-// one approximate backlog gauge; injected clock.
+// partition scale state removed); protos replaced by store types; backlog gauges are the
+// unversioned (non-attribution) ones; no task lag gauge; injected clock.
 // Copyright (c) 2025 Temporal Technologies Inc. MIT License; see UPSTREAM_LICENSE and NOTICE.
 
 package matching
@@ -481,13 +481,79 @@ func (db *taskQueueDB) cachedQueueInfo() *store.QueueInfo {
 	}
 }
 
-// emitPhysicalBacklogGaugesLocked emits the approximate backlog count gauge.
+// emitPhysicalBacklogGaugesLocked is upstream's without versioning: the backlog count per
+// task_priority and the backlog age, named physical_* when the periodic (logical) emission is
+// on and unprefixed when it is off, only when the queue has its real taskqueue tag.
+// task_lag_per_tl is not ported (upstream marks it a poor estimate).
 func (db *taskQueueDB) emitPhysicalBacklogGaugesLocked() {
-	var total int64
-	for _, s := range db.subqueues {
-		total += s.ApproximateBacklogCount
+	if !db.config.BreakdownMetricsByTaskQueue {
+		return
 	}
-	db.metricsHandler.Gauge(metrics.ApproximateBacklogCount, float64(total))
+	countGauge, ageGauge := db.backlogGaugeNames()
+	var oldestTime time.Time
+	counts := make(map[int32]int64)
+	for _, s := range db.subqueues {
+		counts[s.Key.Priority] += s.ApproximateBacklogCount
+		oldestTime = minNonZeroTime(oldestTime, s.oldestTime)
+	}
+	for priority, count := range counts {
+		db.metricsHandler.Gauge(countGauge, float64(count), metrics.TaskPriorityTag(priority))
+	}
+	if oldestTime.IsZero() {
+		db.metricsHandler.Gauge(ageGauge, 0)
+	} else {
+		db.metricsHandler.Gauge(ageGauge, db.timeSource.Since(oldestTime).Seconds())
+	}
+}
+
+func (db *taskQueueDB) backlogGaugeNames() (count, age string) {
+	if db.config.BacklogMetricsEmitInterval > 0 { // upstream attributionEnabled
+		return metrics.PhysicalApproximateBacklogCount, metrics.PhysicalApproximateBacklogAgeSeconds
+	}
+	return metrics.ApproximateBacklogCount, metrics.ApproximateBacklogAgeSeconds
+}
+
+// emitZeroPhysicalBacklogGauges is upstream's: called when the queue unloads so stale values
+// do not persist.
+func (db *taskQueueDB) emitZeroPhysicalBacklogGauges() {
+	if !db.config.BreakdownMetricsByTaskQueue {
+		return
+	}
+	priorities := make(map[int32]struct{})
+	db.Lock()
+	for _, s := range db.subqueues {
+		priorities[s.Key.Priority] = struct{}{}
+	}
+	db.Unlock()
+	countGauge, ageGauge := db.backlogGaugeNames()
+	for k := range priorities {
+		db.metricsHandler.Gauge(countGauge, 0, metrics.TaskPriorityTag(k))
+	}
+	db.metricsHandler.Gauge(ageGauge, 0)
+}
+
+// getApproximateBacklogCountsBySubqueue is upstream's.
+func (db *taskQueueDB) getApproximateBacklogCountsBySubqueue() []int64 {
+	db.Lock()
+	defer db.Unlock()
+	result := make([]int64, len(db.subqueues))
+	for id, s := range db.subqueues {
+		result[id] = s.ApproximateBacklogCount
+	}
+	return result
+}
+
+func minNonZeroTime(a, b time.Time) time.Time {
+	switch {
+	case a.IsZero():
+		return b
+	case b.IsZero():
+		return a
+	case a.Before(b):
+		return a
+	default:
+		return b
+	}
 }
 
 func (db *taskQueueDB) ensureDefaultSubqueuesLocked(infos []store.SubqueueInfo) []*dbSubqueue {

@@ -60,6 +60,14 @@ type (
 	PartitionRouter = matching.PartitionRouter
 	// SubqueueStatus is a debugging snapshot of one subqueue.
 	SubqueueStatus = matching.SubqueueStatus
+	// QueueDescription is Engine.DescribeQueue's snapshot (upstream DescribeTaskQueue stats).
+	QueueDescription = matching.QueueDescription
+	// QueueStats are backlog count/age and add/dispatch rates (upstream TaskQueueStats).
+	QueueStats = matching.QueueStats
+	// QueueListing is one row of Engine.ListQueues.
+	QueueListing = matching.QueueListing
+	// ListQueuesPage is one page of Engine.ListQueues.
+	ListQueuesPage = matching.ListQueuesPage
 
 	// QueueKey identifies a queue partition.
 	QueueKey = store.QueueKey

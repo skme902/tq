@@ -144,6 +144,12 @@ func (tr *fairTaskReader) Start() {
 	tr.maybeReadTasksLocked()
 }
 
+func (tr *fairTaskReader) getOldestBacklogTime() time.Time {
+	tr.lock.Lock()
+	defer tr.lock.Unlock()
+	return tr.backlogAge.oldestTime()
+}
+
 func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 	recordDroppedTask(tr.backlogMgr.metricsHandler, res.dropReason)
 	err := res.err()
