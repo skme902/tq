@@ -70,7 +70,7 @@ func (tr *fairTaskReader) delayLocked(task *internalTask, visibleAt time.Time) b
 // undelayLocked drops a delayed task's delayed state (it is completed, trimmed or deleted).
 func (tr *fairTaskReader) undelayLocked(task *internalTask) {
 	task.delayed = false
-	task.delayGen++ // a pending registration or firing for the old delay is dropped
+	task.delayGen++ // a callback already scheduled for the old delay is ignored
 	tr.delayedTasks--
 	if task.delayTimer != nil {
 		task.delayTimer.Stop()
@@ -130,7 +130,9 @@ func (tr *fairTaskReader) recordEvictedDelayLocked(level fairLevel, at time.Time
 // delayFired makes a delayed task matchable, unless it left the delayed state meanwhile.
 func (tr *fairTaskReader) delayFired(task *internalTask, gen uint64) {
 	tr.lock.Lock()
-	if !task.delayed || task.delayGen != gen || tr.delayStopped || tr.backlogMgr.tqCtx.Err() != nil {
+	// No separate delayStopped check: stopDelayTimers bumps delayGen of every delayed task, and
+	// armDelayLocked arms nothing once stopped, so a callback reaching here after a stop is stale.
+	if !task.delayed || task.delayGen != gen || tr.backlogMgr.tqCtx.Err() != nil {
 		tr.lock.Unlock()
 		return
 	}
