@@ -87,6 +87,9 @@ type (
 		// addition) and is tracked as delayed rather than loaded. Guarded like leased.
 		delayed    bool
 		delayTimer clock.Timer
+		// delayGen identifies the current delay (guarded by the reader lock): a timer
+		// registered or fired for an older one is stopped or ignored.
+		delayGen uint64
 		// redeliverAt (unix nanos, 0 = none) is set by a delayed Nack or expiry before the task
 		// is finished back to its reader, which then delays it instead of re-matching it.
 		redeliverAt atomic.Int64

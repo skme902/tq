@@ -16,6 +16,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/skme902/tq/clock"
 	"github.com/skme902/tq/internal/backoff"
 	"github.com/skme902/tq/metrics"
 )
@@ -36,10 +37,43 @@ func (tr *fairTaskReader) armDelayLocked(task *internalTask, visibleAt time.Time
 	if tr.delayStopped {
 		return // the queue is stopping: the row keeps VisibleAt for the next load
 	}
-	d := max(visibleAt.Sub(tr.backlogMgr.timeSource.Now()), 0)
-	// Not under the timer callback: the matcher reads the clock, and a fake clock runs
-	// callbacks with its lock held.
-	task.delayTimer = tr.backlogMgr.timeSource.AfterFunc(d, func() { go tr.delayFired(task) })
+	task.delayGen++
+	// Register the timer outside tr.lock: a fake clock (EventTimeSource) runs callbacks with its
+	// own lock held, and some callbacks take tr.lock, so calling the clock under tr.lock could
+	// deadlock (lock order tr.lock -> clock vs clock -> tr.lock).
+	go tr.registerDelayTimer(task, task.delayGen, visibleAt)
+}
+
+// registerDelayTimer arms the timer for delay gen of task, unless that delay ended meanwhile.
+func (tr *fairTaskReader) registerDelayTimer(task *internalTask, gen uint64, visibleAt time.Time) {
+	ts := tr.backlogMgr.timeSource
+	var timer clock.Timer
+	for {
+		now := ts.Now()
+		d := visibleAt.Sub(now)
+		if d <= 0 {
+			// Already due (the clock moved before this ran): a fake clock would not fire a
+			// zero timer until its next Advance, so fire now. delayFired checks gen.
+			tr.delayFired(task, gen)
+			return
+		}
+		// The callback does not run delayFired inline: the matcher reads the clock, and a fake
+		// clock runs callbacks with its lock held.
+		timer = ts.AfterFunc(d, func() { go tr.delayFired(task, gen) })
+		// AfterFunc reads the clock again; if it moved meanwhile (a fake clock's Advance), the
+		// deadline is late by that much, so re-arm.
+		if ts.Now().Sub(now) <= time.Millisecond {
+			break
+		}
+		timer.Stop()
+	}
+	tr.lock.Lock()
+	defer tr.lock.Unlock()
+	if !task.delayed || task.delayGen != gen || tr.delayStopped {
+		timer.Stop()
+		return
+	}
+	task.delayTimer = timer
 }
 
 // delayLocked turns a loaded (just unleased) task into a delayed one. It reports false if
@@ -62,6 +96,7 @@ func (tr *fairTaskReader) delayLocked(task *internalTask, visibleAt time.Time) b
 // undelayLocked drops a delayed task's delayed state (it is completed, trimmed or deleted).
 func (tr *fairTaskReader) undelayLocked(task *internalTask) {
 	task.delayed = false
+	task.delayGen++ // a pending registration or firing for the old delay is dropped
 	tr.delayedTasks--
 	if task.delayTimer != nil {
 		task.delayTimer.Stop()
@@ -87,19 +122,35 @@ func (tr *fairTaskReader) stopDelayTimers() {
 }
 
 // delayFired makes a delayed task matchable, unless it left the delayed state meanwhile.
-func (tr *fairTaskReader) delayFired(task *internalTask) {
+func (tr *fairTaskReader) delayFired(task *internalTask, gen uint64) {
 	tr.lock.Lock()
-	if !task.delayed || tr.backlogMgr.tqCtx.Err() != nil {
+	if !task.delayed || task.delayGen != gen || tr.backlogMgr.tqCtx.Err() != nil {
 		tr.lock.Unlock()
 		return
 	}
 	task.delayed = false
 	task.delayTimer = nil
 	tr.delayedTasks--
+	if o, ok := tr.outstandingTasks.Get(outstandingTask{level: task.fairLevel()}); !ok || o.task != task {
+		tr.lock.Unlock() // no longer tracked by this reader: a re-read owns the row
+		return
+	}
 	tr.loadedTasks++
+	// Reset the matcher state under the lock: a trim that runs once the lock is dropped then
+	// marks the task evicted, and the matcher refuses it. Resetting after the unlock (as
+	// addTaskToMatcher does) would wipe that eviction, and the trimmed row would be matched
+	// here and again by the re-read that loads it.
+	task.resetMatcherState()
 	tr.lock.Unlock()
-	tr.addTaskToMatcher(task)
+	if testHookDelayFiredUnlocked != nil {
+		testHookDelayFiredUnlocked(tr, task)
+	}
+	tr.addPreparedTaskToMatcher(task)
 }
+
+// testHookDelayFiredUnlocked runs in delayFired between dropping the reader lock and adding the
+// task to the matcher (tests only).
+var testHookDelayFiredUnlocked func(tr *fairTaskReader, task *internalTask)
 
 // RetryBackoff is an exponential delay before a nacked or expired backlog task is
 // redelivered (library addition). The n-th failed delivery waits

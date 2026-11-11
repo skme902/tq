@@ -55,9 +55,11 @@ func TestStopReleasesDelayTimers(t *testing.T) {
 	require.NoError(t, err)
 	addTo(t, e, q, "ready")
 	require.NoError(t, pollFrom(t, e, q).Ack()) // the reader has loaded the delayed task
-	ts.mu.Lock()
-	require.Len(t, ts.long, 1, "the delayed task is on a timer")
-	ts.mu.Unlock()
+	require.Eventually(t, func() bool {         // the timer is registered asynchronously
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
+		return len(ts.long) == 1
+	}, 3*time.Second, time.Millisecond, "the delayed task is on a timer")
 	e.Stop()
 	ts.mu.Lock()
 	defer ts.mu.Unlock()

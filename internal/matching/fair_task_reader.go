@@ -65,6 +65,12 @@ type (
 		// by the number of outstanding leases; entries leave on Ack, Nack or expiry.
 		leasedEvicted map[fairLevel]*internalTask
 
+		// Deviation (delay, library addition): redelivery times of trimmed leases that were
+		// nacked or expired with a delay. The next read of the row applies it, so an in-memory
+		// delay (no DeadLetterStore, or a failed VisibleAt write) or a read that fetched the row
+		// before the write is not lost. Bounded by evictedAcksCacheSize; nil until first use.
+		evictedDelays map[fairLevel]time.Time
+
 		// Deviation (task admin, library addition): levels deleted by Engine.DeleteTask. A read
 		// that fetched the row before the delete committed must not load it. Pruned once the ack
 		// level passes them; nil until the first delete.
@@ -180,6 +186,18 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 		// A leased task trimmed from memory: the lease is over, so a re-read may deliver it again
 		// (after a failure) or skip it via evictedAcks (after success).
 		delete(tr.leasedEvicted, task.fairLevel())
+		if at := task.redeliverAt.Swap(0); at != 0 && err != nil && isTransientMatchError(err) {
+			if tr.evictedDelays == nil {
+				tr.evictedDelays = make(map[fairLevel]time.Time)
+			}
+			tr.evictedDelays[task.fairLevel()] = time.Unix(0, at)
+			for l := range tr.evictedDelays {
+				if len(tr.evictedDelays) <= evictedAcksCacheSize {
+					break
+				}
+				delete(tr.evictedDelays, l)
+			}
+		}
 		// Deviation: upstream relies on history to dedupe the re-read task. We remember the
 		// successful completion in evictedAcks so the re-read is skipped instead of redelivered.
 		if err == nil && tr.ackLevel.less(task.fairLevel()) {
@@ -402,6 +420,12 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 // call with_out_ lock held
 func (tr *fairTaskReader) addTaskToMatcher(task *internalTask) {
 	task.resetMatcherState()
+	tr.addPreparedTaskToMatcher(task)
+}
+
+// addPreparedTaskToMatcher is addTaskToMatcher for a task whose matcher state the caller
+// already reset (under the reader lock, so an eviction after that is honoured).
+func (tr *fairTaskReader) addPreparedTaskToMatcher(task *internalTask) {
 	if task.adminDeleted.Load() {
 		return // Deviation (task admin): deleted or purged; see internalTask.adminRemove
 	}
@@ -570,7 +594,13 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			task.event.leaseFunc = tr.leaseTask
 			task.event.subqueue = tr.subqueue
 			tr.backlogMgr.setPriority(task)
-			task.delayed = t.Data.VisibleAt.After(tr.backlogMgr.timeSource.Now()) // Deviation (delay)
+			if at, ok := tr.evictedDelays[level]; ok { // Deviation (delay): a trimmed lease's delay
+				delete(tr.evictedDelays, level)
+				if at.After(task.event.Data.VisibleAt) {
+					task.event.Data.VisibleAt = at
+				}
+			}
+			task.delayed = task.event.Data.VisibleAt.After(tr.backlogMgr.timeSource.Now()) // Deviation (delay)
 			merged.SetHint(outstandingTask{level: level, task: task}, &hint)
 			created = append(created, task)
 		}
