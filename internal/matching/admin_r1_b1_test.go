@@ -94,17 +94,22 @@ func TestDeleteDuringAttemptWriteReturnsNoTasks(t *testing.T) {
 
 // An ack that lands while DeleteTask's store delete is in flight owns the backlog delta.
 // Applying it again leaves ApproximateBacklogCount one low.
+//
+// The count is only a delta while the reader is not atEnd, so the reader must not re-read
+// after the poll: a read that finds nothing sets atEnd and the count becomes exact, hiding
+// the double delta. With a full first batch of 3 and the poll leaving 2 loaded (above
+// GetTasksReloadAt=1), shouldReadMoreLocked stays false and nothing re-reads.
 func TestAckDuringDeleteKeepsBacklogCount(t *testing.T) {
 	st := memstore.New()
 	e1 := newR2Engine(t, st, nil, nil, nil)
-	for _, p := range []string{"a", "b"} {
+	for _, p := range []string{"a", "b", "c"} {
 		_, err := e1.AddTask(context.Background(), portQueue, store.Task{Payload: []byte(p)})
 		require.NoError(t, err)
 	}
 	e1.Stop()
 
 	e := newR2Engine(t, st, nil, nil, func(c *Config) {
-		c.GetTasksBatchSize = 2
+		c.GetTasksBatchSize = 3
 		c.GetTasksReloadAt = 1
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -118,7 +123,7 @@ func TestAckDuringDeleteKeepsBacklogCount(t *testing.T) {
 	atEnd := tr.atEnd
 	tr.lock.Unlock()
 	require.False(t, atEnd, "a full read batch is not the end, so the count is a delta")
-	require.Equal(t, int64(2), backlogCount(t, e))
+	require.Equal(t, int64(3), backlogCount(t, e))
 
 	page, _, err := e.PeekTasks(context.Background(), portQueue, PeekOptions{})
 	require.NoError(t, err)
@@ -129,7 +134,7 @@ func TestAckDuringDeleteKeepsBacklogCount(t *testing.T) {
 	ok, err := e.DeleteTask(context.Background(), portQueue, page[0].Ref)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Equal(t, int64(1), backlogCount(t, e))
+	require.Equal(t, int64(2), backlogCount(t, e))
 }
 
 // deleteReadGate fails the first DeleteTask after a backlog read has observed the

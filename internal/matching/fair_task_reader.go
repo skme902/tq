@@ -83,6 +83,7 @@ type (
 
 		// gc state
 		inGC       bool
+		purgeHolds int       // PurgeQueue calls between adminPurge and their own store delete; GC waits
 		numToGC    int       // counts approximately how many tasks we can delete with a GC
 		lastGCTime time.Time // last time GCed
 	}
@@ -794,7 +795,7 @@ func (tr *fairTaskReader) maybeGC() {
 }
 
 func (tr *fairTaskReader) shouldGCLocked() bool {
-	if tr.inGC || tr.numToGC == 0 {
+	if tr.inGC || tr.numToGC == 0 || tr.purgeHolds > 0 {
 		return false
 	}
 	return tr.numToGC >= tr.backlogMgr.config.MaxTaskDeleteBatchSize ||

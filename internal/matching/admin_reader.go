@@ -177,6 +177,10 @@ func (tr *fairTaskReader) adminPurge(ctx context.Context) (leased []*internalTas
 		}
 		tr.evictedAcks.PopMin()
 	}
+	// Hold ack-level GC until the caller's own delete of the purged range has run (see
+	// releasePurgeHold); otherwise a GC started now deletes those rows first and PurgeQueue
+	// reports (and counts in TasksAdminDeleted) fewer tasks than it removed.
+	tr.purgeHolds++
 	ackMoved := tr.ackLevel.less(maxLevel)
 	if ackMoved {
 		tr.ackLevel = maxLevel
@@ -199,6 +203,16 @@ func (tr *fairTaskReader) adminPurge(ctx context.Context) (leased []*internalTas
 	tr.backlogMgr.db.updateFairAckLevel(tr.subqueue, tr.ackLevel, 0, int64(tr.loadedTasks+tr.leasedTasks), tr.backlogAge.oldestTime())
 	tr.maybeReadTasksLocked()
 	return leased, tr.ackLevel.inc(), nil
+}
+
+// releasePurgeHold ends the GC hold adminPurge took. numToGC is still at least 1, so GC
+// retries rows the purge delete left behind.
+func (tr *fairTaskReader) releasePurgeHold() {
+	tr.lock.Lock()
+	defer tr.lock.Unlock()
+	softAssert(tr.logger, tr.purgeHolds > 0, "purge hold released twice")
+	tr.purgeHolds--
+	tr.maybeGCLocked()
 }
 
 // waitAckPinClearLocked blocks until a writer pin (and any tasks held for a
