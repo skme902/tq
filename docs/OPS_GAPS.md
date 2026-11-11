@@ -37,7 +37,7 @@ Reference points:
 | # | Gap | Priority | Effort |
 |---|---|---|---|
 | 1 | Max attempts, poison tasks and a DLQ (with redrive) — **done** (feat/ops-dlq) | P0 | M–L |
-| 2 | Task admin: peek and browse, delete one task, purge a queue | P0 | M |
+| 2 | Task admin: peek and browse, delete one task, purge a queue — **done** (feat/ops-admin) | P0 | M |
 | 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
 | 4 | Retry backoff and delayed visibility on Nack | P1 | M |
 | 5 | Pause and resume of a queue or a fairness key | P1 | M |
@@ -112,7 +112,16 @@ What shipped:
   - Migration 0002.
   - Upstream reference: the history DLQ v2 API shape (read, purge, merge) for the admin verbs.
 
-## 2. Task admin: peek and browse, delete, purge — P0, M
+## 2. Task admin: peek and browse, delete, purge — P0, M — done
+
+**Status: implemented in feat/ops-admin** (README §Task admin). Refinements: `DeleteTask` takes a `TaskRef`
+(subqueue, pass, ID) from `PeekTasks`, so the store delete is a primary-key delete. Purge persists the new ack
+levels before deleting rows, so a failed delete never resurrects tasks (GC retries it). Fairness counters and TopK
+are not reset by a purge (they are approximate and age out).
+
+Original analysis (superseded by the status above). Two claims in it do not describe the implementation:
+there is no engine-level peek or delete (**superseded** — `PeekTasks`, `DeleteTask` and `PurgeQueue`), and
+purge resets TopK (**superseded** — a purge does not reset fairness counters or TopK).
 
 - **Today.**
   - `ListQueues` and `DescribeQueue` give counts and ages.
@@ -120,9 +129,11 @@ What shipped:
   - `store.DeleteQueue` deletes a queue and all its tasks, but calling it under a loaded queue races the owner. No
     Engine method fences it.
   - There is no way to delete one bad task or purge a backlog without SQL.
+    **Superseded:** engine-level `PeekTasks`, `DeleteTask` and `PurgeQueue` (README §Task admin).
 - **Missing.** `PeekTasks` (read-only, paged, per subqueue/priority, optionally filtered by fairness key),
   `DeleteTask(queue, id)`, and `PurgeQueue(queue)`. Upstream has `tdbg taskqueue list-tasks`, SQS `PurgeQueue`,
   RabbitMQ get-messages and purge, and Asynq `Inspector.DeleteTask`.
+  **Superseded:** those engine methods exist.
 - **Design.**
   - **Peek.** It follows the same read-only path as `describeUnloaded`: `GetTasks` from the ack level with a page
     token of (subqueue, level). It never takes ownership, works on loaded and unloaded queues, and returns
@@ -132,7 +143,7 @@ What shipped:
     - Delete: removes the task from the reader's loaded set if present, deletes the row conditioned on rangeID,
       and adjusts the backlog count.
     - Purge: `CompleteTasksLessThan(max level)` on every subqueue, sets the ack level to the max read level, and
-      resets the counts and TopK.
+      resets the counts and TopK. **Superseded:** purge does not reset the counts or TopK.
   - **Store.** Add `DeleteTask(queue, subqueue, level, rangeID)` to the store as a new optional interface with
     conformance tests.
   - **Leases.** In-flight leases on purged tasks become lost (`ErrLeaseLost` on Ack, harmless).

@@ -71,6 +71,12 @@ type (
 	RedriveOptions = matching.RedriveOptions
 	// NackOption configures Delivery.Nack.
 	NackOption = matching.NackOption
+	// TaskRef identifies one backlog task (PeekedTask.Ref, Engine.DeleteTask).
+	TaskRef = matching.TaskRef
+	// PeekOptions selects the tasks Engine.PeekTasks returns.
+	PeekOptions = matching.PeekOptions
+	// PeekedTask is one backlog task as Engine.PeekTasks sees it.
+	PeekedTask = matching.PeekedTask
 	// QueueStats are backlog count/age and add/dispatch rates (upstream TaskQueueStats).
 	QueueStats = matching.QueueStats
 	// QueueListing is one row of Engine.ListQueues.

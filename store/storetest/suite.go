@@ -57,6 +57,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"ListQueues_InvalidArgs", testListQueuesInvalidArgs},
 		{"UpdateTask_InPlace", testUpdateTaskInPlace},
 		{"UpdateTask_Fenced", testUpdateTaskFenced},
+		{"DeleteTask_One", testDeleteTaskOne},
+		{"DeleteTask_Fenced", testDeleteTaskFenced},
 		{"DeadLetter_RoundTrip", testDeadLetterRoundTrip},
 		{"DeadLetter_KeepsBacklog", testDeadLetterKeepsBacklog},
 		{"DeadLetter_Fenced", testDeadLetterFenced},

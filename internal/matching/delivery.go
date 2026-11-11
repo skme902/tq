@@ -13,6 +13,7 @@ package matching
 //   - Engine.Stop ends every lease (stopping its timer); later calls return ErrEngineStopped.
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -21,6 +22,10 @@ import (
 	"github.com/skme902/tq/metrics"
 	"github.com/skme902/tq/store"
 )
+
+// testHookAfterAttemptRecord, if set, runs after a backlog attempt write returns and
+// before newDelivery decides whether that lease was already settled. Tests only.
+var testHookAfterAttemptRecord func()
 
 // Delivery is a leased task returned by PollTask.
 type Delivery struct {
@@ -59,6 +64,9 @@ type Delivery struct {
 // settles the lease without acking and does not return a delivery. If Stop or a shutdown
 // give-up ends the lease during the write, the count is rolled back (best-effort; a failed
 // rollback leaves it one high, at-least-once) and PollTask returns ErrEngineStopped.
+// Admin endLeases (DeleteTask / PurgeQueue) settles the same lease with ErrLeaseLost while
+// the engine is still running: PollTask returns ErrNoTasks, and an admin-deleted task is
+// not rewritten (the row is gone).
 func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) (*Delivery, error) {
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
@@ -105,6 +113,9 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 	e.leasesLock.Unlock()
 	if recordFirst {
 		err := e.recordAttempt(pqm, task)
+		if testHookAfterAttemptRecord != nil {
+			testHookAfterAttemptRecord()
+		}
 		if err != nil && store.IsConditionFailed(err) {
 			// The backlog row is unchanged and the queue is unloaded. Do not ack, and do not
 			// hand the poller a delivery. If Stop already settled this lease, it owns release.
@@ -114,20 +125,27 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 			return nil, errAttemptFenced
 		}
 		e.leasesLock.Lock()
-		if e.leasesClosed || d.isSettled() {
+		stopped := e.leasesClosed
+		settled := d.isSettled()
+		if !stopped && !settled {
+			d.arm(lease)
 			e.leasesLock.Unlock()
-			// The attempt write committed, but Stop or a shutdown give-up already ended
-			// this lease, so no Delivery is returned. Roll the durable count back with
-			// the same fenced write. Release/settle stays with whoever ended the lease.
+		} else {
+			e.leasesLock.Unlock()
+			// Stop or a shutdown give-up ended the lease: roll the durable count back
+			// and return ErrEngineStopped. Release/settle stays with whoever ended it.
+			// Admin endLeases settles with ErrLeaseLost while the engine still runs, so
+			// the poller gets ErrNoTasks. An admin-deleted row is not rewritten.
 			// A failed rollback leaves the stored count one high (at-least-once).
-			if err == nil {
+			if err == nil && !task.adminDeleted.Load() {
 				task.event.Data.Attempts--
 				e.rollbackAttemptCount(pqm, task)
 			}
+			if !stopped && errors.Is(d.lost(), ErrLeaseLost) {
+				return nil, ErrNoTasks
+			}
 			return nil, ErrEngineStopped
 		}
-		d.arm(lease)
-		e.leasesLock.Unlock()
 	}
 	if d.SyncMatched {
 		// The task is "started": let the AddTask caller return (upstream: finish after

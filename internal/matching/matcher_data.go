@@ -264,6 +264,12 @@ func (d *matcherData) EnqueueTaskNoWait(task *internalTask) error {
 	if d.stopped {
 		return errMatcherStopped
 	}
+	// Deviation: a task evicted between priTaskMatcher.AddTask's setRemoveFunc and this lock
+	// had its remove run while it was not queued yet (a no-op); without this check it would
+	// be queued anyway and delivered after the reader dropped it (trim or task admin delete).
+	if task.evicted() {
+		return nil
+	}
 
 	task.initMatch(d)
 	d.tasks.Add(task)

@@ -33,6 +33,7 @@ const (
 	OpListDeadTasks         = "ListDeadTasks"
 	OpDeleteDeadTasks       = "DeleteDeadTasks"
 	OpCountDeadTasks        = "CountDeadTasks"
+	OpDeleteTask            = "DeleteTask"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -537,4 +538,26 @@ func (s *Store) ListQueues(ctx context.Context, req *store.ListQueuesRequest) (*
 		resp.Queues = append(resp.Queues, store.ListedQueue{RangeID: q.rangeID, Info: cloneInfo(q.info)})
 	}
 	return resp, nil
+}
+
+// DeleteTask implements store.TaskAdminStore.
+func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (bool, error) {
+	if err := ctxErr(ctx); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpDeleteTask); err != nil {
+		return false, err
+	}
+	q, err := s.fencedLocked(req.Key, req.RangeID)
+	if err != nil {
+		return false, err
+	}
+	tree := q.subqueues[req.Subqueue]
+	if tree == nil {
+		return false, nil
+	}
+	_, ok := tree.Delete(store.TaskInfo{Pass: req.Pass, ID: req.ID})
+	return ok, nil
 }

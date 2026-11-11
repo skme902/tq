@@ -66,6 +66,9 @@ type (
 		queued            bool
 		recycleToken      func(*internalTask)
 		removeFromMatcher atomic.Pointer[func()]
+		// adminDeleted is set by Engine.DeleteTask / PurgeQueue (library addition): the task
+		// must not be (re-)added to the matcher.
+		adminDeleted atomic.Bool
 
 		// The following fields are for use by priMatcher/matcherData:
 		waitableMatchResult
@@ -192,10 +195,24 @@ func (task *internalTask) setRemoveFunc(remove func()) bool {
 	return task.removeFromMatcher.CompareAndSwap(&removeFuncNotAddedYet, &remove)
 }
 
+// evicted reports whether setEvicted was called since the last resetMatcherState.
+func (task *internalTask) evicted() bool {
+	return task.removeFromMatcher.Load() == &removeFuncEvicted
+}
+
 // setEvicted marks the task as evicted. If it was added to a matcher it will be removed.
 func (task *internalTask) setEvicted() {
 	remove := task.removeFromMatcher.Swap(&removeFuncEvicted)
-	(*remove)()
+	if remove != nil { // Deviation: nil before the first resetMatcherState (not yet added)
+		(*remove)()
+	}
+}
+
+// adminRemove marks a loaded task deleted and takes it out of the matcher. With the check in
+// addTaskToMatcher (after resetMatcherState), no interleaving re-adds it.
+func (task *internalTask) adminRemove() {
+	task.adminDeleted.Store(true)
+	task.setEvicted()
 }
 
 // finish marks a task as finished. Must be called after a poller picks up a task

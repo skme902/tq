@@ -68,12 +68,12 @@ var (
 )
 
 type queries struct {
-	insertQueue, getQueue, lockQueue, updateQueue, updateQueueData, deleteQueue string
-	deleteAllTasks, insertTasksPrefix, insertTasksSuffix, getTasks              string
-	rangeDelete, rangeDeleteNoLimit                                             string
-	listQueuesFirst, listQueuesAfter                                            string
-	updateTask, insertDead, listDeadFirst, listDeadAfter, deleteDeadBefore      string
-	countDead, deleteAllDead                                                    string
+	insertQueue, getQueue, lockQueue, updateQueue, updateQueueData, deleteQueue        string
+	deleteAllTasks, insertTasksPrefix, insertTasksSuffix, getTasks                     string
+	rangeDelete, rangeDeleteNoLimit                                                    string
+	listQueuesFirst, listQueuesAfter                                                   string
+	updateTask, deleteTask, insertDead, listDeadFirst, listDeadAfter, deleteDeadBefore string
+	countDead, deleteAllDead                                                           string
 }
 
 // New returns a Store that writes through w and reads through r (r may be nil to use w).
@@ -120,6 +120,7 @@ func buildQueries(d Dialect) queries {
 			`ORDER BY range_hash, task_queue_id LIMIT ?`,
 		listQueuesAfter: `SELECT range_hash, task_queue_id, range_id, data, data_encoding FROM tq_task_queues ` +
 			`WHERE (range_hash, task_queue_id) > (?, ?) ORDER BY range_hash, task_queue_id LIMIT ?`,
+		deleteTask: `DELETE FROM tq_tasks WHERE ` + taskKey + ` AND pass = ? AND task_id = ?`,
 		updateTask: `UPDATE tq_tasks SET data = ?, data_encoding = ? WHERE ` + taskKey + ` AND pass = ? AND task_id = ?`,
 		insertDead: `INSERT INTO tq_dead_tasks (range_hash, task_queue_id, task_id, pass, dead_time, reason, data, data_encoding) ` +
 			`VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (range_hash, task_queue_id, task_id) DO UPDATE SET ` +
@@ -151,6 +152,7 @@ func buildQueries(d Dialect) queries {
 		q.listQueuesFirst = rebind(q.listQueuesFirst, 0)
 		q.listQueuesAfter = rebind(q.listQueuesAfter, 0)
 		q.updateTask = rebind(q.updateTask, 0)
+		q.deleteTask = rebind(q.deleteTask, 0)
 		q.insertDead = rebind(q.insertDead, 0)
 		q.listDeadFirst = rebind(q.listDeadFirst, 0)
 		q.listDeadAfter = rebind(q.listDeadAfter, 0)
@@ -752,4 +754,22 @@ func (s *Store) CountDeadTasks(ctx context.Context, key store.QueueKey) (int64, 
 		return 0, s.wrap("CountDeadTasks", err)
 	}
 	return n, nil
+}
+
+// DeleteTask deletes one backlog task under the rangeID fence.
+func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (bool, error) {
+	id, hash := queueIDAndHash(req.Key)
+	var n int64
+	err := s.txExecute(ctx, "DeleteTask", func(tx *sql.Tx) error {
+		if err := s.lockTaskQueue(ctx, tx, id, hash, req.RangeID); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, s.q.deleteTask, int64(hash), id, req.Subqueue, req.Pass, req.ID)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return n > 0, err
 }

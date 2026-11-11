@@ -62,6 +62,15 @@ type (
 		// by the number of outstanding leases; entries leave on Ack, Nack or expiry.
 		leasedEvicted map[fairLevel]*internalTask
 
+		// Deviation (task admin, library addition): levels deleted by Engine.DeleteTask. A read
+		// that fetched the row before the delete committed must not load it. Pruned once the ack
+		// level passes them; nil until the first delete.
+		adminDeleted map[fairLevel]struct{}
+		// adminInFlight holds levels whose admin store delete is in flight (library addition).
+		// While it is non-empty the ack level is pinned, and a read that skips such a row keeps
+		// it here, so a failed delete can put the task back (REVIEW admin r1 F5).
+		adminInFlight map[fairLevel]*store.TaskInfo
+
 		// Hold tasks written while a read is pending so we make sure to account for them in
 		// our read level.
 		newlyWrittenTasks []*store.TaskInfo
@@ -380,6 +389,9 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 // call with_out_ lock held
 func (tr *fairTaskReader) addTaskToMatcher(task *internalTask) {
 	task.resetMatcherState()
+	if task.adminDeleted.Load() {
+		return // Deviation (task admin): deleted or purged; see internalTask.adminRemove
+	}
 	err := tr.backlogMgr.addSpooledTask(task)
 	if err == nil {
 		return
@@ -425,6 +437,9 @@ func (tr *fairTaskReader) retryAddAfterError(task *internalTask) {
 	_ = backoff.ThrottleRetryContext(
 		tr.backlogMgr.tqCtx,
 		func(context.Context) error {
+			if task.adminDeleted.Load() {
+				return nil // Deviation (task admin)
+			}
 			if isTaskExpired(task.event.TaskInfo, tr.backlogMgr.timeSource.Now()) {
 				task.finish(taskFinishResult{})
 				return nil
@@ -512,6 +527,14 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 		} else if _, have := merged.GetHint(outstandingTask{level: level}, &hint); have {
 			// On a write/read race or a re-read of a range we may see a task we already have
 			// (loaded or acked). Ignore tasks we already track.
+			continue
+		} else if _, deleted := tr.adminDeleted[level]; deleted {
+			// Deviation (task admin): deleted by Engine.DeleteTask; the backlog count was
+			// already adjusted there. If the delete is still in flight, keep the row so a
+			// failed delete can merge it back.
+			if v, inFlight := tr.adminInFlight[level]; inFlight && v == nil {
+				tr.adminInFlight[level] = t
+			}
 			continue
 		} else if leased, ok := tr.leasedEvicted[level]; ok {
 			// Deviation (delivery leases): a leased task we trimmed earlier. Reinstate its entry
@@ -673,7 +696,7 @@ func (tr *fairTaskReader) getLoadedTasks() int {
 }
 
 func (tr *fairTaskReader) ackLevelPinnedLocked() bool {
-	return tr.ackLevelPinnedByWriter || len(tr.newlyWrittenTasks) > 0
+	return tr.ackLevelPinnedByWriter || len(tr.newlyWrittenTasks) > 0 || len(tr.adminInFlight) > 0
 }
 
 // call this whenever new tasks are acked or when ackLevelPinnedLocked() may turn from true to
@@ -696,6 +719,11 @@ func (tr *fairTaskReader) advanceAckLevelLocked() {
 	}
 
 	if numAcked > 0 {
+		for level := range tr.adminDeleted {
+			if !tr.ackLevel.less(level) {
+				delete(tr.adminDeleted, level)
+			}
+		}
 		tr.numToGC += int(numAcked)
 		tr.maybeGCLocked()
 
