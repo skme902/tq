@@ -159,9 +159,13 @@ func (d *Delivery) stopTimer() {
 
 func (d *Delivery) release() {
 	d.pqm.outstandingLeases.Add(-1)
-	d.engine.leasesLock.Lock()
-	delete(d.engine.leases, d)
-	d.engine.leasesLock.Unlock()
+	e := d.engine
+	e.leasesLock.Lock()
+	delete(e.leases, d)
+	if e.leasesDrained != nil && len(e.leases) == 0 && !isClosed(e.leasesDrained) {
+		close(e.leasesDrained) // wake Shutdown
+	}
+	e.leasesLock.Unlock()
 	d.pqm.MarkAlive()
 }
 

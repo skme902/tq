@@ -91,6 +91,8 @@ var (
 	ErrResourceExhausted = matching.ErrResourceExhausted
 	// ErrEngineStopped is returned after Stop, including by Delivery methods on leases Stop ended.
 	ErrEngineStopped = matching.ErrEngineStopped
+	// ErrEngineDraining is returned by Engine.PollTask while Engine.Shutdown drains.
+	ErrEngineDraining = matching.ErrEngineDraining
 	// ErrLeaseLost is returned by Delivery methods after the lease expired or was settled.
 	ErrLeaseLost = matching.ErrLeaseLost
 	// ErrDropTask may be returned (wrapped) by a Starter to drop a task.

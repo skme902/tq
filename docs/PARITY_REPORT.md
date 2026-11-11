@@ -291,6 +291,11 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     - `Engine.ListQueues` pages `store.QueueLister` (optional interface). memstore orders by (namespace, name, partition);
       the SQL stores order by (range_hash, task_queue_id) like upstream `ListTaskQueue`.
 
+25. **Graceful shutdown (feat/ops-drain).** `Engine.Shutdown(ctx)` is library-only: upstream matching stops via fx
+    lifecycle and relies on history to retry anything in flight. During a drain, waiting and new polls return
+    `ErrEngineDraining` (counted as `poll_timeouts` by the matcher, since they end through the poll context), so
+    `AddTask` spools instead of sync-matching. Matching, fairness, the limiter and fencing are unchanged.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

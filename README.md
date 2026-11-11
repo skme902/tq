@@ -156,6 +156,30 @@ Dispatch from the matcher is paced by upstream's GCRA-style limiter. A limit of 
 - `Engine.RateLimit(queue)` reports the effective rate (× read partitions) and its source (API, Worker, System).
   Throttled matches increment the `tasks_rate_limited` metric.
 
+## Graceful shutdown
+
+`Engine.Stop` ends every lease at once: backlog tasks are redelivered after the next load and
+sync-matched tasks are spooled, so nothing is lost, but every in-flight task runs twice.
+`Engine.Shutdown(ctx)` drains first:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := e.Shutdown(ctx); err != nil {
+	log.Printf("stopped with leases outstanding: %v", err) // ctx's error
+}
+```
+
+- From the moment it is called, `PollTask` returns `ErrEngineDraining`, including polls that were
+  already waiting. With no waiting pollers, `AddTask` cannot sync-match, so new tasks go to the
+  backlog.
+- `AddTask`, `Ack`, `Nack` and `ExtendLease` keep working. A nacked or expired lease goes back to
+  the backlog as usual.
+- It returns when every lease is settled (nil) or when ctx is done (ctx's error), then calls `Stop`.
+  After `Stop` it returns nil at once. `Engine.Draining()` reports whether a drain has started.
+- Metrics (no queue tags): `engine_draining` (1 while draining, 0 after),
+  `engine_drain_leases_remaining` (leases `Stop` had to end), `engine_drain_duration`.
+
 ## Observability
 
 ### Metrics

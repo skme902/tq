@@ -133,6 +133,14 @@ const (
 	ApproximateBacklogCount = "approximate_backlog_count"
 	TasksRateLimited        = "tasks_rate_limited"
 
+	// Engine-level (no queue tags), library-only.
+	// EngineDraining is 1 while Engine.Shutdown drains and 0 once it stops.
+	EngineDraining = "engine_draining"
+	// EngineDrainLeases is the number of leases still outstanding when a drain ends (0 for a
+	// clean drain); EngineDrainDuration is how long the drain took.
+	EngineDrainLeases   = "engine_drain_leases_remaining"
+	EngineDrainDuration = "engine_drain_duration"
+
 	// Per-queue gauges (upstream names; approximate_backlog_count is above), tagged
 	// task_priority for counts. Emitted only when the queue has a real taskqueue tag (upstream
 	// emits them only with metrics.breakdownByTaskQueue and ...ByPartition).
