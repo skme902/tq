@@ -190,7 +190,7 @@ func (d *Delivery) arm(lease time.Duration) {
 	// write between constructing the delivery and calling arm; the expire callback
 	// trusts this deadline, so it has to match the timer.
 	d.deadline = d.engine.timeSource.Now().Add(lease)
-	d.timer = d.engine.timeSource.AfterFunc(lease, d.expire)
+	d.timer = afterFunc(d.engine.timeSource, lease, d.expire)
 	d.mu.Unlock()
 }
 
@@ -271,7 +271,17 @@ func (d *Delivery) Ack() error {
 type NackOption func(*nackOptions)
 
 type nackOptions struct {
-	reason string
+	reason   string
+	delay    time.Duration
+	hasDelay bool
+}
+
+// NackDelay redelivers the task no earlier than d from now instead of immediately (or after
+// Config.RetryBackoff); NackDelay(0) redelivers immediately even with a backoff configured.
+// For a backlog task the delay is written to its row (Task.VisibleAt). A sync-matched task is
+// spooled with that VisibleAt. It does not apply when this Nack dead-letters the task.
+func NackDelay(d time.Duration) NackOption {
+	return func(o *nackOptions) { o.delay, o.hasDelay = max(d, 0), true }
 }
 
 // NackReason records why the consumer gave up on the task. It is kept only if this Nack
@@ -296,7 +306,11 @@ func (d *Delivery) Nack(opts ...NackOption) error {
 		return d.lost()
 	}
 	d.stopTimer()
-	d.redeliver(errNacked, DeadReasonNack, o.reason)
+	delay := d.engine.config.RetryBackoff.delay(d.Task.Attempts)
+	if o.hasDelay {
+		delay = o.delay
+	}
+	d.redeliver(errNacked, DeadReasonNack, o.reason, delay)
 	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
 	d.release()
 	return nil
@@ -333,7 +347,7 @@ func (d *Delivery) expire() {
 	// Not under the timer callback. Redeliver before release so a waiting Shutdown cannot
 	// Stop until the task is back on the backlog (or spooled, for a sync match).
 	go func() {
-		d.redeliver(errLeaseExpired, DeadReasonLeaseExpired, "")
+		d.redeliver(errLeaseExpired, DeadReasonLeaseExpired, "", d.engine.config.RetryBackoff.delay(d.Task.Attempts))
 		d.release()
 	}()
 }
@@ -342,15 +356,22 @@ func (d *Delivery) expire() {
 // used its last attempt. A sync-matched task has no backlog row to move: it is spooled with its
 // attempt count and dead-lettered when next matched (reason attempts_exhausted), so a Nack
 // reason from this delivery is not kept.
-func (d *Delivery) redeliver(err error, reason, detail string) {
+func (d *Delivery) redeliver(err error, reason, detail string, delay time.Duration) {
+	var visibleAt time.Time
+	if delay > 0 {
+		visibleAt = redeliveryTime(d.engine.timeSource.Now(), delay)
+	}
 	if d.SyncMatched {
-		d.engine.respoolSyncTaskLocked(d, false)
+		d.engine.respoolSyncTask(d, false, visibleAt)
 		return
 	}
 	if max := d.pqm.maxAttempts(); max > 0 && d.Task.Attempts >= max {
 		if d.engine.deadLetter(d.pqm, d.task, reason, detail, true) {
 			return
 		}
+	}
+	if !visibleAt.IsZero() {
+		d.engine.delayRedelivery(d.pqm, d.task, visibleAt)
 	}
 	d.task.finish(taskFinishResult{err: err, consumedToken: true})
 }

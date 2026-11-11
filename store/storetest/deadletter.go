@@ -22,8 +22,15 @@ func testTaskAttemptsRoundTrip(_ *testing.T, s *suite) {
 	info := s.createQueue(rangeID)
 	t := s.randomTask(1, 1)
 	t.Data.Attempts = 3
+	t.Data.VisibleAt = s.now().Add(time.Hour)
 	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{t}, nil))
 	s.Equal([]store.TaskInfo{t}, s.getAll(0))
+	// UpdateTask rewrites VisibleAt (Nack with a delay).
+	if d, ok := s.store.(store.DeadLetterStore); ok {
+		t.Data.VisibleAt = t.Data.VisibleAt.Add(time.Minute)
+		s.NoError(d.UpdateTask(s.ctx, &store.UpdateTaskRequest{Key: s.key, RangeID: rangeID, Task: t}))
+		s.Equal([]store.TaskInfo{t}, s.getAll(0))
+	}
 }
 
 func testUpdateTaskInPlace(_ *testing.T, s *suite) {

@@ -193,6 +193,19 @@ func (pm *taskQueuePartitionManagerImpl) AddTask(
 	pm.config.setDefaultPriority(syncMatchTask)
 
 	pm.metricsHandler.Counter(metrics.TasksAdded, 1)
+	if taskInfo.VisibleAt.After(pm.engine.timeSource.Now()) {
+		// Deviation (delay): a task that is not visible yet cannot sync-match; spool it.
+		if spoolQueue == nil {
+			return false, errRemoteSyncMatchFailed
+		}
+		// Counted as added like every other add (TrySyncMatch does it there).
+		spoolQueue.incTaskTracker(spoolQueue.tasksAdded, priorityKey(syncMatchTask.getPriority().PriorityKey), 1)
+		err := spoolQueue.SpoolTask(taskInfo)
+		if err == nil {
+			pm.metricsHandler.Counter(metrics.TasksSpooled, 1)
+		}
+		return false, err
+	}
 	outcome, err := syncMatchQueue.TrySyncMatch(ctx, syncMatchTask)
 	if outcome == syncMatchSuccess {
 		// Deviation: upstream returns startErr to the caller (history retries) and only spools

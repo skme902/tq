@@ -72,7 +72,7 @@ type QueueDescription struct {
 
 	// WaitingPollers is the number of polls parked in the matcher.
 	WaitingPollers int
-	// LoadedTasks is the number of backlog tasks read into memory and not leased.
+	// LoadedTasks is the number of backlog tasks read into memory, not leased and not delayed.
 	LoadedTasks int
 	// MatcherTasks is the number of tasks in the matcher, ready to be handed out.
 	MatcherTasks int

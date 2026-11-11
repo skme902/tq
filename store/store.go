@@ -53,6 +53,9 @@ type (
 		// Attempts is the number of deliveries of this task that have started (set by the
 		// queue; AddTask ignores it). See Delivery.Task.Attempts and Config.MaxAttempts.
 		Attempts int32 `json:",omitzero"`
+		// VisibleAt, if in the future, keeps the task from being delivered before then (library
+		// addition: delayed enqueue and Nack backoff). Zero or past means deliverable now.
+		VisibleAt time.Time `json:",omitzero"`
 	}
 
 	// TaskInfo is an allocated (persisted) task (replaces persistencespb.AllocatedTaskInfo).

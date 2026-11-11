@@ -820,6 +820,12 @@ func (e *Engine) isStopped() bool {
 
 // respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
 func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
+	e.respoolSyncTask(d, shuttingDown, time.Time{})
+}
+
+// respoolSyncTask spools a sync-matched task whose lease ended; a non-zero visibleAt delays
+// it (library addition, see delay.go).
+func (e *Engine) respoolSyncTask(d *Delivery, shuttingDown bool, visibleAt time.Time) {
 	if e.testHookBeforeRespool != nil {
 		e.testHookBeforeRespool(shuttingDown)
 	}
@@ -836,6 +842,9 @@ func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
 			pm = p.defaultQueue
 		}
 		t := d.Task
+		if !visibleAt.IsZero() {
+			t.VisibleAt = visibleAt
+		}
 		return pm.SpoolTask(&t)
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, persistenceOperationRetryPolicy, func(err error) bool {
@@ -940,7 +949,7 @@ func timeoutOn(parent context.Context, timeout time.Duration, ts clock.TimeSourc
 		return context.WithTimeout(parent, timeout)
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	timer := ts.AfterFunc(timeout, func() { cancel(context.DeadlineExceeded) })
+	timer := afterFunc(ts, timeout, func() { cancel(context.DeadlineExceeded) })
 	return ctx, func() {
 		timer.Stop()
 		cancel(context.Canceled)

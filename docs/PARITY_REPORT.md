@@ -351,6 +351,15 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     `spoolTask` (redrive); the reader's expiry handling is
     unchanged. sqlcore now has a test that every Postgres query is rebound (`TestNumberedQueriesHaveNoQuestionMarks`).
 
+30. **Delays and retry backoff (feat/ops-backoff).** `Task.VisibleAt`, `NackDelay`, `Config.RetryBackoff` and
+    `Config.MaxDelayedInMemory` are library additions (upstream history schedules activity retries itself and adds a
+    new matching task when due). Changes in ported code, all inert when no task has a future `VisibleAt`:
+    `partitionManager.AddTask` spools such a task without trying a sync match; the fair reader holds it as
+    "delayed" (`delayedTasks`, not counted in `loadedTasks`; up to `MaxDelayedInMemory` are excluded from the trim
+    and read-batch counts) and adds it to the matcher from a timer; `completeTask` delays a nacked/expired task
+    carrying a redelivery time instead of re-matching it; the "fair reader stuck" check also requires no delayed
+    tasks. Upstream's fairness order, limiter, sync match and fencing are unchanged.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

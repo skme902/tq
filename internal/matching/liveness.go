@@ -36,7 +36,7 @@ func newLiveness(
 }
 
 func (l *liveness) Start() {
-	l.timer.Store(timerWrapper{l.timeSource.AfterFunc(l.ttl(), l.onIdle)})
+	l.timer.Store(timerWrapper{afterFunc(l.timeSource, l.ttl(), l.onIdle)})
 }
 
 func (l *liveness) Stop() {

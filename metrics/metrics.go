@@ -142,6 +142,12 @@ const (
 	TasksRedriven             = "tasks_redriven"
 	TaskAttemptRecordFailures = "task_attempt_record_failures"
 
+	// Delays (library-only), per queue: tasks_delayed counts redeliveries held back by a
+	// Nack delay or RetryBackoff; delay_persist_failures counts delays that could not be
+	// written to the store (they still apply in memory).
+	TasksDelayed         = "tasks_delayed"
+	DelayPersistFailures = "delay_persist_failures"
+
 	// Task admin (library-only), per queue.
 	TasksAdminDeleted = "tasks_admin_deleted"
 	QueuePurges       = "queue_purges"

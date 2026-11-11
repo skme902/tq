@@ -293,13 +293,57 @@ d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was 
   fair order, the limiter, sync match versus backlog, and fencing match upstream. With
   `MaxAttempts > 0` the poll path does one extra fenced write per backlog delivery, a sync-matched
   last attempt is spooled and later dead-lettered as `attempts_exhausted`, and a lost fence on the
-  attempt write is reported as `ErrNoTasks`.
+  attempt write is reported as `ErrNoTasks`. Independently of `MaxAttempts`, a redelivery delay
+  (`NackDelay` or `RetryBackoff`) writes the row's `VisibleAt` with a fenced `UpdateTask`, which
+  also persists `Attempts` (see Delays and retry backoff).
 - Needs a store that implements `store.DeadLetterStore` (memstore, sqlite and postgres do;
   migration `0002_dead_tasks`). With another store the limit is ignored (logged at start) and the
   admin calls fail with `*store.InvalidArgumentError`.
 - Metrics, queue-tagged: `tasks_dead_lettered{reason}`, `dead_letter_failures`,
   `tasks_redriven`, `task_attempt_record_failures`. There is no dead-letter gauge: poll
   `DescribeQueue().DeadTasks`, which is a `COUNT` query.
+
+## Delays and retry backoff
+
+```go
+// Delayed enqueue: not delivered before VisibleAt (never sync-matched).
+engine.AddTask(ctx, q, taskqueue.Task{Payload: p, VisibleAt: time.Now().Add(time.Hour)})
+
+// Redeliver a failed task after a delay instead of immediately.
+d.Nack(taskqueue.NackDelay(30 * time.Second))
+
+// Or for every Nack and lease expiry: min(Initial * Multiplier^(attempt-1), Max).
+cfg.RetryBackoff = taskqueue.RetryBackoff{Initial: time.Second, Max: 5 * time.Minute} // Multiplier 0 = 2
+```
+
+- Defaults are unchanged: no `VisibleAt`, no `RetryBackoff`, so redelivery is immediate.
+  `NackDelay(0)` forces an immediate redelivery when a backoff is set.
+- A backlog task's delay is written to its row (`Task.VisibleAt`, part of the task data, so no
+  migration) with a fenced update before the task is released, so it survives a restart. That
+  needs a store implementing `store.DeadLetterStore` (memstore, sqlite, postgres); otherwise the
+  delay applies in memory only. A failed write is counted in `delay_persist_failures`.
+- A sync-matched task that is nacked or expires with a delay is spooled with `VisibleAt`.
+- The delay is skipped when the Nack or expiry dead-letters a backlog task (`MaxAttempts`). A
+  sync-matched task on its last attempt has no row to dead-letter yet: it is spooled with the
+  delay and dead-lettered when it is next matched, after `VisibleAt`.
+- A delayed task keeps its place in fairness order (its pass): when it becomes visible it can
+  be delivered ahead of newer tasks of the same key. It also holds the ack level, so acked rows
+  behind it are not garbage-collected until it is delivered or deleted. Expiry
+  (`MaxTaskAge`, `ExpireTime`) is checked when a task is read and when it is matched, not while
+  it waits: a task that expires while delayed holds the ack level until `VisibleAt`, and is then
+  dropped as expired.
+- Delayed tasks are held in memory by the queue's reader, each on a timer (the injected clock).
+  Up to `Config.MaxDelayedInMemory` (default 10000) per subqueue do not count toward
+  `GetTasksBatchSize`, so they do not hold back ready tasks behind them. Past that they count as
+  loaded, and a longer run of delayed tasks delays the ready tasks behind it until the delayed
+  ones become visible. Use a separate queue for large numbers of scheduled tasks.
+- Metric: `tasks_delayed` (per queue) counts redeliveries held back by a Nack delay or
+  `RetryBackoff`, not tasks added with a future `VisibleAt`. `DescribeQueue`'s `LoadedTasks`
+  excludes delayed tasks; `ApproximateBacklogCount` includes them.
+- Stopping the engine or unloading a queue stops its delay timers; the delays are in the rows
+  and are re-armed on the next load (in-memory-only delays, without a `DeadLetterStore`, are lost).
+- `Config.MaxDelayedInMemory` must be non-negative (0 = the default); `RetryBackoff.Multiplier`
+  must be finite.
 
 ## Retention
 
