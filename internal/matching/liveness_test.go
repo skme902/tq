@@ -30,7 +30,8 @@ func TestLiveness(t *testing.T) {
 	timeSource.Advance(1 * time.Second)
 	assert.Equal(t, int32(0), idleCalled.Load())
 	timeSource.Advance(1 * time.Second)
-	assert.Equal(t, int32(1), idleCalled.Load())
+	// Deviation: timer callbacks run on their own goroutine (afterFunc), not inside Advance.
+	assert.Eventually(t, func() bool { return idleCalled.Load() == 1 }, time.Second, time.Millisecond)
 	liveness.Stop()
 }
 

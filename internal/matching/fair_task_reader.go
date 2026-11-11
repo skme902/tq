@@ -47,9 +47,11 @@ type (
 		loadedTasks      int                            // == number of loaded (unacked, unleased) entries in outstandingTasks
 		leasedTasks      int                            // == number of leased entries in outstandingTasks
 		delayedTasks     int                            // == number of delayed entries in outstandingTasks (library addition)
-		readLevel        fairLevel                      // == highest level in outstandingTasks, or if empty, the level we should read next
-		ackLevel         fairLevel                      // inclusive: task exactly at ackLevel _has_ been acked
-		atEnd            bool                           // whether we believe outstandingTasks represents the entire queue right now
+		// delayStopped is set when the queue stops: delay timers are stopped and no new one is armed.
+		delayStopped bool
+		readLevel    fairLevel // == highest level in outstandingTasks, or if empty, the level we should read next
+		ackLevel     fairLevel // inclusive: task exactly at ackLevel _has_ been acked
+		atEnd        bool      // whether we believe outstandingTasks represents the entire queue right now
 
 		// Small cache of acked task levels that were evicted from outstandingTasks. When tasks
 		// are evicted from memory, we lose track of which ones were already acked. This cache
@@ -63,10 +65,20 @@ type (
 		// by the number of outstanding leases; entries leave on Ack, Nack or expiry.
 		leasedEvicted map[fairLevel]*internalTask
 
+		// Deviation (delay, library addition): redelivery times of trimmed leases that were
+		// nacked or expired with a delay. The next read of the row applies it, so an in-memory
+		// delay (no DeadLetterStore, or a failed VisibleAt write) or a read that fetched the row
+		// before the write is not lost. Bounded by evictedAcksCacheSize; nil until first use.
+		evictedDelays map[fairLevel]time.Time
+
 		// Deviation (task admin, library addition): levels deleted by Engine.DeleteTask. A read
 		// that fetched the row before the delete committed must not load it. Pruned once the ack
 		// level passes them; nil until the first delete.
 		adminDeleted map[fairLevel]struct{}
+		// adminInFlight holds levels whose admin store delete is in flight (library addition).
+		// While it is non-empty the ack level is pinned, and a read that skips such a row keeps
+		// it here, so a failed delete can put the task back (REVIEW admin r1 F5).
+		adminInFlight map[fairLevel]*store.TaskInfo
 
 		// Hold tasks written while a read is pending so we make sure to account for them in
 		// our read level.
@@ -174,6 +186,9 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 		// A leased task trimmed from memory: the lease is over, so a re-read may deliver it again
 		// (after a failure) or skip it via evictedAcks (after success).
 		delete(tr.leasedEvicted, task.fairLevel())
+		if at := task.redeliverAt.Swap(0); at != 0 && err != nil && isTransientMatchError(err) {
+			tr.recordEvictedDelayLocked(task.fairLevel(), time.Unix(0, at))
+		}
 		// Deviation: upstream relies on history to dedupe the re-read task. We remember the
 		// successful completion in evictedAcks so the re-read is skipped instead of redelivered.
 		if err == nil && tr.ackLevel.less(task.fairLevel()) {
@@ -396,6 +411,12 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 // call with_out_ lock held
 func (tr *fairTaskReader) addTaskToMatcher(task *internalTask) {
 	task.resetMatcherState()
+	tr.addPreparedTaskToMatcher(task)
+}
+
+// addPreparedTaskToMatcher is addTaskToMatcher for a task whose matcher state the caller
+// already reset (under the reader lock, so an eviction after that is honoured).
+func (tr *fairTaskReader) addPreparedTaskToMatcher(task *internalTask) {
 	if task.adminDeleted.Load() {
 		return // Deviation (task admin): deleted or purged; see internalTask.adminRemove
 	}
@@ -538,7 +559,11 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			continue
 		} else if _, deleted := tr.adminDeleted[level]; deleted {
 			// Deviation (task admin): deleted by Engine.DeleteTask; the backlog count was
-			// already adjusted there.
+			// already adjusted there. If the delete is still in flight, keep the row so a
+			// failed delete can merge it back.
+			if v, inFlight := tr.adminInFlight[level]; inFlight && v == nil {
+				tr.adminInFlight[level] = t
+			}
 			continue
 		} else if leased, ok := tr.leasedEvicted[level]; ok {
 			// Deviation (delivery leases): a leased task we trimmed earlier. Reinstate its entry
@@ -560,7 +585,14 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			task.event.leaseFunc = tr.leaseTask
 			task.event.subqueue = tr.subqueue
 			tr.backlogMgr.setPriority(task)
-			task.delayed = t.Data.VisibleAt.After(tr.backlogMgr.timeSource.Now()) // Deviation (delay)
+			// Deviation (delay): a trimmed task's in-memory delay. The entry is dropped once the
+			// task survives the cut below; an overflow task keeps it for the next read.
+			if at, ok := tr.evictedDelays[level]; ok {
+				if at.After(task.event.Data.VisibleAt) {
+					task.event.Data.VisibleAt = at
+				}
+			}
+			task.delayed = task.event.Data.VisibleAt.After(tr.backlogMgr.timeSource.Now()) // Deviation (delay)
 			merged.SetHint(outstandingTask{level: level, task: task}, &hint)
 			created = append(created, task)
 		}
@@ -608,6 +640,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			merged.DeleteHint(outstandingTask{level: level}, &hint)
 			return true
 		}
+		delete(tr.evictedDelays, task.fairLevel())
 		tr.backlogAge.record(task.event.Data.CreateTime, 1)
 		if task.delayed {
 			// Deviation (delay): held until VisibleAt, not matched now.
@@ -632,10 +665,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			tr.leasedTasks--
 			tr.leasedEvicted[o.level] = o.task
 		} else if o.task != nil && o.task.delayed {
-			// Deviation (delay): a delayed task we're dropping; a re-read delays it again.
-			tr.backlogAge.record(o.task.event.Data.CreateTime, -1)
-			tr.undelayLocked(o.task)
-			o.task.setEvicted()
+			tr.evictDelayedLocked(o.task)
 		} else if o.task != nil {
 			// A loaded task we're dropping from memory. It may already have been matched and
 			// removed (then setEvicted is a no-op); otherwise it's removed from the matcher.
@@ -701,7 +731,7 @@ func (tr *fairTaskReader) retryReadAfter(duration time.Duration) {
 	defer tr.lock.Unlock()
 
 	if tr.backoffTimer == nil {
-		tr.backoffTimer = tr.backlogMgr.timeSource.AfterFunc(duration, func() {
+		tr.backoffTimer = afterFunc(tr.backlogMgr.timeSource, duration, func() {
 			tr.lock.Lock()
 			defer tr.lock.Unlock()
 			tr.backoffTimer = nil
@@ -719,7 +749,7 @@ func (tr *fairTaskReader) getLoadedTasks() int {
 }
 
 func (tr *fairTaskReader) ackLevelPinnedLocked() bool {
-	return tr.ackLevelPinnedByWriter || len(tr.newlyWrittenTasks) > 0
+	return tr.ackLevelPinnedByWriter || len(tr.newlyWrittenTasks) > 0 || len(tr.adminInFlight) > 0
 }
 
 // call this whenever new tasks are acked or when ackLevelPinnedLocked() may turn from true to

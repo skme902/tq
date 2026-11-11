@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"time"
@@ -76,7 +77,7 @@ type QueueDescription struct {
 
 	// WaitingPollers is the number of polls parked in the matcher.
 	WaitingPollers int
-	// LoadedTasks is the number of backlog tasks read into memory and not leased.
+	// LoadedTasks is the number of backlog tasks read into memory, not leased and not delayed.
 	LoadedTasks int
 	// MatcherTasks is the number of tasks in the matcher, ready to be handed out.
 	MatcherTasks int
@@ -108,7 +109,13 @@ func (e *Engine) DescribeQueue(ctx context.Context, queue store.QueueKey) (*Queu
 	} else if d, err = e.describeUnloaded(ctx, queue); err != nil {
 		return nil, err
 	}
-	if e.configSource != nil {
+	if d.Loaded {
+		// What dispatch uses: the rate limit manager's cache, refreshed on load and on
+		// QueueConfigWatcher notifications (like EffectiveRateLimit).
+		var keys map[string]struct{}
+		d.Paused, keys = pm.rateLimitManager.pauseState()
+		d.PausedFairnessKeys = slices.Sorted(maps.Keys(keys))
+	} else if e.configSource != nil {
 		cfg := e.configSource.QueueConfig(queue)
 		d.Paused, d.PausedFairnessKeys = cfg.Paused, slices.Clone(cfg.PausedFairnessKeys)
 	}

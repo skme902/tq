@@ -21,6 +21,7 @@ import (
 	"embed"
 	"errors"
 	"io/fs"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -70,7 +71,10 @@ type Store struct {
 	closer bool
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store         = (*Store)(nil)
+	_ store.HealthChecker = (*Store)(nil)
+)
 
 // Open connects using a pgx DSN/URL. It does not create tables; call Migrate.
 func Open(ctx context.Context, dsn string, opts Options) (*Store, error) {
@@ -125,14 +129,24 @@ func Migrate(ctx context.Context, db *sql.DB) ([]int, error) {
 	return sqlcore.Migrate(ctx, db, dialect, ms)
 }
 
-// CheckHealth implements store.HealthChecker: a ping of the pool(s) and the applied schema
+// latestMigration is the newest embedded migration, computed once (the embedded files never
+// change at run time).
+var latestMigration = sync.OnceValues(func() (int, error) {
+	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
+	if err != nil {
+		return 0, err
+	}
+	return sqlcore.LatestMigration(ms), nil
+})
+
+// CheckHealth implements store.HealthChecker: a ping of the read pool and the applied schema
 // version against the newest embedded migration.
 func (s *Store) CheckHealth(ctx context.Context) (store.StoreHealth, error) {
-	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
+	want, err := latestMigration()
 	if err != nil {
 		return store.StoreHealth{}, err
 	}
-	return s.Store.CheckHealth(ctx, sqlcore.LatestMigration(ms))
+	return s.Store.CheckHealth(ctx, want)
 }
 
 // DB returns the underlying pool.

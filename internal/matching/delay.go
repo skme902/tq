@@ -31,12 +31,20 @@ func (tr *fairTaskReader) effectiveLoadedLocked() int {
 	return tr.loadedTasks + max(0, tr.delayedTasks-tr.maxDelayedInMemory())
 }
 
-// armDelayLocked starts the timer that makes a delayed task matchable at visibleAt.
+// armDelayLocked starts the timer that makes a delayed task matchable at visibleAt. Arming and
+// stopping under tr.lock is safe because timer callbacks never run inline on the clock
+// (afterFunc). delayGen identifies this delay: a callback for an older one (already
+// scheduled when its timer was stopped) is ignored by delayFired.
 func (tr *fairTaskReader) armDelayLocked(task *internalTask, visibleAt time.Time) {
-	d := max(visibleAt.Sub(tr.backlogMgr.timeSource.Now()), 0)
-	// Not under the timer callback: the matcher reads the clock, and a fake clock runs
-	// callbacks with its lock held.
-	task.delayTimer = tr.backlogMgr.timeSource.AfterFunc(d, func() { go tr.delayFired(task) })
+	if tr.delayStopped {
+		return // the queue is stopping: the row keeps VisibleAt for the next load
+	}
+	task.delayGen++
+	gen := task.delayGen
+	if task.delayTimer != nil {
+		task.delayTimer.Stop()
+	}
+	task.delayTimer = afterFuncAt(tr.backlogMgr.timeSource, visibleAt, func() { tr.delayFired(task, gen) })
 }
 
 // delayLocked turns a loaded (just unleased) task into a delayed one. It reports false if
@@ -59,6 +67,7 @@ func (tr *fairTaskReader) delayLocked(task *internalTask, visibleAt time.Time) b
 // undelayLocked drops a delayed task's delayed state (it is completed, trimmed or deleted).
 func (tr *fairTaskReader) undelayLocked(task *internalTask) {
 	task.delayed = false
+	task.delayGen++ // a pending registration or firing for the old delay is dropped
 	tr.delayedTasks--
 	if task.delayTimer != nil {
 		task.delayTimer.Stop()
@@ -66,19 +75,96 @@ func (tr *fairTaskReader) undelayLocked(task *internalTask) {
 	}
 }
 
-// delayFired makes a delayed task matchable, unless it left the delayed state meanwhile.
-func (tr *fairTaskReader) delayFired(task *internalTask) {
+// stopDelayTimers stops every delayed task's timer when the queue unloads or stops, so neither
+// the timers nor the reader, partition and engine their callbacks hold outlive the queue (a
+// delay can be hours, or effectively forever with an uncapped RetryBackoff). It runs before
+// tqCtx is cancelled, so it also blocks arming new timers.
+func (tr *fairTaskReader) stopDelayTimers() {
 	tr.lock.Lock()
-	if !task.delayed || tr.backlogMgr.tqCtx.Err() != nil {
+	defer tr.lock.Unlock()
+	tr.delayStopped = true
+	tr.outstandingTasks.Scan(func(o outstandingTask) bool {
+		if o.task != nil && o.task.delayed {
+			o.task.delayGen++ // a callback already scheduled is ignored
+			if o.task.delayTimer != nil {
+				o.task.delayTimer.Stop()
+				o.task.delayTimer = nil
+			}
+		}
+		return true
+	})
+}
+
+// evictDelayedLocked drops a delayed task that a trim chopped from outstandingTasks. Its
+// VisibleAt is kept in evictedDelays, so the re-read delays it again even when the delay
+// exists only in memory (no DeadLetterStore, or a failed VisibleAt write).
+func (tr *fairTaskReader) evictDelayedLocked(task *internalTask) {
+	tr.backlogAge.record(task.event.Data.CreateTime, -1)
+	tr.recordEvictedDelayLocked(task.fairLevel(), task.event.Data.VisibleAt)
+	tr.undelayLocked(task)
+	task.setEvicted()
+}
+
+// recordEvictedDelayLocked remembers the visibility time of a task dropped from memory.
+// Bounded by evictedAcksCacheSize: past that it drops the highest other level (the furthest
+// from the ack level, so the last to be re-read), never the one just written.
+func (tr *fairTaskReader) recordEvictedDelayLocked(level fairLevel, at time.Time) {
+	if tr.evictedDelays == nil {
+		tr.evictedDelays = make(map[fairLevel]time.Time)
+	}
+	tr.evictedDelays[level] = at
+	for len(tr.evictedDelays) > evictedAcksCacheSize {
+		victim, found := fairLevel{}, false
+		for l := range tr.evictedDelays {
+			if l != level && (!found || victim.less(l)) {
+				victim, found = l, true
+			}
+		}
+		delete(tr.evictedDelays, victim)
+	}
+}
+
+// delayFired makes a delayed task matchable, unless it left the delayed state meanwhile.
+func (tr *fairTaskReader) delayFired(task *internalTask, gen uint64) {
+	tr.lock.Lock()
+	if !task.delayed || task.delayGen != gen || tr.delayStopped || tr.backlogMgr.tqCtx.Err() != nil {
 		tr.lock.Unlock()
 		return
 	}
 	task.delayed = false
 	task.delayTimer = nil
 	tr.delayedTasks--
+	if o, ok := tr.outstandingTasks.Get(outstandingTask{level: task.fairLevel()}); !ok || o.task != task {
+		tr.lock.Unlock() // no longer tracked by this reader: a re-read owns the row
+		return
+	}
 	tr.loadedTasks++
+	// Reset the matcher state under the lock: a trim that runs once the lock is dropped then
+	// marks the task evicted, and the matcher refuses it. Resetting after the unlock (as
+	// addTaskToMatcher does) would wipe that eviction, and the trimmed row would be matched
+	// here and again by the re-read that loads it.
+	task.resetMatcherState()
 	tr.lock.Unlock()
-	tr.addTaskToMatcher(task)
+	if testHookDelayFiredUnlocked != nil {
+		testHookDelayFiredUnlocked(tr, task)
+	}
+	tr.addPreparedTaskToMatcher(task)
+}
+
+// testHookDelayFiredUnlocked runs in delayFired between dropping the reader lock and adding the
+// task to the matcher (tests only).
+var testHookDelayFiredUnlocked func(tr *fairTaskReader, task *internalTask)
+
+// maxVisibleAt is the latest redelivery time: redeliverAt holds unix nanos, which cannot
+// represent a later time (an uncapped RetryBackoff reaches it after a few dozen attempts).
+var maxVisibleAt = time.Unix(0, math.MaxInt64)
+
+// redeliveryTime is now+delay, capped at maxVisibleAt.
+func redeliveryTime(now time.Time, delay time.Duration) time.Time {
+	if delay >= maxVisibleAt.Sub(now) {
+		return maxVisibleAt
+	}
+	return now.Add(delay)
 }
 
 // RetryBackoff is an exponential delay before a nacked or expired backlog task is

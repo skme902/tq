@@ -72,7 +72,7 @@ type (
 
 	// QueueConfigSource replaces userDataManager for per-queue config. A loaded queue reads
 	// QueueConfig once when it loads and again only when notified through QueueConfigWatcher:
-	// every field (rate limits, admin dispatch rates, fairness weight overrides) is cached in
+	// every field (rate limits, admin dispatch rates, fairness weight overrides, Paused, PausedFairnessKeys) is cached in
 	// the queue's rate limit manager. A source that changes values without implementing
 	// QueueConfigWatcher takes effect only after the queue unloads and reloads.
 	QueueConfigSource interface {

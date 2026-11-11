@@ -75,7 +75,7 @@ func TestPauseQueue(t *testing.T) {
 func TestPauseFairnessKey(t *testing.T) {
 	src := taskqueue.NewMemoryQueueConfigSource(0)
 	e := newEngine(t, memstore.New(), nil, withConfigSource(src))
-	src.SetFairnessKeyPaused(q, "a", true)
+	require.NoError(t, src.SetFairnessKeyPaused(q, "a", true))
 	for _, k := range []string{"a", "b", "a", "b"} {
 		tk := task(k)
 		tk.Priority = store.Priority{FairnessKey: k}
@@ -91,7 +91,7 @@ func TestPauseFairnessKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"a"}, desc.PausedFairnessKeys)
 
-	src.SetFairnessKeyPaused(q, "a", false)
+	require.NoError(t, src.SetFairnessKeyPaused(q, "a", false))
 	for range 2 {
 		d := pollFrom(t, e, q)
 		require.Equal(t, "a", string(d.Task.Payload))

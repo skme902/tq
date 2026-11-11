@@ -43,8 +43,8 @@ func deadLetteredCount(rec *metricstest.Recorder, reason string) int64 {
 	return rec.CounterValue(metrics.TasksDeadLettered, qTags(metrics.Tag{Key: metrics.TagReason, Value: reason})...)
 }
 
-// Nack on the last attempt dead-letters the backlog task: it is removed from the backlog, not
-// redelivered, and listed with its attempts and the Nack reason.
+// Nack on the last attempt dead-letters the backlog task: it is not redelivered, and listed
+// with its attempts and the Nack reason. Ack-level GC removes the backlog row.
 func TestMaxAttemptsNackDeadLetters(t *testing.T) {
 	rec := metricstest.New()
 	st := memstore.New()
@@ -67,7 +67,8 @@ func TestMaxAttemptsNackDeadLetters(t *testing.T) {
 	require.Equal(t, int32(3), dead[0].Task.Data.Attempts)
 	require.Equal(t, "nack: boom", dead[0].Reason)
 	require.Equal(t, int64(1), deadLetteredCount(rec, taskqueue.DeadReasonNack))
-	require.Zero(t, st.TotalTaskCount(q), "moved out of the backlog")
+	require.Eventually(t, func() bool { return st.TotalTaskCount(q) == 0 }, 3*time.Second, 10*time.Millisecond,
+		"ack-level GC removes the backlog row")
 
 	desc, err := e.DescribeQueue(context.Background(), q)
 	require.NoError(t, err)
@@ -140,7 +141,8 @@ func TestMaxAttemptsSurviveRestart(t *testing.T) {
 		require.Len(t, dead, 1)
 		require.Equal(t, taskqueue.DeadReasonAttemptsExhausted, dead[0].Reason)
 		require.Equal(t, int32(2), dead[0].Task.Data.Attempts)
-		require.Empty(t, storedTasks(t, st, q))
+		require.Eventually(t, func() bool { return len(storedTasks(t, st, q)) == 0 }, 3*time.Second, 10*time.Millisecond,
+			"ack-level GC removes the dead-lettered row")
 	})
 }
 

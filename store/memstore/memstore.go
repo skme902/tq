@@ -64,6 +64,7 @@ var (
 	_ store.QueueLister      = (*Store)(nil)
 	_ store.DeadLetterStore  = (*Store)(nil)
 	_ store.QueueSweeper     = (*Store)(nil)
+	_ store.HealthChecker    = (*Store)(nil)
 	_ store.QueueConfigStore = (*Store)(nil)
 )
 
@@ -208,7 +209,15 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 			ack = q.info.Subqueues[sq].FairAckLevel
 		}
 		live := false
-		tree.Ascend(store.TaskInfo{Pass: ack.Pass, ID: ack.ID + 1}, func(store.TaskInfo) bool {
+		// Ascend from the ack level itself (ack.ID+1 would overflow at MaxInt64) and skip a
+		// row exactly at it: live means strictly above, as in SQL (pass, task_id) > ack.
+		tree.Ascend(store.TaskInfo{Pass: ack.Pass, ID: ack.ID}, func(ti store.TaskInfo) bool {
+			if ti.Pass == ack.Pass && ti.ID == ack.ID {
+				return true
+			}
+			if !req.Now.IsZero() && ti.Data.ExpiryTime.Unix() > 0 && ti.Data.ExpiryTime.Before(req.Now) {
+				return true // expired: goes with the queue
+			}
 			live = true
 			return false
 		})
@@ -393,10 +402,8 @@ func (s *Store) DeadLetterTask(ctx context.Context, req *store.DeadLetterTaskReq
 	if q.dead == nil {
 		q.dead = make(map[int64]store.DeadTask)
 	}
+	// The backlog row stays. Ack-level GC removes it, the same as an acked task.
 	q.dead[req.Task.ID] = store.DeadTask{Task: cloneTask(req.Task), Reason: req.Reason, DeadTime: req.DeadTime}
-	if tree := q.subqueues[req.Subqueue]; tree != nil {
-		tree.Delete(store.TaskInfo{Pass: req.Task.Pass, ID: req.Task.ID})
-	}
 	return nil
 }
 
@@ -434,7 +441,11 @@ func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksReque
 	slices.Sort(ids)
 	for i, id := range ids {
 		if i == req.PageSize {
-			resp.NextPageToken, _ = json.Marshal(ids[i-1])
+			tok, err := json.Marshal(ids[i-1])
+			if err != nil {
+				return nil, err
+			}
+			resp.NextPageToken = tok
 			break
 		}
 		d := q.dead[id]

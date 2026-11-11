@@ -66,6 +66,9 @@ type Engine struct {
 	partitionsLock sync.RWMutex
 	partitions     map[store.QueueKey]*taskQueuePartitionManagerImpl
 	stopped        bool
+	// sweeping holds the queues SweepIdleQueues is deleting (guarded by partitionsLock); a load
+	// of one waits for its channel to close.
+	sweeping map[store.QueueKey]chan struct{}
 
 	// leases holds every outstanding Delivery (backlog and sync-matched). leasesClosed is set
 	// under leasesLock when Shutdown decides the drain is over and when Stop snapshots leases;
@@ -114,6 +117,10 @@ type Engine struct {
 	queueTagsLock sync.Mutex
 	queueTags     map[[2]string]struct{}
 
+	// redriveMu serializes RedriveDeadTasks. Without it, two goroutines can both spool a
+	// dead row before either deletes it and the backlog gets a duplicate.
+	redriveMu sync.Mutex
+
 	// testHookStopAfterSyncLeases, if set, runs in Stop after sync leases are re-spooled and
 	// before queues unload (tests only).
 	testHookStopAfterSyncLeases func()
@@ -122,6 +129,9 @@ type Engine struct {
 	testHookBeforeDrainSelect func()
 	// testHookBeforeRespool, if set, runs at the start of respoolSyncTaskLocked.
 	testHookBeforeRespool func(shuttingDown bool)
+	// testHookAfterDeadSnapshot, if set, runs after RedriveDeadTasks has snapshotted the max
+	// dead task id and before it redrives (tests only).
+	testHookAfterDeadSnapshot func()
 }
 
 // NewEngine validates options and returns an engine. Queues load lazily on first use.
@@ -514,6 +524,20 @@ func (e *Engine) getTaskQueuePartitionManager(
 
 	// If it gets here, write lock and check again in case a task queue is created between the two locks
 	e.partitionsLock.Lock()
+	for {
+		ch, sweeping := e.sweeping[partition]
+		if !sweeping {
+			break
+		}
+		// SweepIdleQueues is deleting this queue's row: load it once that has finished.
+		e.partitionsLock.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		e.partitionsLock.Lock()
+	}
 	if e.stopped {
 		e.partitionsLock.Unlock()
 		return nil, ErrEngineStopped
@@ -589,13 +613,7 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 			return false, err
 		}
 		t := task
-		if age := time.Duration(pm.maxTaskAge.Load()); age > 0 {
-			// Library addition (Config.MaxTaskAge): cap the expiry at max age after this
-			// AddTask (not CreateTime, so a redriven task gets a fresh window).
-			if limit := start.Add(age); t.ExpiryTime.IsZero() || limit.Before(t.ExpiryTime) {
-				t.ExpiryTime = limit
-			}
-		}
+		capExpiry(pm, &t, start, false)
 		matched, err := pm.AddTask(ctx, &t, nil)
 		if matched && err == nil {
 			// upstream handler.AddActivityTask: the whole call, for sync matches only
@@ -607,6 +625,47 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 			continue
 		}
 		return matched, err
+	}
+}
+
+// capExpiry applies Config/QueueConfig.MaxTaskAge (library addition): the task expires at most
+// max age after now (not CreateTime). For a redrive (fresh), an ExpiryTime already in the past
+// is replaced too, so a dead task that outlived its window gets a new one instead of being
+// dropped unseen by the reader.
+func capExpiry(pm *taskQueuePartitionManagerImpl, t *store.Task, now time.Time, fresh bool) {
+	age := time.Duration(pm.maxTaskAge.Load())
+	if age <= 0 {
+		return
+	}
+	limit := now.Add(age)
+	if t.ExpiryTime.IsZero() || limit.Before(t.ExpiryTime) || (fresh && !now.Before(t.ExpiryTime)) {
+		t.ExpiryTime = limit
+	}
+}
+
+// spoolTask writes task to the durable backlog and never sync-matches. Redrive uses it so the
+// task is persisted before its dead row is deleted. Public AddTask still sync-matches.
+func (e *Engine) spoolTask(ctx context.Context, queue store.QueueKey, task store.Task) error {
+	if err := e.validatePriority(task.Priority); err != nil {
+		return err
+	}
+	task.Attempts = 0 // owned by the queue, same as AddTask
+	if task.CreateTime.IsZero() {
+		task.CreateTime = e.timeSource.Now()
+	}
+	for attempt := 1; ; attempt++ {
+		pm, err := e.getTaskQueuePartitionManager(ctx, queue, true)
+		if err != nil {
+			return err
+		}
+		t := task
+		capExpiry(pm, &t, e.timeSource.Now(), true)
+		err = pm.spoolBacklog(&t)
+		// Same unload/conflict retries as AddTask. A waiting poller is not offered the task.
+		if err != nil && attempt < addTaskMaxAttempts && isShutdownOrConflict(err) && ctx.Err() == nil {
+			continue
+		}
+		return err
 	}
 }
 
@@ -709,20 +768,25 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 			}
 		}
 		d, err := e.newDelivery(task, dbq, queue, opts.LeaseDuration)
-		if err == nil && !d.SyncMatched && dbq.maxAttempts() > 0 {
-			e.recordAttempt(dbq, task)
+		if errors.Is(err, errAttemptFenced) {
+			// Ownership was lost while recording the attempt. The backlog row is unchanged
+			// and the queue is unloaded. Do not hand the caller a delivery it could ack.
+			if derr := e.drainingErr(); derr != nil && callerCtx.Err() == nil {
+				return nil, derr
+			}
+			return nil, ErrNoTasks
 		}
 		return d, err
 	}
 }
 
-// respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
 func (e *Engine) isStopped() bool {
 	e.partitionsLock.RLock()
 	defer e.partitionsLock.RUnlock()
 	return e.stopped
 }
 
+// respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
 func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
 	e.respoolSyncTask(d, shuttingDown, time.Time{})
 }
@@ -853,7 +917,7 @@ func timeoutOn(parent context.Context, timeout time.Duration, ts clock.TimeSourc
 		return context.WithTimeout(parent, timeout)
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	timer := ts.AfterFunc(timeout, func() { cancel(context.DeadlineExceeded) })
+	timer := afterFunc(ts, timeout, func() { cancel(context.DeadlineExceeded) })
 	return ctx, func() {
 		timer.Stop()
 		cancel(context.Canceled)
