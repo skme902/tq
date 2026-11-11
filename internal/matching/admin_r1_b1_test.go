@@ -436,8 +436,12 @@ func TestPurgeGCRetriesFailedDelete(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, 2, st.TotalTaskCount(portQueue), "failed purge delete leaves the rows behind the new ack level")
 
-	ts.Advance(time.Second)
+	// periodicSync arms its UpdateAckInterval timer in its own goroutine, which can start
+	// after the queue reports initialized. A single Advance taken before that timer exists
+	// never fires it (the timer lands a full interval later), so step the clock on every
+	// check: each step fires the periodic sync, and its maybeGC, once the timer is armed.
 	require.Eventually(t, func() bool {
+		ts.Advance(time.Second)
 		return st.TotalTaskCount(portQueue) == 0
 	}, 3*time.Second, 5*time.Millisecond, "ack-level GC retries the purge delete")
 }
