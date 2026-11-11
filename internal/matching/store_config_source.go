@@ -8,7 +8,6 @@ package matching
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -69,7 +68,8 @@ type StoreQueueConfigSource struct {
 }
 
 // NewStoreQueueConfigSource loads every stored config (it fails if the store does) and
-// starts polling for changes until Close.
+// starts polling for changes until Close. ctx bounds only that initial load; the poller runs
+// until Close.
 func NewStoreQueueConfigSource(ctx context.Context, st store.QueueConfigStore, opts StoreQueueConfigSourceOptions) (*StoreQueueConfigSource, error) {
 	if st == nil {
 		return nil, &store.InvalidArgumentError{Msg: "NewStoreQueueConfigSource: nil store"}
@@ -138,44 +138,62 @@ func (s *StoreQueueConfigSource) WatchQueueConfig(queue store.QueueKey, onChange
 	return s.mem.WatchQueueConfig(queue, onChange)
 }
 
-// Refresh reads every change since the last one seen and applies the newer versions.
+// Refresh reads every change since the last one seen and installs, per queue, only the newest
+// version: like upstream's user-data load, a peer that missed several changes moves straight
+// to the latest one and notifies once, so a superseded value (say a resume followed by a new
+// pause) never reaches the matcher. A newest version that does not decode is logged and
+// skipped; older rows of that queue are not replayed instead.
 func (s *StoreQueueConfigSource) Refresh(ctx context.Context) error {
 	const page = 500
+	s.mu.Lock()
+	after := s.seq
+	s.mu.Unlock()
+	newest := make(map[store.QueueKey]store.QueueConfigRecord)
 	for {
-		s.mu.Lock()
-		after := s.seq
-		s.mu.Unlock()
 		recs, err := s.st.ListQueueConfigChanges(ctx, after, page)
 		if err != nil {
 			return err
 		}
 		for _, r := range recs {
-			s.apply(r)
+			after = max(after, r.Seq)
+			if r.Version > newest[r.Key].Version {
+				newest[r.Key] = r
+			}
 		}
 		if len(recs) < page {
-			return nil
+			break
 		}
 	}
+	for _, r := range newest {
+		cfg, err := decodeQueueConfig(r.Config)
+		if err != nil {
+			s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
+			s.opts.Logger.Error("ignoring undecodable queue config", "queue", r.Key.String(), "version", r.Version, "error", err)
+			continue
+		}
+		s.install(r.Key, r.Version, cfg)
+	}
+	s.mu.Lock()
+	s.seq = max(s.seq, after)
+	s.mu.Unlock()
+	return nil
 }
 
-// apply installs r if it is newer than the cached version and advances the feed position.
-func (s *StoreQueueConfigSource) apply(r store.QueueConfigRecord) {
+// install caches cfg as the queue's config if version is newer than the cached one, then
+// notifies watchers with no lock of this source held: a watcher may call back into the source
+// (QueueConfig, Update, Refresh), and one queue's notification does not block other queues.
+func (s *StoreQueueConfigSource) install(key store.QueueKey, version int64, cfg QueueConfig) {
 	s.mu.Lock()
-	s.seq = max(s.seq, r.Seq)
-	if r.Version <= s.version[r.Key] {
+	if version <= s.version[key] {
 		s.mu.Unlock()
 		return
 	}
-	cfg, err := decodeQueueConfig(r.Config)
-	if err != nil {
-		s.mu.Unlock()
-		s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
-		s.opts.Logger.Error("ignoring undecodable queue config", "queue", r.Key.String(), "version", r.Version, "error", err)
-		return
-	}
-	s.version[r.Key] = r.Version
-	s.mem.update(r.Key, func(c *QueueConfig) { *c = cfg }) // notifies watchers (no lock held there)
+	s.version[key] = version
+	s.mem.mu.Lock()
+	s.mem.cfgs[key] = cfg
+	s.mem.mu.Unlock()
 	s.mu.Unlock()
+	s.mem.notifyQueue(key)
 }
 
 // Update changes one queue's config: mutate gets a copy of the current stored value, and
@@ -205,6 +223,9 @@ func (s *StoreQueueConfigSource) Update(ctx context.Context, queue store.QueueKe
 		if err := mutate(&next); err != nil {
 			return QueueConfig{}, err
 		}
+		if len(next.PausedFairnessKeys) > 0 { // same normal form as SetFairnessKeyPaused
+			next.PausedFairnessKeys = slices.Compact(slices.Sorted(slices.Values(next.PausedFairnessKeys)))
+		}
 		if err := validateQueueConfig(next, s.mem.maxOverrides); err != nil {
 			return QueueConfig{}, err
 		}
@@ -226,22 +247,16 @@ func (s *StoreQueueConfigSource) Update(ctx context.Context, queue store.QueueKe
 		s.opts.Metrics.Counter(metrics.QueueConfigUpdates, 1)
 		s.opts.Logger.Info("queue config updated", "queue", queue.String(), "version", out.Version,
 			"identity", change.Identity, "reason", change.Reason)
-		s.applyLocal(*out, next)
-		return next, nil
+		// Cache and return fresh decodes of what was written, so nothing the mutate callback
+		// still references aliases the live config.
+		cached, err := decodeQueueConfig(blob)
+		if err != nil {
+			return QueueConfig{}, err
+		}
+		s.install(queue, out.Version, cached) // the feed position stays: it may hold others' writes
+		return decodeQueueConfig(blob)
 	}
 	return QueueConfig{}, lastErr
-}
-
-// applyLocal installs a version this source wrote, without moving the feed position (the
-// feed may still hold earlier writes by others).
-func (s *StoreQueueConfigSource) applyLocal(r store.QueueConfigRecord, cfg QueueConfig) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if r.Version <= s.version[r.Key] {
-		return
-	}
-	s.version[r.Key] = r.Version
-	s.mem.update(r.Key, func(c *QueueConfig) { *c = cfg })
 }
 
 // History returns up to limit versions of the queue's config, newest first.
@@ -297,6 +312,16 @@ func validateQueueConfig(c QueueConfig, maxOverrides int) error {
 	if c.MaxAttempts != nil && *c.MaxAttempts < 0 {
 		errs = append(errs, &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxAttempts must be non-negative, got %d", *c.MaxAttempts)})
 	}
+	if len(c.PausedFairnessKeys) > maxOverrides {
+		errs = append(errs, &store.InvalidArgumentError{Msg: fmt.Sprintf("too many paused fairness keys: got %d, maximum %d", len(c.PausedFairnessKeys), maxOverrides)})
+	}
+	for _, k := range c.PausedFairnessKeys {
+		if k == "" {
+			errs = append(errs, &store.InvalidArgumentError{Msg: "paused fairness key must not be empty"})
+		} else if len(k) > fairnessKeyMaxLength {
+			errs = append(errs, &store.InvalidArgumentError{Msg: "fairness key length exceeds limit"})
+		}
+	}
 	if c.MaxTaskAge != nil && *c.MaxTaskAge < 0 {
 		errs = append(errs, &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", *c.MaxTaskAge)})
 	}
@@ -305,5 +330,5 @@ func validateQueueConfig(c QueueConfig, maxOverrides int) error {
 			return e
 		}
 	}
-	return errors.Join() // nil
+	return nil
 }
