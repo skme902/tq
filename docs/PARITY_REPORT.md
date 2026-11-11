@@ -305,10 +305,13 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
 
 26. **Max attempts and dead letters (feat/ops-dlq).** Library-only: upstream matching acks a task once history
     starts it, and history owns retries. `store.Task.Attempts` (in the task blob, no column) counts deliveries;
-    with `MaxAttempts > 0` each backlog delivery does one extra fenced `UpdateTask` before `PollTask` returns, and
-    a last failed attempt moves the row to `tq_dead_tasks` instead of `addTaskToMatcher`. The default (0) adds no
-    writes and keeps upstream's redelivery path. Fair order, the limiter, sync match vs backlog and fencing are
-    unchanged; a dead-lettered task is finished like an ack, so the ack level advances past it as usual.
+    with `MaxAttempts > 0` each backlog delivery does one extra fenced `UpdateTask` before the lease timer is armed
+    and before `PollTask` returns. A last failed attempt inserts a row in `tq_dead_tasks` and finishes the task
+    like an ack (dead-lettering is an ack plus a dead insert). Ack-level GC deletes the backlog row, the same as
+    any other ack. A crash after the insert and before that ack level is persisted leaves the task both live and
+    dead (at-least-once duplicate). The default (0) adds no writes and keeps upstream's redelivery path. Fair
+    order, the limiter, sync match vs backlog and fencing are unchanged; the ack level advances past a
+    dead-lettered task as usual.
 
 27. **Task admin (feat/ops-admin).** `PeekTasks`, `DeleteTask` and `PurgeQueue` are library-only (upstream has
     `tdbg taskqueue list-tasks` but no delete or purge). The reader gains `adminDeleted` levels that a racing read

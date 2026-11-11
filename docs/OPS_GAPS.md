@@ -59,13 +59,30 @@ The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so b
 
 ## 1. Max attempts, poison tasks and a DLQ — P0, M–L — done
 
-**Status: implemented in feat/ops-dlq** (README §Dead letters). Refinements to the design below:
-`Attempts` lives in `store.Task` (the JSON blob, no column) and counts deliveries started, persisted with a
-fenced in-place `UpdateTask` on each backlog delivery when a limit is set, rather than a rewrite with a new ID
-(which would move the task in fair order). `Nack(NackReason(s))` records a string, not an error. `PurgeDeadTasks`
-takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count` gauge:
-`DescribeQueue().DeadTasks` reads the count.
+**Status: implemented in feat/ops-dlq** (README §Dead letters).
 
+What shipped:
+
+- `store.Task.Attempts` (in the task JSON, no column) counts deliveries started. `Delivery.Task.Attempts` is that
+  field. `AddTask` ignores a caller-supplied value and resets it to 0.
+- With `MaxAttempts > 0`, each backlog delivery does a fenced in-place `UpdateTask` (same id and pass, so fair
+  order does not move) before the lease timer is armed. A `ConditionFailed` on that write unloads the queue and
+  `PollTask` returns `ErrNoTasks` without a delivery; the backlog row is unchanged. Other write failures still
+  deliver the task.
+- `QueueConfig.MaxAttempts` overrides the engine default (`nil` = engine default, `0` = unlimited). A negative
+  override is ignored and the previous limit is kept.
+- Dead-lettering inserts into `tq_dead_tasks` and finishes the task like an ack. Ack-level GC deletes the backlog
+  row. A crash between the insert and the persisted ack level leaves the task both live and dead (at-least-once).
+- `Nack(NackReason(s))` records a string (`nack: s`), not an error. Reasons are `nack`, `lease_expired`, and
+  `attempts_exhausted`. A sync-matched last attempt is spooled and later dead-lettered as `attempts_exhausted`, so
+  that Nack reason is not kept.
+- `ListDeadTasks`, `DeleteDeadTasks`, `PurgeDeadTasks(queue, deadBefore)`, and `RedriveDeadTasks`. Redrive spools
+  onto the backlog (no sync match) and deletes dead rows only after that write commits. The count is rows
+  deleted. The call snapshots the highest dead task id and does not pick up tasks that die again during it.
+- Metrics: `tasks_dead_lettered{reason}`, `dead_letter_failures`, `tasks_redriven`, `task_attempt_record_failures`.
+  No `dlq_backlog_count` gauge: `DescribeQueue().DeadTasks` reads the count.
+
+Original design (superseded by the status above):
 
 - **Today.**
   - `Delivery.Nack`, lease expiry, and a Starter that returns a retryable error all redeliver the task. This is

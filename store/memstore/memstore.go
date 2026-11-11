@@ -346,10 +346,8 @@ func (s *Store) DeadLetterTask(ctx context.Context, req *store.DeadLetterTaskReq
 	if q.dead == nil {
 		q.dead = make(map[int64]store.DeadTask)
 	}
+	// The backlog row stays. Ack-level GC removes it, the same as an acked task.
 	q.dead[req.Task.ID] = store.DeadTask{Task: cloneTask(req.Task), Reason: req.Reason, DeadTime: req.DeadTime}
-	if tree := q.subqueues[req.Subqueue]; tree != nil {
-		tree.Delete(store.TaskInfo{Pass: req.Task.Pass, ID: req.Task.ID})
-	}
 	return nil
 }
 
