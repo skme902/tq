@@ -269,9 +269,11 @@ func (e *Engine) DeleteTask(ctx context.Context, queue store.QueueKey, ref TaskR
 
 // PurgeQueue deletes every backlog task of a queue and returns how many rows it deleted. It
 // loads the queue on this Engine (taking it over from another owner, like AddTask). Tasks added
-// while it runs may or may not be purged; tasks added after it returns are kept. Leases on
-// purged tasks end (Ack and Nack return ErrLeaseLost). Dead tasks are kept (PurgeDeadTasks);
-// sync-matched leases are not in the backlog and are not affected.
+// while it runs may or may not be purged. A write that already pinned the ack level is kept:
+// its passes were chosen before the purge watermark moved, and a lagging fairness key can land
+// below the previous max. Tasks added after PurgeQueue returns are kept. Leases on purged tasks
+// end (Ack and Nack return ErrLeaseLost). Dead tasks are kept (PurgeDeadTasks); sync-matched
+// leases are not in the backlog and are not affected.
 func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, error) {
 	pqm, err := e.adminQueue(ctx, queue)
 	if err != nil {
@@ -284,7 +286,11 @@ func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, err
 	var leased []*internalTask
 	bounds := make([]fairLevel, len(readers))
 	for i, tr := range readers {
-		l, b := tr.adminPurge()
+		l, b, err := tr.adminPurge(ctx)
+		if err != nil {
+			e.endLeases(leased)
+			return 0, err
+		}
 		leased = append(leased, l...)
 		bounds[i] = b
 	}
