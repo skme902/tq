@@ -3,6 +3,7 @@ package taskqueue_test
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -416,4 +417,43 @@ func (g *gateStore) GetQueue(ctx context.Context, key store.QueueKey) (*store.Ge
 		return nil, ctx.Err()
 	}
 	return g.Store.GetQueue(ctx, key)
+}
+
+// slowCreateStore blocks CreateTasks while armed, so a respool can be caught mid-write.
+type slowCreateStore struct {
+	*memstore.Store
+	armed   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *slowCreateStore) CreateTasks(ctx context.Context, req *store.CreateTasksRequest) (*store.CreateTasksResponse, error) {
+	if s.armed.Load() {
+		s.once.Do(func() { close(s.started) })
+		<-s.release
+	}
+	return s.Store.CreateTasks(ctx, req)
+}
+
+// Review r2 #4: a Shutdown that finds a direct Stop in progress returns only after that
+// Stop has respooled the outstanding sync-matched lease.
+func TestShutdownWaitsForConcurrentStop(t *testing.T) {
+	st := &slowCreateStore{Store: memstore.New(), started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	open := func() { releaseOnce.Do(func() { close(st.release) }) }
+	e := newEngine(t, st, nil)
+	t.Cleanup(open) // runs before the engine's cleanup Stop
+	syncMatch(t, e, "held")
+	st.armed.Store(true)
+	stopped := make(chan struct{})
+	go func() { e.Stop(); close(stopped) }()
+	<-st.started // Stop is respooling
+	done := shutdownAsync(e, context.Background())
+	requireNotDone(t, done)
+	open()
+	require.NoError(t, <-done)
+	<-stopped
+	st.armed.Store(false)
+	requireDelivered(t, st.Store, "held")
 }

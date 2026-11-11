@@ -91,6 +91,11 @@ type Engine struct {
 	shutdownClaimed atomic.Bool
 	shutdownErr     error
 	shutdownDone    chan struct{}
+	// drainStart is when the first Shutdown began (UnixNano), for engine_drain_duration.
+	drainStart atomic.Int64
+	// stopDone is closed when Stop has finished respooling and unloading; a concurrent or
+	// later Stop, and a Shutdown that finds the engine stopped, wait on it.
+	stopDone chan struct{}
 
 	// queueTags holds the queues (namespace, name) granted a real taskqueue metrics tag,
 	// at most config.MetricsQueueTagLimit of them.
@@ -103,6 +108,8 @@ type Engine struct {
 	// testHookBeforeDrainSelect, if set, runs in Shutdown after a wait is armed and before
 	// selecting on it (tests only).
 	testHookBeforeDrainSelect func()
+	// testHookBeforeRespool, if set, runs at the start of respoolSyncTaskLocked.
+	testHookBeforeRespool func(shuttingDown bool)
 }
 
 // NewEngine validates options and returns an engine. Queues load lazily on first use.
@@ -145,6 +152,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		partitions:     make(map[store.QueueKey]*taskQueuePartitionManagerImpl),
 		leases:         make(map[*Delivery]struct{}),
 		shutdownDone:   make(chan struct{}),
+		stopDone:       make(chan struct{}),
 		queueTags:      make(map[[2]string]struct{}),
 	}, nil
 }
@@ -215,15 +223,15 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	if done, err := e.finishedShutdown(); done {
 		return err
 	}
-	start := e.timeSource.Now()
 	if !e.draining.Swap(true) {
+		e.drainStart.Store(e.timeSource.Now().UnixNano())
 		e.metricsHandler.Gauge(metrics.EngineDraining, 1)
 		e.logger.Info("draining", "leases", e.outstandingLeaseCount())
 	}
 	e.drainCancel()
 
 	remaining, err := e.waitDrain(ctx)
-	return e.completeShutdown(start, err, remaining)
+	return e.completeShutdown(err, remaining)
 }
 
 // finishedShutdown reports the result of a Shutdown that has already stopped the engine.
@@ -241,6 +249,7 @@ func (e *Engine) finishedShutdown() (bool, error) {
 	if !stopped {
 		return false, nil
 	}
+	<-e.stopDone // a Stop in progress may still be respooling
 	if e.shutdownClaimed.Load() {
 		<-e.shutdownDone
 		return true, e.shutdownErr
@@ -291,20 +300,20 @@ func (e *Engine) waitDrain(ctx context.Context) (int, error) {
 
 // completeShutdown runs Stop once. The caller that stops records err and emits the drain
 // metrics; every other caller returns that same recorded result.
-func (e *Engine) completeShutdown(start time.Time, err error, remaining int) error {
+func (e *Engine) completeShutdown(err error, remaining int) error {
 	ran := false
 	e.shutdownOnce.Do(func() {
 		ran = true
 		e.shutdownClaimed.Store(true)
 		e.shutdownErr = err
 		e.metricsHandler.Gauge(metrics.EngineDrainLeases, float64(remaining))
-		e.metricsHandler.Timer(metrics.EngineDrainDuration, e.timeSource.Since(start))
+		e.metricsHandler.Timer(metrics.EngineDrainDuration, e.timeSource.Since(time.Unix(0, e.drainStart.Load())))
 		if err != nil {
-			e.logger.Warn("drain deadline reached; stopping with leases outstanding", "leases", remaining, "error", err)
+			e.logger.Warn("drain gave up (context done); stopping with leases outstanding", "leases", remaining, "error", err)
 		} else {
 			e.logger.Info("drained")
 		}
-		e.Stop()
+		e.Stop() // waits for a concurrent Stop to finish
 		e.metricsHandler.Gauge(metrics.EngineDraining, 0)
 		close(e.shutdownDone)
 	})
@@ -370,7 +379,8 @@ func isClosed(ch chan struct{}) bool {
 	}
 }
 
-// Draining reports whether Shutdown has started.
+// Draining reports whether Shutdown has started. It stays true after Shutdown has stopped the
+// engine (the engine_draining gauge goes back to 0 then); PollTask then reports ErrEngineStopped.
 func (e *Engine) Draining() bool { return e.draining.Load() }
 
 func (e *Engine) outstandingLeaseCount() int {
@@ -380,15 +390,20 @@ func (e *Engine) outstandingLeaseCount() int {
 }
 
 // Stop re-spools outstanding sync-matched leases, then unloads every queue. It does not wait
-// for consumers; see Shutdown for a graceful drain.
+// for consumers; see Shutdown for a graceful drain. It does wait for an Ack, Nack or expiry
+// already in progress to finish its side effect (an ack, a redelivery or a respool), so that
+// side effect is not cut off by the unload. A concurrent or later Stop returns once the first
+// has finished.
 func (e *Engine) Stop() {
 	e.partitionsLock.Lock()
 	if e.stopped {
 		e.partitionsLock.Unlock()
+		<-e.stopDone
 		return
 	}
 	e.stopped = true
 	e.partitionsLock.Unlock()
+	defer close(e.stopDone)
 
 	// End every outstanding lease (library addition). Sync-matched tasks only exist in memory
 	// while leased; write them back before unloading so a graceful shutdown does not lose them.
@@ -401,17 +416,23 @@ func (e *Engine) Stop() {
 		leases = append(leases, d)
 	}
 	e.leasesLock.Unlock()
+	var settling []*Delivery
 	for _, d := range leases {
 		// A lease Ack, Nack or expiry already settled may still be in the map: its side
-		// effect has run (or is running) and release has not removed it yet. settleWith
-		// fails, so Stop must not finish or re-spool it a second time.
+		// effect is running and release has not removed it yet. settleWith fails, so Stop
+		// must not finish or re-spool it a second time; it waits for release instead.
 		if d.settleWith(ErrEngineStopped) {
 			d.stopTimer()
-			d.release()
 			if d.SyncMatched {
 				e.respoolSyncTaskLocked(d, true)
 			}
+			d.release()
+		} else {
+			settling = append(settling, d)
 		}
+	}
+	for _, d := range settling {
+		<-d.released // bounded: a respool gives up after 30s
 	}
 
 	if e.testHookStopAfterSyncLeases != nil {
@@ -648,6 +669,9 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 
 // respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
 func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
+	if e.testHookBeforeRespool != nil {
+		e.testHookBeforeRespool(shuttingDown)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	op := func(ctx context.Context) error {

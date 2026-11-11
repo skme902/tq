@@ -37,6 +37,9 @@ type Delivery struct {
 
 	deliveredAt time.Time
 
+	// released is closed by release, after the settling side effect.
+	released chan struct{}
+
 	mu       sync.Mutex
 	settled  bool
 	lostErr  error // returned by Ack/Nack/ExtendLease once settled
@@ -62,6 +65,7 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		task:        task,
 		deliveredAt: now,
 		deadline:    now.Add(lease),
+		released:    make(chan struct{}),
 	}
 	if !d.SyncMatched {
 		d.TaskID = task.event.ID
@@ -165,6 +169,7 @@ func (d *Delivery) release() {
 	e.maybeWakeDrainLocked()
 	e.leasesLock.Unlock()
 	d.pqm.MarkAlive()
+	close(d.released)
 }
 
 // Ack completes the task. It returns ErrLeaseLost if the lease already expired or was settled,
