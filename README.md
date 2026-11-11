@@ -314,7 +314,12 @@ src.SetPaused(q, false)                   // resume: waiting pollers are matched
 
 - A paused queue still accepts `AddTask`: tasks are spooled (never sync-matched) and polls wait
   as if the queue were empty. Leases already handed out are unaffected.
-- A paused fairness key is skipped by the matcher; other keys keep their fairness order.
+- A paused fairness key is skipped by the matcher; other keys keep their fairness order. Its
+  loaded tasks stay in memory but do not count toward the read batch, so they do not stop the
+  reader from loading other keys' tasks behind them. They share `Config.MaxDelayedInMemory` with
+  delayed tasks: past that many held tasks per subqueue they count as loaded, which bounds
+  memory. Like delayed tasks, they hold the ack level, so acked rows behind them are not
+  garbage-collected until the key resumes.
 - Pause is part of `QueueConfig` (`Paused`, `PausedFairnessKeys`), so any `QueueConfigSource`
   can provide it. It applies per partition key, like the other `QueueConfig` settings. Like
   rate limits, a loaded queue picks up a change only through `QueueConfigWatcher` (see Rate

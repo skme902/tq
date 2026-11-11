@@ -125,10 +125,11 @@ type Config struct {
 	// store.DeadLetterStore, so it survives a reload; otherwise it applies in memory only.
 	RetryBackoff RetryBackoff
 
-	// MaxDelayedInMemory is how many delayed tasks (Task.VisibleAt in the future) one
-	// subqueue reader holds without counting them toward GetTasksBatchSize (library
-	// addition). Past it they count as loaded, so a backlog with more delayed tasks than
-	// this plus GetTasksBatchSize ahead of ready ones delays those ready ones too.
+	// MaxDelayedInMemory is how many held tasks (delayed: Task.VisibleAt in the future; or
+	// loaded tasks of a paused fairness key) one subqueue reader keeps without counting them
+	// toward GetTasksBatchSize (library addition). Past it they count as loaded, so a backlog
+	// with more held tasks than this plus GetTasksBatchSize ahead of ready ones delays those
+	// ready ones too.
 	// Default 10000.
 	MaxDelayedInMemory int
 }

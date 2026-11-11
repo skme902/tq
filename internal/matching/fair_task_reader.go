@@ -603,13 +603,14 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	// batchSize, cut stays at maxFairLevel, meaning nothing is trimmed.
 	cut := outstandingTask{level: maxFairLevel}
 	loaded, delayed := 0, 0
+	pausedKeys := tr.pausedKeys()
 	merged.Scan(func(o outstandingTask) bool {
 		if o.acked() || o.task.leased {
 			// Leased tasks don't count either: their slot is held by the lease holder.
 			return true
-		} else if o.task.delayed {
-			// Deviation (delay): up to maxDelayedInMemory delayed tasks don't count, so they
-			// don't block reading the ready tasks behind them.
+		} else if o.task.delayed || isPausedKeyTask(pausedKeys, o.task) {
+			// Deviation (delay, pause): up to maxDelayedInMemory held tasks (delayed, or of a
+			// paused key) don't count, so they don't block reading the ready tasks behind them.
 			if delayed++; delayed <= tr.maxDelayedInMemory() {
 				return true
 			}

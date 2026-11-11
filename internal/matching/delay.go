@@ -26,9 +26,12 @@ func (tr *fairTaskReader) maxDelayedInMemory() int {
 	return tr.backlogMgr.config.MaxDelayedInMemory
 }
 
-// effectiveLoadedLocked is loadedTasks plus the delayed tasks past maxDelayedInMemory.
+// effectiveLoadedLocked is the count the reader limits: loaded tasks, not counting "held" ones
+// (delayed tasks and loaded tasks of paused fairness keys, see pause_hold.go) up to
+// maxDelayedInMemory.
 func (tr *fairTaskReader) effectiveLoadedLocked() int {
-	return tr.loadedTasks + max(0, tr.delayedTasks-tr.maxDelayedInMemory())
+	paused := tr.pausedLoadedLocked(tr.pausedKeys())
+	return tr.loadedTasks - paused + max(0, tr.delayedTasks+paused-tr.maxDelayedInMemory())
 }
 
 // armDelayLocked starts the timer that makes a delayed task matchable at visibleAt. Arming and
