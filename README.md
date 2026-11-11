@@ -321,15 +321,24 @@ cfg.RetryBackoff = taskqueue.RetryBackoff{Initial: time.Second, Max: 5 * time.Mi
   needs a store implementing `store.DeadLetterStore` (memstore, sqlite, postgres); otherwise the
   delay applies in memory only. A failed write is counted in `delay_persist_failures`.
 - A sync-matched task that is nacked or expires with a delay is spooled with `VisibleAt`.
-- The delay is skipped when the Nack or expiry dead-letters the task (`MaxAttempts`).
+- The delay is skipped when the Nack or expiry dead-letters a backlog task (`MaxAttempts`). A
+  sync-matched task on its last attempt has no row to dead-letter yet: it is spooled with the
+  delay and dead-lettered when it is next matched, after `VisibleAt`.
 - A delayed task keeps its place in fairness order (its pass): when it becomes visible it can
-  be delivered ahead of newer tasks of the same key.
+  be delivered ahead of newer tasks of the same key. It also holds the ack level, so acked rows
+  behind it are not garbage-collected until it is delivered or deleted.
 - Delayed tasks are held in memory by the queue's reader, each on a timer (the injected clock).
   Up to `Config.MaxDelayedInMemory` (default 10000) per subqueue do not count toward
   `GetTasksBatchSize`, so they do not hold back ready tasks behind them. Past that they count as
   loaded, and a longer run of delayed tasks delays the ready tasks behind it until the delayed
   ones become visible. Use a separate queue for large numbers of scheduled tasks.
-- Metric: `tasks_delayed` (per queue).
+- Metric: `tasks_delayed` (per queue) counts redeliveries held back by a Nack delay or
+  `RetryBackoff`, not tasks added with a future `VisibleAt`. `DescribeQueue`'s `LoadedTasks`
+  excludes delayed tasks; `ApproximateBacklogCount` includes them.
+- Stopping the engine or unloading a queue stops its delay timers; the delays are in the rows
+  and are re-armed on the next load (in-memory-only delays, without a `DeadLetterStore`, are lost).
+- `Config.MaxDelayedInMemory` must be non-negative (0 = the default); `RetryBackoff.Multiplier`
+  must be finite.
 
 ## Retention
 

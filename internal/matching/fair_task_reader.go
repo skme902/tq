@@ -47,9 +47,11 @@ type (
 		loadedTasks      int                            // == number of loaded (unacked, unleased) entries in outstandingTasks
 		leasedTasks      int                            // == number of leased entries in outstandingTasks
 		delayedTasks     int                            // == number of delayed entries in outstandingTasks (library addition)
-		readLevel        fairLevel                      // == highest level in outstandingTasks, or if empty, the level we should read next
-		ackLevel         fairLevel                      // inclusive: task exactly at ackLevel _has_ been acked
-		atEnd            bool                           // whether we believe outstandingTasks represents the entire queue right now
+		// delayStopped is set when the queue stops: delay timers are stopped and no new one is armed.
+		delayStopped bool
+		readLevel    fairLevel // == highest level in outstandingTasks, or if empty, the level we should read next
+		ackLevel     fairLevel // inclusive: task exactly at ackLevel _has_ been acked
+		atEnd        bool      // whether we believe outstandingTasks represents the entire queue right now
 
 		// Small cache of acked task levels that were evicted from outstandingTasks. When tasks
 		// are evicted from memory, we lose track of which ones were already acked. This cache

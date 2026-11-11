@@ -33,6 +33,9 @@ func (tr *fairTaskReader) effectiveLoadedLocked() int {
 
 // armDelayLocked starts the timer that makes a delayed task matchable at visibleAt.
 func (tr *fairTaskReader) armDelayLocked(task *internalTask, visibleAt time.Time) {
+	if tr.delayStopped {
+		return // the queue is stopping: the row keeps VisibleAt for the next load
+	}
 	d := max(visibleAt.Sub(tr.backlogMgr.timeSource.Now()), 0)
 	// Not under the timer callback: the matcher reads the clock, and a fake clock runs
 	// callbacks with its lock held.
@@ -64,6 +67,23 @@ func (tr *fairTaskReader) undelayLocked(task *internalTask) {
 		task.delayTimer.Stop()
 		task.delayTimer = nil
 	}
+}
+
+// stopDelayTimers stops every delayed task's timer when the queue unloads or stops, so neither
+// the timers nor the reader, partition and engine their callbacks hold outlive the queue (a
+// delay can be hours, or effectively forever with an uncapped RetryBackoff). It runs before
+// tqCtx is cancelled, so it also blocks arming new timers.
+func (tr *fairTaskReader) stopDelayTimers() {
+	tr.lock.Lock()
+	defer tr.lock.Unlock()
+	tr.delayStopped = true
+	tr.outstandingTasks.Scan(func(o outstandingTask) bool {
+		if o.task != nil && o.task.delayTimer != nil {
+			o.task.delayTimer.Stop()
+			o.task.delayTimer = nil
+		}
+		return true
+	})
 }
 
 // delayFired makes a delayed task matchable, unless it left the delayed state meanwhile.

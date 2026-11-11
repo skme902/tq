@@ -186,7 +186,8 @@ Original analysis (superseded by the status above):
 - The retry policy is engine-wide (`Config.RetryBackoff`), not yet per queue (it can move to `QueueConfig` with 6).
 - The Nack rewrite reuses the fenced `UpdateTask` from 1; with a store without it the delay is in memory only.
 
-Original analysis (superseded by the status above):
+Original analysis (superseded by the status above and README §Delays and retry backoff; `WithDelay`, a per-queue
+policy and a timer wheel were not built):
 
 
 - **Today.**

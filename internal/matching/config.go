@@ -6,6 +6,7 @@ package matching
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/skme902/tq/internal/counter"
@@ -218,8 +219,11 @@ func (c Config) validate() error {
 	if c.GetTasksBatchSize < 1 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasksBatchSize must be positive, got %d", c.GetTasksBatchSize)}
 	}
-	if b := c.RetryBackoff; b.Initial < 0 || b.Max < 0 || (b.Multiplier != 0 && b.Multiplier < 1) {
+	if b := c.RetryBackoff; b.Initial < 0 || b.Max < 0 || math.IsNaN(b.Multiplier) || math.IsInf(b.Multiplier, 0) || (b.Multiplier != 0 && b.Multiplier < 1) {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("RetryBackoff needs non-negative durations and Multiplier 0 or >= 1, got %+v", b)}
+	}
+	if c.MaxDelayedInMemory < 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxDelayedInMemory must be non-negative (0 = default 10000), got %d", c.MaxDelayedInMemory)}
 	}
 	if c.MaxTaskAge < 0 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", c.MaxTaskAge)}
