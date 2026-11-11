@@ -118,6 +118,7 @@ The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so b
 (README §Graceful shutdown). Refinement: there is no separate `Drain` that leaves the engine running; Shutdown
 drains then stops. Readiness is wired in with item 7.
 
+Original analysis (superseded by the status above):
 
 - **Today.**
   - `Engine.Stop` ends every lease immediately with `ErrEngineStopped`. It re-spools sync-matched tasks and leaves

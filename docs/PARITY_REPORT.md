@@ -292,9 +292,13 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
       the SQL stores order by (range_hash, task_queue_id) like upstream `ListTaskQueue`.
 
 25. **Graceful shutdown (feat/ops-drain).** `Engine.Shutdown(ctx)` is library-only: upstream matching stops via fx
-    lifecycle and relies on history to retry anything in flight. During a drain, waiting and new polls return
-    `ErrEngineDraining` (counted as `poll_timeouts` by the matcher, since they end through the poll context), so
-    `AddTask` spools instead of sync-matching. Matching, fairness, the limiter and fencing are unchanged.
+    lifecycle and relies on history to retry anything in flight. During a drain, polls that are already waiting
+    end through the poll context and return `ErrEngineDraining`; the matcher counts those as `poll_timeouts`.
+    Polls refused by the fast-path draining check return before the matcher and are not counted as
+    `poll_timeouts`. With no waiting poller, `AddTask` spools instead of sync-matching. Shutdown also waits for
+    in-flight polls (calls that already passed the fast path, including a match still inside `Starter`) and
+    refuses further leases at the drain decision, so no sync match commits after that decision. Matching,
+    fairness, the limiter and fencing are unchanged.
 
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate

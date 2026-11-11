@@ -5,6 +5,9 @@
 // (stride scheduling per fairness key within each priority level) and upstream's rate
 // limiting (whole-queue and per-fairness-key next-ready-time limiters).
 //
+// Stop ends an engine immediately. Shutdown(ctx) drains outstanding leases and in-flight
+// polls, then stops.
+//
 // See README.md for usage and docs/UPSTREAM_MAP.md for the upstream mapping.
 //
 // The package name is taskqueue while the module path ends in tq; import it as
@@ -18,7 +21,7 @@ import (
 )
 
 type (
-	// Engine owns the loaded queues. Create with New, release with Stop.
+	// Engine owns the loaded queues. Create with New; release with Stop, or Shutdown(ctx) to drain first.
 	Engine = matching.Engine
 	// Options configures an Engine.
 	Options = matching.Options

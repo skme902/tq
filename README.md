@@ -173,12 +173,20 @@ if err := e.Shutdown(ctx); err != nil {
 - From the moment it is called, `PollTask` returns `ErrEngineDraining`, including polls that were
   already waiting. With no waiting pollers, `AddTask` cannot sync-match, so new tasks go to the
   backlog.
-- `AddTask`, `Ack`, `Nack` and `ExtendLease` keep working. A nacked or expired lease goes back to
-  the backlog as usual.
-- It returns when every lease is settled (nil) or when ctx is done (ctx's error), then calls `Stop`.
-  After `Stop` it returns nil at once. `Engine.Draining()` reports whether a drain has started.
+- `AddTask`, `Ack`, `Nack` and `ExtendLease` keep working. A nacked or expired backlog lease goes
+  back to the backlog. A nacked or expired sync-matched lease is spooled to the backlog.
+- It waits until every outstanding lease is settled and every poll that already passed the
+  draining check has returned, then calls `Stop` and returns nil. If `ctx` ends first it returns
+  that error, and `Stop` ends whatever is still outstanding. If `ctx` is done but the drain has
+  finished (no leases left), it returns nil. Concurrent callers share one result: the caller that
+  invokes `Stop` records nil or its own `ctx` error, and every other waiter returns that same
+  error once the engine has stopped. A caller whose own `ctx` ends first is the one that stops.
+  `Shutdown` after a direct `Stop` returns nil. `Engine.Draining()` reports whether a drain has
+  started.
 - Metrics (no queue tags): `engine_draining` (1 while draining, 0 after),
-  `engine_drain_leases_remaining` (leases `Stop` had to end), `engine_drain_duration`.
+  `engine_drain_leases_remaining` (outstanding leases sampled under the lease lock when Shutdown
+  decides; 0 when the drain finishes), `engine_drain_duration`. The lease gauge and the duration
+  are emitted once, by the call that stops the engine.
 
 ## Observability
 
