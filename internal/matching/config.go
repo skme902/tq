@@ -110,6 +110,12 @@ type Config struct {
 	// PollTask returns (one extra write), so the count survives crashes. Needs a store that
 	// implements store.DeadLetterStore; with any other store the limit is ignored.
 	MaxAttempts int32
+
+	// MaxTaskAge, if positive, caps every new task's ExpiryTime at AddTask time + MaxTaskAge
+	// (library addition; QueueConfig.MaxTaskAge overrides it per queue). The cap is applied
+	// by AddTask, so it covers tasks added after it is set; expired tasks are then dropped
+	// like any task past its ExpiryTime. 0, the default, adds no cap.
+	MaxTaskAge time.Duration
 }
 
 // DefaultConfig returns upstream defaults.
@@ -195,6 +201,9 @@ func (c Config) WithDefaults() Config {
 func (c Config) validate() error {
 	if c.GetTasksBatchSize < 1 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasksBatchSize must be positive, got %d", c.GetTasksBatchSize)}
+	}
+	if c.MaxTaskAge < 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", c.MaxTaskAge)}
 	}
 	if c.MaxAttempts < 0 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxAttempts must be non-negative, got %d", c.MaxAttempts)}

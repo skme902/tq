@@ -35,6 +35,7 @@ const (
 	OpCountDeadTasks        = "CountDeadTasks"
 	OpDeleteTask            = "DeleteTask"
 	OpCheckHealth           = "CheckHealth"
+	OpDeleteQueueIfIdle     = "DeleteQueueIfIdle"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -55,6 +56,7 @@ var (
 	_ store.Store           = (*Store)(nil)
 	_ store.QueueLister     = (*Store)(nil)
 	_ store.DeadLetterStore = (*Store)(nil)
+	_ store.QueueSweeper    = (*Store)(nil)
 )
 
 // New returns an empty store.
@@ -172,6 +174,41 @@ func (s *Store) DeleteQueue(ctx context.Context, req *store.DeleteQueueRequest) 
 	}
 	delete(s.queues, req.Key)
 	return nil
+}
+
+// DeleteQueueIfIdle implements store.QueueSweeper.
+func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfIdleRequest) (bool, error) {
+	if err := ctxErr(ctx); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpDeleteQueueIfIdle); err != nil {
+		return false, err
+	}
+	q, ok := s.queues[req.Key]
+	if !ok || q.rangeID != req.RangeID || len(q.dead) > 0 {
+		return false, nil
+	}
+	if !req.IdleBefore.IsZero() && (q.info == nil || !q.info.LastUpdateTime.Before(req.IdleBefore)) {
+		return false, nil
+	}
+	for sq, tree := range q.subqueues {
+		var ack store.Level
+		if q.info != nil && sq < len(q.info.Subqueues) {
+			ack = q.info.Subqueues[sq].FairAckLevel
+		}
+		live := false
+		tree.Ascend(store.TaskInfo{Pass: ack.Pass, ID: ack.ID + 1}, func(store.TaskInfo) bool {
+			live = true
+			return false
+		})
+		if live {
+			return false, nil
+		}
+	}
+	delete(s.queues, req.Key)
+	return true, nil
 }
 
 func (s *Store) CreateTasks(ctx context.Context, req *store.CreateTasksRequest) (*store.CreateTasksResponse, error) {

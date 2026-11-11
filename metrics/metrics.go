@@ -149,6 +149,10 @@ const (
 	// Engine-level (no queue tags), library-only.
 	EngineReady        = "engine_ready"
 	StoreHealthLatency = "store_health_latency"
+	// QueuesSwept counts queues deleted by SweepIdleQueues; DeadTasksExpired counts dead
+	// tasks it deleted for SweepOptions.DeadTaskRetention.
+	QueuesSwept      = "queues_swept"
+	DeadTasksExpired = "dead_tasks_expired"
 	// EngineDraining is 1 while Engine.Shutdown drains and 0 once it stops.
 	EngineDraining = "engine_draining"
 	// EngineDrainLeases is the number of leases still outstanding when a drain ends (0 for a

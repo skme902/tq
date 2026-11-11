@@ -1,6 +1,8 @@
 package sqlcore
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -32,4 +34,13 @@ func TestQueueIDIsUnambiguous(t *testing.T) {
 
 func TestRebind(t *testing.T) {
 	require.Equal(t, "a=$1 AND b IN ($2, $3)", rebind("a=? AND b IN (?, ?)", 0))
+}
+
+func TestNumberedQueriesHaveNoQuestionMarks(t *testing.T) {
+	q := buildQueries(Dialect{NumberedPlaceholders: true, RowRef: "ctid", LockSuffix: " FOR UPDATE"})
+	v := reflect.ValueOf(q)
+	for i := range v.NumField() {
+		require.NotContains(t, v.Field(i).String(), "?", "query %s is not rebound", v.Type().Field(i).Name)
+	}
+	require.True(t, strings.Contains(q.deadExists, "$1"))
 }

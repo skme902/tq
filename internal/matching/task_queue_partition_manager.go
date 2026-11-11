@@ -37,6 +37,8 @@ type taskQueuePartitionManagerImpl struct {
 	// maxAttempts is the effective QueueConfig.MaxAttempts / Config.MaxAttempts (0 =
 	// unlimited), refreshed on load and on every config notification.
 	maxAttempts atomic.Int32
+	// maxTaskAge is the effective QueueConfig.MaxTaskAge / Config.MaxTaskAge (0 = no cap).
+	maxTaskAge atomic.Int64
 }
 
 func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *taskQueueConfig) *taskQueuePartitionManagerImpl {
@@ -135,6 +137,13 @@ func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
 		}
 	}
 	pm.maxAttempts.Store(max(n, 0))
+	age := pm.config.MaxTaskAge
+	if src := pm.engine.configSource; src != nil {
+		if v := src.QueueConfig(pm.partition).MaxTaskAge; v != nil {
+			age = *v
+		}
+	}
+	pm.maxTaskAge.Store(int64(max(age, 0)))
 }
 
 // GetRateLimitManager returns the partition's rate limit manager.

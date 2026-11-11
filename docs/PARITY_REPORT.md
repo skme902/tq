@@ -317,6 +317,11 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     `Shutdown` + `/readyz` mirror). The only engine change is that `signalIfFatal` records the last store error per
     queue; it still decides fatality as upstream does.
 
+29. **Retention (feat/ops-retention).** `SweepIdleQueues` and `store.QueueSweeper.DeleteQueueIfIdle` are new (upstream
+    deletes idle task queue rows only through Cassandra/SQL TTL and its scavenger). `Config.MaxTaskAge` /
+    `QueueConfig.MaxTaskAge` (default 0, off) caps a task's `ExpiryTime` in `AddTask`; the reader's expiry handling is
+    unchanged. sqlcore now has a test that every Postgres query is rebound (`TestNumberedQueriesHaveNoQuestionMarks`).
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

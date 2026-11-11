@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"sync"
+	"time"
 
 	"github.com/skme902/tq/store"
 )
@@ -160,6 +161,16 @@ func (s *MemoryQueueConfigSource) SetMaxAttempts(queue store.QueueKey, n *int32)
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxAttempts must be non-negative, got %d", *n)}
 	}
 	s.update(queue, func(cfg *QueueConfig) { cfg.MaxAttempts = clonePtr(n) })
+	return nil
+}
+
+// SetMaxTaskAge sets (or with nil, unsets) the queue's cap on new tasks' age
+// (QueueConfig.MaxTaskAge). Negative values are rejected.
+func (s *MemoryQueueConfigSource) SetMaxTaskAge(queue store.QueueKey, d *time.Duration) error {
+	if d != nil && *d < 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", *d)}
+	}
+	s.update(queue, func(cfg *QueueConfig) { cfg.MaxTaskAge = clonePtr(d) })
 	return nil
 }
 

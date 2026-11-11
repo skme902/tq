@@ -433,6 +433,13 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 			return false, err
 		}
 		t := task
+		if age := time.Duration(pm.maxTaskAge.Load()); age > 0 {
+			// Library addition (Config.MaxTaskAge): cap the expiry at max age after this
+			// AddTask (not CreateTime, so a redriven task gets a fresh window).
+			if limit := start.Add(age); t.ExpiryTime.IsZero() || limit.Before(t.ExpiryTime) {
+				t.ExpiryTime = limit
+			}
+		}
 		matched, err := pm.AddTask(ctx, &t, nil)
 		if matched && err == nil {
 			// upstream handler.AddActivityTask: the whole call, for sync matches only

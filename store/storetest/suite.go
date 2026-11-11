@@ -68,6 +68,10 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"DeadLetter_DeleteQueue", testDeadLetterDeleteQueue},
 		{"DeadLetter_InvalidArgs", testDeadLetterInvalidArgs},
 		{"Task_AttemptsRoundTrip", testTaskAttemptsRoundTrip},
+		{"Sweep_EmptyQueue", testSweepEmptyQueue},
+		{"Sweep_LiveTasks", testSweepLiveTasks},
+		{"Sweep_UntrackedSubqueue", testSweepUntrackedSubqueue},
+		{"Sweep_DeadTasks", testSweepDeadTasks},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
