@@ -55,6 +55,16 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"ListQueues_Paged", testListQueuesPaged},
 		{"ListQueues_ReadOnly", testListQueuesReadOnly},
 		{"ListQueues_InvalidArgs", testListQueuesInvalidArgs},
+		{"UpdateTask_InPlace", testUpdateTaskInPlace},
+		{"UpdateTask_Fenced", testUpdateTaskFenced},
+		{"DeadLetter_RoundTrip", testDeadLetterRoundTrip},
+		{"DeadLetter_KeepsBacklog", testDeadLetterKeepsBacklog},
+		{"DeadLetter_Fenced", testDeadLetterFenced},
+		{"DeadLetter_Paged", testDeadLetterPaged},
+		{"DeadLetter_Delete", testDeadLetterDelete},
+		{"DeadLetter_DeleteQueue", testDeadLetterDeleteQueue},
+		{"DeadLetter_InvalidArgs", testDeadLetterInvalidArgs},
+		{"Task_AttemptsRoundTrip", testTaskAttemptsRoundTrip},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

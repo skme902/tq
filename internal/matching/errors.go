@@ -40,6 +40,9 @@ var (
 	errLeaseExpired        = Retryable(errors.New("delivery lease expired"))
 	errNacked              = Retryable(errors.New("delivery nacked"))
 	errLeaseRefused        = Retryable(errors.New("delivery refused: engine stopped"))
+	// errAttemptFenced: the attempt write lost the rangeID fence. The delivery must not be
+	// handed to the poller; the backlog row is unchanged.
+	errAttemptFenced = errors.New("attempt record lost ownership")
 )
 
 // isTransientMatchError replaces common.IsServiceClientTransientError ||

@@ -26,7 +26,8 @@ import (
 type Delivery struct {
 	Queue store.QueueKey
 	// TaskID is the persisted task ID, or 0 for a sync-matched task.
-	TaskID      int64
+	TaskID int64
+	// Task is the task; Task.Attempts counts deliveries including this one (1 on the first).
 	Task        store.Task
 	SyncMatched bool
 
@@ -51,11 +52,19 @@ type Delivery struct {
 // sync-matched task is finished with that error, so the partition manager spools it (or AddTask
 // reports the error) instead of handing out an in-memory-only task that Stop would never
 // re-spool (REVIEW M1); a refused backlog task is returned to its reader.
+//
+// A backlog task with a max-attempts limit persists its new count before the lease timer is
+// armed, so a slow attempt write cannot lose the lease out from under the write. The lease
+// deadline is stamped in arm, when that timer starts. A fencing failure (errAttemptFenced)
+// settles the lease without acking and does not return a delivery. If Stop or a shutdown
+// give-up ends the lease during the write, the count is rolled back (best-effort; a failed
+// rollback leaves it one high, at-least-once) and PollTask returns ErrEngineStopped.
 func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) (*Delivery, error) {
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
 	}
 	now := e.timeSource.Now()
+	task.event.Data.Attempts++
 	d := &Delivery{
 		Queue:       queue,
 		Task:        task.event.Data,
@@ -64,7 +73,6 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		pqm:         pqm,
 		task:        task,
 		deliveredAt: now,
-		deadline:    now.Add(lease),
 		released:    make(chan struct{}),
 	}
 	if !d.SyncMatched {
@@ -74,10 +82,13 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		}
 	}
 
-	// Register the lease and arm its timer atomically with respect to Stop's snapshot.
+	// Register the lease atomically with respect to Stop's snapshot. The timer stays unarmed
+	// until a limited backlog task's attempt count is durable: Stop can see the lease with a
+	// nil timer, and stopTimer tolerates that.
 	e.leasesLock.Lock()
 	if e.leasesClosed {
 		e.leasesLock.Unlock()
+		task.event.Data.Attempts-- // not delivered
 		if d.SyncMatched {
 			task.finish(taskFinishResult{err: ErrEngineStopped})
 		} else {
@@ -86,15 +97,49 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		return nil, ErrEngineStopped
 	}
 	pqm.outstandingLeases.Add(1)
-	d.arm(lease)
 	e.leases[d] = struct{}{}
+	recordFirst := !d.SyncMatched && pqm.maxAttempts() > 0
+	if !recordFirst {
+		d.arm(lease)
+	}
 	e.leasesLock.Unlock()
+	if recordFirst {
+		err := e.recordAttempt(pqm, task)
+		if err != nil && store.IsConditionFailed(err) {
+			// The backlog row is unchanged and the queue is unloaded. Do not ack, and do not
+			// hand the poller a delivery. If Stop already settled this lease, it owns release.
+			if d.settle() {
+				d.release()
+			}
+			return nil, errAttemptFenced
+		}
+		e.leasesLock.Lock()
+		if e.leasesClosed || d.isSettled() {
+			e.leasesLock.Unlock()
+			// The attempt write committed, but Stop or a shutdown give-up already ended
+			// this lease, so no Delivery is returned. Roll the durable count back with
+			// the same fenced write. Release/settle stays with whoever ended the lease.
+			// A failed rollback leaves the stored count one high (at-least-once).
+			if err == nil {
+				task.event.Data.Attempts--
+				e.rollbackAttemptCount(pqm, task)
+			}
+			return nil, ErrEngineStopped
+		}
+		d.arm(lease)
+		e.leasesLock.Unlock()
+	}
 	if d.SyncMatched {
 		// The task is "started": let the AddTask caller return (upstream: finish after
 		// RecordTaskStarted succeeds).
 		task.finish(taskFinishResult{consumedToken: true})
 	}
 	emitDispatchLatency(pqm.metricsHandler, task, now)
+	// Count a dispatch only once a Delivery is returned. A task dead-lettered as
+	// attempts_exhausted, or refused after a lost fence or Stop, is not one. Polls are
+	// never forwarded, so this matches the old forwardedFrom == "" guard for every
+	// delivery this engine hands out.
+	pqm.incTaskTracker(pqm.tasksDispatched, priorityKey(task.getPriority().PriorityKey), 1)
 	return d, nil
 }
 
@@ -123,6 +168,10 @@ func emitDispatchLatency(h metrics.Handler, task *internalTask, now time.Time) {
 
 func (d *Delivery) arm(lease time.Duration) {
 	d.mu.Lock()
+	// Stamp the deadline when the timer starts. newDelivery may block in the attempt
+	// write between constructing the delivery and calling arm; the expire callback
+	// trusts this deadline, so it has to match the timer.
+	d.deadline = d.engine.timeSource.Now().Add(lease)
 	d.timer = d.engine.timeSource.AfterFunc(lease, d.expire)
 	d.mu.Unlock()
 }
@@ -155,10 +204,19 @@ func (d *Delivery) lost() error {
 	return d.lostErr
 }
 
+func (d *Delivery) isSettled() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.settled
+}
+
 func (d *Delivery) stopTimer() {
 	d.mu.Lock()
-	d.timer.Stop()
+	t := d.timer
 	d.mu.Unlock()
+	if t != nil {
+		t.Stop()
+	}
 }
 
 func (d *Delivery) release() {
@@ -191,14 +249,36 @@ func (d *Delivery) Ack() error {
 	return nil
 }
 
-// Nack releases the task for immediate redelivery. Redeliver (backlog back to the matcher,
-// sync-matched spooled) runs before release so Shutdown cannot Stop in between.
-func (d *Delivery) Nack() error {
+// NackOption configures Nack.
+type NackOption func(*nackOptions)
+
+type nackOptions struct {
+	reason string
+}
+
+// NackReason records why the consumer gave up on the task. It is kept only if this Nack
+// dead-letters the task (DeadTask.Reason "nack: <reason>").
+func NackReason(reason string) NackOption {
+	return func(o *nackOptions) { o.reason = reason }
+}
+
+// Nack releases the task for immediate redelivery, or, if this was its last attempt
+// (QueueConfig.MaxAttempts), dead-letters it. Redeliver (backlog back to the matcher or to the
+// dead-letter table, sync-matched spooled) runs before release so Shutdown cannot Stop in
+// between.
+func (d *Delivery) Nack(opts ...NackOption) error {
+	var o nackOptions
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&o)
+	}
 	if !d.settle() {
 		return d.lost()
 	}
 	d.stopTimer()
-	d.redeliver(errNacked)
+	d.redeliver(errNacked, DeadReasonNack, o.reason)
 	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
 	d.release()
 	return nil
@@ -235,15 +315,24 @@ func (d *Delivery) expire() {
 	// Not under the timer callback. Redeliver before release so a waiting Shutdown cannot
 	// Stop until the task is back on the backlog (or spooled, for a sync match).
 	go func() {
-		d.redeliver(errLeaseExpired)
+		d.redeliver(errLeaseExpired, DeadReasonLeaseExpired, "")
 		d.release()
 	}()
 }
 
-func (d *Delivery) redeliver(err error) {
+// redeliver returns a failed delivery's task to the queue, or dead-letters a backlog task that
+// used its last attempt. A sync-matched task has no backlog row to move: it is spooled with its
+// attempt count and dead-lettered when next matched (reason attempts_exhausted), so a Nack
+// reason from this delivery is not kept.
+func (d *Delivery) redeliver(err error, reason, detail string) {
 	if d.SyncMatched {
 		d.engine.respoolSyncTaskLocked(d, false)
 		return
+	}
+	if max := d.pqm.maxAttempts(); max > 0 && d.Task.Attempts >= max {
+		if d.engine.deadLetter(d.pqm, d.task, reason, detail, true) {
+			return
+		}
 	}
 	d.task.finish(taskFinishResult{err: err, consumedToken: true})
 }

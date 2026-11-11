@@ -11,6 +11,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/skme902/tq/metrics"
@@ -32,6 +33,10 @@ type taskQueuePartitionManagerImpl struct {
 	// metricsCtx ends the periodic backlog-metrics emission (upstream initCtx).
 	metricsCtx    context.Context
 	metricsCancel context.CancelFunc
+
+	// maxAttempts is the effective QueueConfig.MaxAttempts / Config.MaxAttempts (0 =
+	// unlimited), refreshed on load and on every config notification.
+	maxAttempts atomic.Int32
 }
 
 func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *taskQueueConfig) *taskQueuePartitionManagerImpl {
@@ -47,10 +52,13 @@ func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *t
 	pm.metricsCtx, pm.metricsCancel = context.WithCancel(context.Background())
 	pm.rateLimitManager = newRateLimitManager(e.configSource, partition, config, e.timeSource)
 	pm.defaultQueue = newPhysicalTaskQueueManager(pm, partition)
+	// The engine default is the limit a negative QueueConfig override must not replace.
+	pm.maxAttempts.Store(config.MaxAttempts)
 	return pm
 }
 
 func (pm *taskQueuePartitionManagerImpl) Start() {
+	pm.refreshQueueConfig()
 	pm.rateLimitManager.Start(pm.userDataChanged)
 	// initial user data load (upstream: userDataManager.Start -> onUserDataChanged)
 	pm.rateLimitManager.UserDataChanged()
@@ -113,9 +121,28 @@ func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog() {
 
 // userDataChanged is called on QueueConfigWatcher notifications.
 func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
+	pm.refreshQueueConfig()
 	// Update rateLimits if any change is userData.
 	pm.rateLimitManager.UserDataChanged()
 	pm.defaultQueue.UserDataChanged()
+}
+
+// refreshQueueConfig caches the library-only QueueConfig fields (the rate limit manager caches
+// the upstream ones). A negative MaxAttempts override is ignored: 0 already means unlimited, so
+// clamping a negative value would drop the queue's limit.
+func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
+	n := pm.config.MaxAttempts
+	if src := pm.engine.configSource; src != nil {
+		if v := src.QueueConfig(pm.partition).MaxAttempts; v != nil {
+			if *v < 0 {
+				pm.logger.Warn("ignoring negative QueueConfig.MaxAttempts; keeping the previous limit",
+					"max_attempts", *v, "limit", pm.maxAttempts.Load())
+				return
+			}
+			n = *v
+		}
+	}
+	pm.maxAttempts.Store(n)
 }
 
 // GetRateLimitManager returns the partition's rate limit manager.
@@ -165,6 +192,18 @@ func (pm *taskQueuePartitionManagerImpl) AddTask(
 		pm.metricsHandler.Counter(metrics.TasksSpooled, 1)
 	}
 	return false, err
+}
+
+// spoolBacklog persists task without a sync match. Redrive uses it so a waiting poller cannot
+// hold the only copy. Public AddTask is unchanged.
+func (pm *taskQueuePartitionManagerImpl) spoolBacklog(taskInfo *store.Task) error {
+	pm.metricsHandler.Counter(metrics.TasksAdded, 1)
+	pm.defaultQueue.incTaskTracker(pm.defaultQueue.tasksAdded, priorityKey(taskInfo.Priority.PriorityKey), 1)
+	err := pm.defaultQueue.SpoolTask(taskInfo) // also markAlive
+	if err == nil {
+		pm.metricsHandler.Counter(metrics.TasksSpooled, 1)
+	}
+	return err
 }
 
 func (pm *taskQueuePartitionManagerImpl) PollTask(ctx context.Context, pollMetadata *pollMetadata) (*internalTask, *physicalTaskQueueManagerImpl, error) {

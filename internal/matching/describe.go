@@ -78,6 +78,10 @@ type QueueDescription struct {
 	MatcherTasks int
 	// OutstandingLeases is the number of deliveries not yet acked, nacked or expired.
 	OutstandingLeases int64
+
+	// DeadTasks is the number of dead-lettered tasks (read from the store; 0 if the store
+	// does not implement store.DeadLetterStore). Library addition.
+	DeadTasks int64
 }
 
 // DescribeQueue returns a snapshot of a queue. A queue not loaded on this Engine is described
@@ -91,10 +95,21 @@ func (e *Engine) DescribeQueue(ctx context.Context, queue store.QueueKey) (*Queu
 	if stopped {
 		return nil, ErrEngineStopped
 	}
+	var (
+		d   *QueueDescription
+		err error
+	)
 	if ok && pm.defaultQueue.backlogMgr.isInitialized() {
-		return e.describeLoaded(pm), nil
+		d = e.describeLoaded(pm)
+	} else if d, err = e.describeUnloaded(ctx, queue); err != nil {
+		return nil, err
 	}
-	return e.describeUnloaded(ctx, queue)
+	if e.deadLetters != nil {
+		if d.DeadTasks, err = e.deadLetters.CountDeadTasks(ctx, queue); err != nil {
+			return nil, err
+		}
+	}
+	return d, nil
 }
 
 func (e *Engine) describeLoaded(pm *taskQueuePartitionManagerImpl) *QueueDescription {

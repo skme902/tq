@@ -238,9 +238,8 @@ func (c *physicalTaskQueueManagerImpl) PollTask(
 			task.finish(taskFinishResult{dropReason: dropReasonExpiredMemory})
 			continue
 		}
-		if pollMetadata.forwardedFrom == "" { // track the task on the child, not where a poll was forwarded to
-			c.incTaskTracker(c.tasksDispatched, priorityKey(task.getPriority().PriorityKey), 1)
-		}
+		// Dispatch is counted in newDelivery, and only when a Delivery is returned, so a
+		// task Engine.PollTask dead-letters as attempts_exhausted is not a dispatch.
 		return task, nil
 	}
 }

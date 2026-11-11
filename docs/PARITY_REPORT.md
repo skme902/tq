@@ -303,6 +303,27 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     leases (Ack/Nack/expiry whose write is in flight) before unloading. Matching,
     fairness, the limiter and fencing are unchanged.
 
+26. **Max attempts and dead letters (feat/ops-dlq).** Library-only: upstream matching acks a task once history
+    starts it, and history owns retries. `store.Task.Attempts` (in the task blob, no column) counts a delivery
+    once `PollTask` has returned a `Delivery`. A `PollTask` that returns an error does not count. `Stop` during
+    the attempt write rolls that write back, best effort. Only a committed attempt write counts across restarts:
+    a non-fence write error still delivers the task, with the new count only in memory. `Starter.Start` runs
+    before the attempt write and is at-least-once if that write is fenced (`PollTask` then returns `ErrNoTasks`
+    and no delivery). With `MaxAttempts > 0` each backlog delivery does one extra fenced `UpdateTask` on the poll
+    path, before the lease timer is armed and before `PollTask` returns. A lost fence on that write is reported
+    as `ErrNoTasks` and does not deliver; the backlog row is unchanged. A last failed attempt inserts a row in
+    `tq_dead_tasks` and finishes the task like an ack (dead-lettering is an ack plus a dead insert). Ack-level GC
+    deletes the backlog row, the same as any other ack. A crash after the insert and before that ack level is
+    persisted leaves the task both live and dead (at-least-once duplicate). A sync-matched last attempt is spooled
+    and later dead-lettered as `attempts_exhausted`. A redrive during the window before that GC removes the
+    original backlog row can produce an at-least-once duplicate after a reload. `RedriveDeadTasks` is serialized
+    only within one engine process; redrives from several processes on one store are at-least-once. With
+    `MaxAttempts == 0` there are no extra writes and upstream's redelivery path is unchanged: fair order, the
+    limiter, sync match vs backlog and fencing match upstream. With `MaxAttempts > 0` the differences are an
+    extra fenced write on the poll path, a sync-matched last attempt spooled and later dead-lettered as
+    `attempts_exhausted`, and fence loss on the attempt write reported as `ErrNoTasks`. The ack level still
+    advances past a dead-lettered task as usual.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

@@ -153,6 +153,16 @@ func (s *MemoryQueueConfigSource) SetAdminQueueDispatchRate(queue store.QueueKey
 	s.update(queue, func(cfg *QueueConfig) { cfg.AdminQueueDispatchRate = clonePtr(rps) })
 }
 
+// SetMaxAttempts sets (or with nil, unsets) the queue's max deliveries before a task is
+// dead-lettered (QueueConfig.MaxAttempts). Negative values are rejected.
+func (s *MemoryQueueConfigSource) SetMaxAttempts(queue store.QueueKey, n *int32) error {
+	if n != nil && *n < 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxAttempts must be non-negative, got %d", *n)}
+	}
+	s.update(queue, func(cfg *QueueConfig) { cfg.MaxAttempts = clonePtr(n) })
+	return nil
+}
+
 // SetAdminNamespaceDispatchRate overrides Config.AdminNamespaceToPartitionDispatchRate for
 // every queue whose QueueKey.Namespace is ns (nil restores the Config value). It is applied
 // per partition, like upstream; it is not a shared namespace budget.

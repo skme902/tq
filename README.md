@@ -203,6 +203,73 @@ if err := e.Shutdown(ctx); err != nil {
   lease lock when Shutdown decides; 0 when the drain finishes), `engine_drain_duration`. The lease gauge and the duration
   are emitted once, by the call that stops the engine.
 
+## Dead letters
+
+By default a task that is nacked or whose lease expires is redelivered forever. Set a limit to
+move poison tasks aside instead:
+
+```go
+cfg := taskqueue.Config{MaxAttempts: 5}           // engine default; 0 = unlimited (the default)
+three := int32(3)
+src.SetMaxAttempts(queue, &three)                  // per queue (MemoryQueueConfigSource)
+
+d, _ := e.PollTask(ctx, queue, taskqueue.PollOptions{})
+log.Print(d.Task.Attempts)                         // 1 on the first delivery
+d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was attempt 5
+```
+
+- `Task.Attempts` counts once `PollTask` has returned a `Delivery`. A `PollTask` that returns an
+  error does not count. `Stop` during the attempt write rolls that write back, best effort. A
+  delivery that later ends without `Ack` (Nack, lease expiry, `Stop`, a crash) used one, because
+  `PollTask` already returned it. A `Starter` error returns no delivery, so it does not count.
+  `AddTask` ignores the field.
+- `Starter.Start` runs before the attempt write. If that write is fenced, `PollTask` returns
+  `ErrNoTasks` and no delivery, and `Start` has already run (at-least-once).
+- With a limit, each backlog delivery writes its new count to the store before the lease timer is
+  armed and before `PollTask` returns (one extra fenced write per delivery), so a task that crashes
+  its consumer is counted. Only a committed attempt write counts across restarts. A lost rangeID
+  fence on that write unloads the queue and `PollTask` returns `ErrNoTasks` with no delivery; the
+  backlog row is unchanged. Any other attempt-write failure still delivers the task, with the new
+  count only in memory.
+- A Nack or expiry on the last attempt inserts the task into the dead-letter set and finishes it
+  like an ack. The backlog row is removed later by ack-level GC, the same as an acked task. A crash
+  after the insert and before that ack level is persisted leaves the task both live and dead
+  (at-least-once). A task matched with no attempts left (read back after a crash, or the limit
+  was lowered) is dead-lettered instead of delivered. A sync-matched task has no row to move: it
+  is spooled with its count and dead-lettered when next matched (`attempts_exhausted`).
+- If the dead-letter write fails the task is redelivered, never dropped
+  (`dead_letter_failures`).
+- `DeadTask.Reason` is `nack` (or `nack: <NackReason>`), `lease_expired` or
+  `attempts_exhausted`. A sync-matched last attempt is spooled and later dead-lettered as
+  `attempts_exhausted`, so the Nack reason from that attempt is not kept.
+- A negative `QueueConfig.MaxAttempts` is ignored and the previous limit is kept (the engine
+  default on the first load). `0` is still unlimited. `nil` means the engine default.
+- Admin calls. `ListDeadTasks`, `DeleteDeadTasks`, `PurgeDeadTasks(queue, deadBefore)` (zero time =
+  all) and `DescribeQueue().DeadTasks` read or write the store only: they do not load the queue,
+  take it over, or bump its rangeID. `RedriveDeadTasks(queue, RedriveOptions{TaskIDs, Max})`
+  writes each task to the durable backlog (new ID, `Attempts` 0, original payload, priority and
+  create time) and never sync-matches, then deletes the dead row only after that write has
+  committed. It loads the queue on the calling engine, taking it over from another owner like any
+  `AddTask`. The returned count is the number of dead rows actually deleted; a delete error is
+  returned with the rows already deleted. The call snapshots the highest dead task id first, so a
+  task that dies again during the redrive is left for a later call. It is at-least-once: a crash
+  after the backlog write and before the delete can leave the task both live and dead. A redrive
+  during the window before ack-level GC removes the original backlog row can produce an
+  at-least-once duplicate after a reload: the original row and the redriven task are both live.
+  `RedriveDeadTasks` is serialized only within one engine process. Redrives from several processes
+  on one store are at-least-once. `Max` < 0 is an error; `0` means no cap.
+- Versus upstream, `MaxAttempts == 0` (the default) adds no writes and keeps the redelivery path:
+  fair order, the limiter, sync match versus backlog, and fencing match upstream. With
+  `MaxAttempts > 0` the poll path does one extra fenced write per backlog delivery, a sync-matched
+  last attempt is spooled and later dead-lettered as `attempts_exhausted`, and a lost fence on the
+  attempt write is reported as `ErrNoTasks`.
+- Needs a store that implements `store.DeadLetterStore` (memstore, sqlite and postgres do;
+  migration `0002_dead_tasks`). With another store the limit is ignored (logged at start) and the
+  admin calls fail with `*store.InvalidArgumentError`.
+- Metrics, queue-tagged: `tasks_dead_lettered{reason}`, `dead_letter_failures`,
+  `tasks_redriven`, `task_attempt_record_failures`. There is no dead-letter gauge: poll
+  `DescribeQueue().DeadTasks`, which is a `COUNT` query.
+
 ## Observability
 
 ### Metrics

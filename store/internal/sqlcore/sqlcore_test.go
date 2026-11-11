@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/skme902/tq/internal/testdb"
 	"github.com/skme902/tq/store"
+	"github.com/skme902/tq/store/internal/sqlcore"
 	"github.com/skme902/tq/store/postgres"
 	"github.com/skme902/tq/store/sqlite"
 )
@@ -164,7 +166,7 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 		defer st.Close()
 		var n int
 		require.NoError(t, st.ReadDB().QueryRowContext(ctx, "SELECT count(*) FROM tq_schema_version").Scan(&n))
-		require.Equal(t, 1, n)
+		require.Equal(t, numMigrations(t, sqlite.Migrations()), n)
 		require.NoError(t, st.Migrate(ctx))
 	})
 	t.Run("postgres", func(t *testing.T) {
@@ -196,7 +198,7 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 		for did := range applied {
 			total += len(did)
 		}
-		require.Equal(t, 1, total, "exactly one migrator applied 0001")
+		require.Equal(t, numMigrations(t, postgres.Migrations()), total, "each migration applied by exactly one migrator")
 	})
 }
 
@@ -224,4 +226,51 @@ func TestCorruptTaskRowIsInvalidArgument(t *testing.T) {
 	require.ErrorAs(t, err, &inv)
 	require.Contains(t, err.Error(), "task 2")
 	require.False(t, store.IsTransient(err))
+}
+
+func numMigrations(t *testing.T, fsys fs.FS) int {
+	ms, err := sqlcore.LoadMigrations(fsys, ".")
+	require.NoError(t, err)
+	return len(ms)
+}
+
+// Upgrading a database created at 0001 keeps its queues and tasks readable and adds the
+// later tables (forward migrations only).
+func TestMigrateUpgradeKeepsData(t *testing.T) {
+	ctx := context.Background()
+	run := func(t *testing.T, db *sql.DB, d sqlcore.Dialect, fsys fs.FS, st store.Store) {
+		ms, err := sqlcore.LoadMigrations(fsys, ".")
+		require.NoError(t, err)
+		require.Greater(t, len(ms), 1)
+		_, err = sqlcore.Migrate(ctx, db, d, ms[:1])
+		require.NoError(t, err)
+		require.NoError(t, st.CreateQueue(ctx, &store.CreateQueueRequest{RangeID: 1, Info: info()}))
+		_, err = st.CreateTasks(ctx, &store.CreateTasksRequest{RangeID: 1, Info: info(), Tasks: tasks(1, 3)})
+		require.NoError(t, err)
+
+		did, err := sqlcore.Migrate(ctx, db, d, ms)
+		require.NoError(t, err)
+		require.Len(t, did, len(ms)-1)
+		got, err := st.GetTasks(ctx, &store.GetTasksRequest{Key: key, InclusiveMin: store.Level{Pass: 1}, PageSize: 10})
+		require.NoError(t, err)
+		require.Len(t, got.Tasks, 3)
+		require.Zero(t, got.Tasks[0].Data.Attempts)
+		dls := st.(store.DeadLetterStore)
+		require.NoError(t, dls.DeadLetterTask(ctx, &store.DeadLetterTaskRequest{Key: key, RangeID: 1, Task: got.Tasks[0], Reason: "r", DeadTime: time.Now()}))
+		n, err := dls.CountDeadTasks(ctx, key)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, n)
+	}
+	t.Run("sqlite", func(t *testing.T) {
+		st, err := sqlite.Open(ctx, t.TempDir()+"/q.db", sqlite.Options{})
+		require.NoError(t, err)
+		defer st.Close()
+		run(t, st.WriteDB(), sqlcore.Dialect{Name: "sqlite"}, sqlite.Migrations(), st)
+	})
+	t.Run("postgres", func(t *testing.T) {
+		st, err := postgres.Open(ctx, testdb.PostgresSchemaDSN(t), postgres.Options{})
+		require.NoError(t, err)
+		defer st.Close()
+		run(t, st.DB(), sqlcore.Dialect{Name: "postgres", NumberedPlaceholders: true}, postgres.Migrations(), st)
+	})
 }
