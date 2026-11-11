@@ -116,6 +116,7 @@ func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekO
 	tqConfig := newTaskQueueConfig(e.config)
 	readers := e.loadedReaders(queue)
 	var out []PeekedTask
+	var deadSet peekDeadSet
 	budget := pageSize * peekMaxScanFactor
 	for sq := tok.Subqueue; sq < len(resp.Info.Subqueues); sq++ {
 		info := resp.Info.Subqueues[sq]
@@ -150,7 +151,7 @@ func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekO
 			// row until ack-level GC; skip it when its ID is in the dead-letter set.
 			var dead map[int64]struct{}
 			if tr == nil {
-				dead, err = e.peekDeadIDs(ctx, queue, res.Tasks)
+				dead, err = e.peekDeadIDs(ctx, queue, &deadSet, res.Tasks)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -202,48 +203,47 @@ func (e *Engine) peekNext(sq int, from fairLevel) ([]byte, error) {
 	return fn(peekToken{Subqueue: sq, Pass: from.pass, ID: from.id})
 }
 
-// peekDeadIDs returns which of tasks' IDs are in the queue's dead-letter set.
-// The store has no ID lookup, so this pages ListDeadTasks (task ID order) and stops once
-// every wanted ID is found or the page passes the highest wanted ID. A store that does
-// not implement store.DeadLetterStore has none.
-func (e *Engine) peekDeadIDs(ctx context.Context, queue store.QueueKey, tasks []store.TaskInfo) (map[int64]struct{}, error) {
+// peekDeadSet is the part of a queue's dead-letter set one PeekTasks call has read. The store
+// has no lookup by ID, so it pages ListDeadTasks (task ID order) and only reads further when a
+// backlog batch has an ID above what it has scanned: one pass over the dead-letter set up to
+// the highest backlog ID seen, per PeekTasks call.
+type peekDeadSet struct {
+	ids     map[int64]struct{}
+	token   []byte
+	scanned int64 // every dead ID <= scanned is in ids
+	done    bool  // the whole set is in ids
+}
+
+// peekDeadIDs returns the dead-letter IDs known after scanning up to the highest ID in tasks.
+// A store that does not implement store.DeadLetterStore has none.
+func (e *Engine) peekDeadIDs(ctx context.Context, queue store.QueueKey, ds *peekDeadSet, tasks []store.TaskInfo) (map[int64]struct{}, error) {
 	if e.deadLetters == nil || len(tasks) == 0 {
 		return nil, nil
 	}
-	want := make(map[int64]struct{}, len(tasks))
 	var maxID int64
 	for _, t := range tasks {
-		want[t.ID] = struct{}{}
-		if t.ID > maxID {
-			maxID = t.ID
-		}
+		maxID = max(maxID, t.ID)
 	}
-	found := make(map[int64]struct{})
-	var token []byte
-	pageSize := max(len(tasks), 128)
-	pageSize = min(pageSize, peekMaxPageSize)
-	for {
+	if ds.ids == nil {
+		ds.ids = make(map[int64]struct{})
+	}
+	for !ds.done && ds.scanned < maxID {
 		resp, err := e.deadLetters.ListDeadTasks(ctx, &store.ListDeadTasksRequest{
-			Key: queue, PageSize: pageSize, PageToken: token,
+			Key: queue, PageSize: peekMaxPageSize, PageToken: ds.token,
 		})
 		if err != nil {
 			return nil, err
 		}
-		past := false
 		for _, d := range resp.Tasks {
-			if d.Task.ID > maxID {
-				past = true
-				break
-			}
-			if _, ok := want[d.Task.ID]; ok {
-				found[d.Task.ID] = struct{}{}
-			}
+			ds.ids[d.Task.ID] = struct{}{}
+			ds.scanned = max(ds.scanned, d.Task.ID)
 		}
-		if past || len(found) == len(want) || len(resp.NextPageToken) == 0 {
-			return found, nil
+		if len(resp.NextPageToken) == 0 {
+			ds.done = true
 		}
-		token = resp.NextPageToken
+		ds.token = resp.NextPageToken
 	}
+	return ds.ids, nil
 }
 
 // loadedReaders returns the readers of a queue loaded on this Engine (nil otherwise), by
@@ -359,14 +359,18 @@ func (e *Engine) DeleteTask(ctx context.Context, queue store.QueueKey, ref TaskR
 }
 
 // PurgeQueue deletes every backlog task of a queue and returns how many rows it deleted. It
-// loads the queue on this Engine (taking it over from another owner, like AddTask). Tasks added
-// while it runs may or may not be purged. A write that already pinned the ack level is kept:
-// its passes were chosen before the purge watermark moved, and a lagging fairness key can land
-// below the previous max. Tasks added after PurgeQueue returns are kept. Leases on purged tasks
-// end (Ack and Nack return ErrLeaseLost). The count is rows removed, so it can include a
-// dead-lettered backlog row that ack-level GC has not deleted yet. Dead-letter copies are
-// kept (DeadTasks is unchanged; PurgeDeadTasks removes them). Sync-matched leases are not in
-// the backlog and are not affected.
+// loads the queue on this Engine (taking it over from another owner, like AddTask). Each
+// priority level is purged up to its highest written task once no write is in flight there,
+// so a task whose AddTask returns while PurgeQueue runs may be purged (as with SQS
+// PurgeQueue); nothing is left below the new ack level. Tasks added after PurgeQueue returns
+// are kept. Leases on purged tasks end (Ack and Nack return ErrLeaseLost). The count is rows
+// removed, so it can include a dead-lettered backlog row that ack-level GC has not deleted
+// yet. Dead-letter copies are kept (DeadTasks is unchanged; PurgeDeadTasks removes them).
+// Sync-matched leases are not in the backlog and are not affected.
+//
+// The purge is per priority level and not atomic across levels: if ctx ends while waiting
+// for a write on one level, the levels already purged are still persisted and their rows
+// deleted, and PurgeQueue returns their row count with the error. Later levels are untouched.
 func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, error) {
 	pqm, err := e.adminQueue(ctx, queue)
 	if err != nil {
@@ -377,27 +381,39 @@ func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, err
 	readers := slices.Clone(bm.subqueues)
 	bm.subqueueLock.Unlock()
 	var leased []*internalTask
-	bounds := make([]fairLevel, len(readers))
-	for i, tr := range readers {
+	var bounds []fairLevel
+	var waitErr error
+	for _, tr := range readers {
 		l, b, err := tr.adminPurge(ctx)
 		if err != nil {
-			e.endLeases(leased)
-			return 0, err
+			waitErr = err
+			break
 		}
 		leased = append(leased, l...)
-		bounds[i] = b
+		bounds = append(bounds, b)
 	}
 	e.endLeases(leased)
+	if len(bounds) == 0 {
+		return 0, waitErr
+	}
+	// Finish the levels already purged in memory even if ctx is done (waitErr): otherwise
+	// their tasks would be gone from memory but not from the store's ack level.
+	pctx := ctx
+	if waitErr != nil {
+		var cancel context.CancelFunc
+		pctx, cancel = context.WithTimeout(pqm.tqCtx, persistenceOperationRetryPolicy.Expiration)
+		defer cancel()
+	}
 	// Persist the new ack levels first: from then on a reload cannot read the purged rows,
 	// even if the deletes below fail (ack-level GC retries them).
 	db := bm.getDB()
-	if err := db.SyncState(ctx); err != nil {
+	if err := db.SyncState(pctx); err != nil {
 		bm.signalIfFatal(err)
 		return 0, err
 	}
 	total := 0
-	for i := range readers {
-		n, err := db.CompleteFairTasksLessThan(ctx, bounds[i], 0, subqueueIndex(i))
+	for i := range bounds {
+		n, err := db.CompleteFairTasksLessThan(pctx, bounds[i], 0, subqueueIndex(i))
 		if err != nil {
 			bm.signalIfFatal(err)
 			return total, err
@@ -408,8 +424,8 @@ func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, err
 	}
 	pqm.metricsHandler.Counter(metrics.QueuePurges, 1)
 	pqm.metricsHandler.Counter(metrics.TasksAdminDeleted, int64(total))
-	pqm.logger.Info("queue purged", "tasks", total, "leases_ended", len(leased))
-	return total, nil
+	pqm.logger.Info("queue purged", "tasks", total, "leases_ended", len(leased), "levels", len(bounds), "levels_total", len(readers))
+	return total, waitErr
 }
 
 // endLeases ends the leases on tasks an admin call removed: later Ack/Nack/ExtendLease return

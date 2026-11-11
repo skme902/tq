@@ -288,8 +288,9 @@ n, _ := e.PurgeQueue(ctx, queue)               // the whole backlog
   dead-letter set, do not count against that budget. It reads the store only: it never loads the
   queue, takes it over or bumps its rangeID. On the owning engine it also hides tasks acked but
   not yet deleted and sets `Leased`. On any other engine, when the store implements
-  `store.DeadLetterStore`, it hides backlog rows whose IDs are in the dead-letter set (a batch
-  lookup of the IDs just read). That includes a dead-lettered task still sitting behind a lease,
+  `store.DeadLetterStore`, it hides backlog rows whose IDs are in the dead-letter set. The store
+  has no lookup by ID, so each `PeekTasks` call pages the dead-letter set once in ID order, up to
+  the highest backlog ID it has read; a large dead-letter set makes a non-owner peek slower. That includes a dead-lettered task still sitting behind a lease,
   whose ack level has not moved and whose backlog row ack-level GC has not deleted.
 - `DeleteTask` and `PurgeQueue` change the backlog, so they run on the owner: they load the queue
   on the calling engine, taking it over from another owner like `AddTask` does (the old owner's
@@ -301,12 +302,17 @@ n, _ := e.PurgeQueue(ctx, queue)               // the whole backlog
   false for an already dead-lettered task and never touches the dead-letter copy (use
   `PurgeDeadTasks`). Needs a store that implements `store.TaskAdminStore` (memstore, sqlite and
   postgres do).
-- `PurgeQueue` moves every subqueue's ack level to its highest written task, persists it, then
-  deletes the rows. It returns how many rows that delete removed. The count can include
+- `PurgeQueue` waits, per priority level, until no write is in flight there, then moves that
+  level's ack level to its highest written task, persists it, and deletes the rows. Like SQS
+  `PurgeQueue`, a task whose `AddTask` returns while a purge is running may be purged, and
+  nothing is left below the new ack level. The purge is not atomic across priority levels: if
+  `ctx` ends while waiting on one level, the levels already purged stay purged and are
+  persisted, `PurgeQueue` returns their row count with the error, and later levels are
+  untouched. It returns how many rows that delete removed. The count can include
   dead-lettered backlog rows that ack-level GC has not removed yet, so it can be higher than
   `DescribeQueue`'s `ApproximateBacklogCount`. `DeadTasks` is unchanged; the dead-letter copies
-  stay until `PurgeDeadTasks`. Leases on purged tasks end like above. Tasks added while it runs
-  may or may not be purged; tasks added after it returns are kept. Sync-matched leases are not
+  stay until `PurgeDeadTasks`. Leases on purged tasks end like above. Tasks added after it returns
+  are kept. Sync-matched leases are not
   in the backlog and are not affected.
 - Metrics, queue-tagged: `tasks_admin_deleted`, `queue_purges`.
 

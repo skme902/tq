@@ -119,41 +119,25 @@ func (tr *fairTaskReader) adminDeleteTask(ctx context.Context, tas store.TaskAdm
 // level there (in memory, then persisted by the caller's SyncState) and returns the leased
 // tasks it dropped and the level to delete below.
 //
-// It waits, bounded by ctx, while a writer has the ack level pinned or newlyWrittenTasks
-// are still pending. Those tasks were assigned passes from the pre-purge ack level; with
-// two fairness keys a lagging key's pass can sit below the previous max. Moving the ack
-// level over them would commit the task and then never deliver it, including after a
-// restart. Tasks that appear during the wait stay strictly above the purge watermark.
+// It first waits, bounded by ctx, while the ack level is pinned (a writer between picking
+// passes and committing, newlyWrittenTasks held for a read, or an admin delete in flight).
+// Once the pin is clear the reader lock is held until the ack level has moved, and
+// CreateFairTasks raises FairMaxReadLevel before it commits, so every row written so far is
+// at or below maxLevel and is purged, including a task whose AddTask returned while the
+// purge was waiting (like SQS PurgeQueue). Nothing is left below the new ack level. A write
+// that pins after this returns gets the new ack level as its pass base, so it lands above.
 func (tr *fairTaskReader) adminPurge(ctx context.Context) (leased []*internalTask, exclusiveMax fairLevel, err error) {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
 
-	before := make(map[fairLevel]struct{})
-	tr.outstandingTasks.Scan(func(o outstandingTask) bool {
-		before[o.level] = struct{}{}
-		return true
-	})
 	if err = tr.waitAckPinClearLocked(ctx); err != nil {
 		return nil, fairLevel{}, err
 	}
 
 	maxLevel := tr.backlogMgr.db.GetMaxFairReadLevel(tr.subqueue)
 	maxLevel = maxLevel.max(tr.readLevel)
-	var protect fairLevel
-	haveProtect := false
-	tr.outstandingTasks.Scan(func(o outstandingTask) bool {
-		if _, ok := before[o.level]; ok {
-			return true
-		}
-		if !haveProtect || o.level.less(protect) {
-			protect = o.level
-			haveProtect = true
-		}
-		return true
-	})
-	if haveProtect && !maxLevel.less(protect) {
-		// Stay strictly below the lowest task written under the pin.
-		maxLevel = fairLevel{pass: protect.pass, id: protect.id - 1}
+	if maxItem, ok := tr.outstandingTasks.Max(); ok {
+		maxLevel = maxLevel.max(maxItem.level)
 	}
 	var drop []outstandingTask
 	tr.outstandingTasks.Scan(func(o outstandingTask) bool {

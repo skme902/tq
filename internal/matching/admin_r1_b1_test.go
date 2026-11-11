@@ -6,6 +6,7 @@ package matching
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -284,16 +285,35 @@ func fairTask(payload, key string) store.Task {
 	return store.Task{Payload: []byte(payload), Priority: store.Priority{FairnessKey: key}}
 }
 
-// PurgeQueue must not move the ack level across a task whose pass was assigned while the
-// writer pin was held. Two fairness keys make that pass fall below the other key's max.
-func TestPurgeKeepsTaskPinnedAcrossPurge(t *testing.T) {
+// PurgeQueue during a write that holds the ack pin: once the write commits, everything up to
+// the highest written level is purged, including the task written during the wait (as with
+// SQS PurgeQueue) and older tasks that sort after it (two fairness keys put the new task's pass
+// below b2's). No row is left in the store, so nothing sits below the new ack level, and a
+// task added afterwards is delivered. smallBatch keeps the reader short of the end, so the
+// write is not merged into memory (mergeWrite drops it above readLevel).
+func TestPurgeDuringPinnedWriteLeavesNoOrphans(t *testing.T) {
+	for _, smallBatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("smallBatch=%v", smallBatch), func(t *testing.T) {
+			testPurgeDuringPinnedWrite(t, smallBatch)
+		})
+	}
+}
+
+func testPurgeDuringPinnedWrite(t *testing.T, smallBatch bool) {
 	g := &createGate{
 		Store:   memstore.New(),
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
 	t.Cleanup(func() { closeOnce(g.release) })
-	e := newR2Engine(t, g, nil, nil, nil)
+	var mut func(*Config)
+	if smallBatch {
+		mut = func(c *Config) {
+			c.GetTasksBatchSize = 2
+			c.GetTasksReloadAt = 1
+		}
+	}
+	e := newR2Engine(t, g, nil, nil, mut)
 	for _, tk := range []store.Task{
 		fairTask("a0", "a"),
 		fairTask("b0", "b"),
@@ -307,6 +327,9 @@ func TestPurgeKeepsTaskPinnedAcrossPurge(t *testing.T) {
 		tr := subqueueReader(t, e)
 		tr.lock.Lock()
 		defer tr.lock.Unlock()
+		if smallBatch {
+			return !tr.atEnd && tr.loadedTasks == 2
+		}
 		return tr.atEnd && tr.loadedTasks == 4
 	}, 3*time.Second, time.Millisecond)
 
@@ -353,12 +376,27 @@ func TestPurgeKeepsTaskPinnedAcrossPurge(t *testing.T) {
 		t.Fatal("PurgeQueue did not return")
 	}
 
-	require.Contains(t, payloadSet(t, g), "pinned")
-	requireDelivered(t, e, "pinned")
+	require.Empty(t, payloadSet(t, g), "purge left rows behind")
+	_, err := e.PollTask(context.Background(), portQueue, PollOptions{NoWait: true})
+	require.ErrorIs(t, err, ErrNoTasks)
+
+	_, err = e.AddTask(context.Background(), portQueue, fairTask("after", "a"))
+	require.NoError(t, err)
+	pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	d, err := e.PollTask(pctx, portQueue, PollOptions{})
+	pcancel()
+	require.NoError(t, err)
+	require.Equal(t, "after", string(d.Task.Payload))
+	require.NoError(t, d.Ack())
 
 	e.Stop()
-	e2 := newR2Engine(t, g, nil, nil, nil)
-	requireDelivered(t, e2, "pinned")
+	e2 := newR2Engine(t, g, nil, nil, mut)
+	_, err = e2.PollTask(context.Background(), portQueue, PollOptions{NoWait: true})
+	require.ErrorIs(t, err, ErrNoTasks)
+	rows := payloadSet(t, g) // "after" is acked; its row waits for ack-level GC
+	for _, p := range []string{"a0", "b0", "b1", "b2", "pinned"} {
+		require.False(t, rows[p], "purged task %q still in the store", p)
+	}
 }
 
 func payloadSet(t *testing.T, st store.Store) map[string]bool {
@@ -368,23 +406,6 @@ func payloadSet(t *testing.T, st store.Store) map[string]bool {
 		got[string(row.Data.Payload)] = true
 	}
 	return got
-}
-
-func requireDelivered(t *testing.T, e *Engine, payload string) {
-	t.Helper()
-	require.Eventually(t, func() bool {
-		d, err := e.PollTask(context.Background(), portQueue, PollOptions{NoWait: true})
-		if err != nil {
-			return false
-		}
-		got := string(d.Task.Payload)
-		if got != payload {
-			require.NoError(t, d.Ack())
-			return false
-		}
-		require.NoError(t, d.Nack())
-		return true
-	}, 3*time.Second, 5*time.Millisecond)
 }
 
 // A failed CompleteFairTasksLessThan in PurgeQueue leaves the rows. Ack-level GC must

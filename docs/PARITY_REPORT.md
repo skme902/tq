@@ -326,10 +326,12 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
 
 27. **Task admin (feat/ops-admin).** `PeekTasks`, `DeleteTask` and `PurgeQueue` are library-only (upstream has
     `tdbg taskqueue list-tasks` but no delete or purge). The reader gains `adminDeleted` levels that a racing read
-    skips, and a deleted task is flagged so `addTaskToMatcher` does not re-add it. Purge safety holds because
-    purge waits for writer ack-level pins to drop before it moves the ack level (a task whose pass was assigned
-    while the writer held the pin is not purged). It then moves the ack level to the max written level. Later
-    writes stay above that level because the writer's pass base is the ack level and task IDs only grow. One
+    skips, and a deleted task is flagged so `addTaskToMatcher` does not re-add it. Purge waits for every ack-level
+    pin on a subqueue to drop (a writer between picking passes and committing, tasks held for a read, an admin
+    delete in flight), then, without releasing the reader lock, moves the ack level to the max written level.
+    `CreateFairTasks` raises that level before it commits, so a task written during the wait is purged too (as
+    with SQS PurgeQueue) and no row is left below the ack level. Later writes stay above it because the writer's
+    pass base is the ack level, read under the same lock, and task IDs only grow. One
     upstream race is fixed on the way: a task evicted between `priTaskMatcher.AddTask`'s
     `setRemoveFunc` and `EnqueueTaskNoWait` was still queued (its remove ran while it was not queued yet), so a
     trimmed task could be delivered twice; `EnqueueTaskNoWait` now skips evicted tasks
