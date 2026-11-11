@@ -268,8 +268,8 @@ func (h *softAssertHandler) Handle(ctx context.Context, r slog.Record) error {
 	return nil
 }
 func (h *softAssertHandler) Enabled(context.Context, slog.Level) bool { return true }
-func (h *softAssertHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
-func (h *softAssertHandler) WithGroup(string) slog.Handler           { return h }
+func (h *softAssertHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *softAssertHandler) WithGroup(string) slog.Handler            { return h }
 
 // Deletes and a purge racing producers and consumers keep the reader's bookkeeping sound (no
 // soft assertion fires) and never deliver a task after its delete returned.
