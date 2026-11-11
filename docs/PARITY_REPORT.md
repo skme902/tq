@@ -292,9 +292,16 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
       the SQL stores order by (range_hash, task_queue_id) like upstream `ListTaskQueue`.
 
 25. **Graceful shutdown (feat/ops-drain).** `Engine.Shutdown(ctx)` is library-only: upstream matching stops via fx
-    lifecycle and relies on history to retry anything in flight. During a drain, waiting and new polls return
-    `ErrEngineDraining` (counted as `poll_timeouts` by the matcher, since they end through the poll context), so
-    `AddTask` spools instead of sync-matching. Matching, fairness, the limiter and fencing are unchanged.
+    lifecycle and relies on history to retry anything in flight. During a drain, polls that are already waiting
+    end through the poll context and return `ErrEngineDraining`; the matcher counts those as `poll_timeouts`.
+    Polls refused by the fast-path draining check return before the matcher and are not counted as
+    `poll_timeouts`. With no waiting poller, `AddTask` spools instead of sync-matching. Shutdown also waits for
+    in-flight polls (calls that already passed the fast path, including a match still inside `Starter`) and
+    refuses further leases at the drain decision, so no sync match commits after that decision. A sync-matched
+    task refused at that point (or one whose `Starter` failed) returns to its `AddTask` caller, which spools it or
+    reports an error once the engine has unloaded; the task is never silently dropped. `Stop` waits for settling
+    leases (Ack/Nack/expiry whose write is in flight) before unloading. Matching,
+    fairness, the limiter and fencing are unchanged.
 
 26. **Max attempts and dead letters (feat/ops-dlq).** Library-only: upstream matching acks a task once history
     starts it, and history owns retries. `store.Task.Attempts` (in the task blob, no column) counts deliveries;
