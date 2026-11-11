@@ -119,17 +119,31 @@ func (e *Engine) SweepIdleQueues(ctx context.Context, opts SweepOptions) (SweepR
 	}
 }
 
-// deleteIfIdle deletes the queue unless it is loaded here. partitionsLock is held (read)
-// across the store call so this Engine cannot start loading the queue in between; a load
-// elsewhere is excluded by the store's rangeID condition.
+// deleteIfIdle deletes the queue unless it is loaded here. The key is reserved in e.sweeping
+// for the store call, so this Engine cannot start loading the queue in between (a load waits
+// for the delete) while loads and unloads of other queues go ahead; a load elsewhere is
+// excluded by the store's rangeID condition.
 func (e *Engine) deleteIfIdle(ctx context.Context, sw store.QueueSweeper, key store.QueueKey, rangeID int64, idleBefore time.Time) (bool, error) {
-	e.partitionsLock.RLock()
-	defer e.partitionsLock.RUnlock()
+	e.partitionsLock.Lock()
 	if e.stopped {
+		e.partitionsLock.Unlock()
 		return false, ErrEngineStopped
 	}
 	if _, loaded := e.partitions[key]; loaded {
+		e.partitionsLock.Unlock()
 		return false, nil
 	}
+	if e.sweeping == nil {
+		e.sweeping = make(map[store.QueueKey]chan struct{})
+	}
+	done := make(chan struct{})
+	e.sweeping[key] = done
+	e.partitionsLock.Unlock()
+	defer func() {
+		e.partitionsLock.Lock()
+		delete(e.sweeping, key)
+		e.partitionsLock.Unlock()
+		close(done)
+	}()
 	return sw.DeleteQueueIfIdle(ctx, &store.DeleteQueueIfIdleRequest{Key: key, RangeID: rangeID, IdleBefore: idleBefore})
 }

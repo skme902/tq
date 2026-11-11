@@ -66,6 +66,9 @@ type Engine struct {
 	partitionsLock sync.RWMutex
 	partitions     map[store.QueueKey]*taskQueuePartitionManagerImpl
 	stopped        bool
+	// sweeping holds the queues SweepIdleQueues is deleting (guarded by partitionsLock); a load
+	// of one waits for its channel to close.
+	sweeping map[store.QueueKey]chan struct{}
 
 	// leases holds every outstanding Delivery (backlog and sync-matched). leasesClosed is set
 	// under leasesLock when Shutdown decides the drain is over and when Stop snapshots leases;
@@ -524,6 +527,16 @@ func (e *Engine) getTaskQueuePartitionManager(
 	if e.stopped {
 		e.partitionsLock.Unlock()
 		return nil, ErrEngineStopped
+	}
+	if ch, sweeping := e.sweeping[partition]; sweeping {
+		// SweepIdleQueues is deleting this queue's row: load it once that has finished.
+		e.partitionsLock.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return e.getTaskQueuePartitionManager(ctx, partition, create)
 	}
 	pm, ok = e.partitions[partition]
 	if ok {
