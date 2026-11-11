@@ -343,12 +343,17 @@ hist, _ := src.History(ctx, q, 20) // newest first: Version, Config, UpdatedBy, 
   `Update` returns and to other processes on their next poll (`PollInterval`, default 5s); loaded queues
   are notified through `QueueConfigWatcher` as with the memory source.
 - Each write is a new version (compare-and-set on the version, up to 10 retries) and a history row.
-  The whole `QueueConfig` is validated with the memory source's rules before it is written.
+  The whole `QueueConfig` is validated before it is written: the memory source's setter rules
+  (rate limits, fairness weight overrides, paused fairness keys, MaxAttempts and MaxTaskAge
+  non-negative), and in addition admin dispatch rates must be non-negative (the memory source's
+  `SetAdmin*DispatchRate` setters accept any value).
 - Stored as JSON of `QueueConfig` (Go field names) in `tq_queue_config` / `tq_queue_config_history`
   (migration `0003_queue_config`). Writes are serialised (a transaction-scoped advisory lock on
   Postgres) so the change feed's sequence numbers are in commit order and a poll cannot skip one.
 - Metrics: `queue_config_updates`, `queue_config_refresh_failures` (no queue tags).
-- The history is never trimmed by the library.
+- The history is never trimmed by the library. Config rows are kept when a queue is deleted
+  (`DeleteQueue`) or swept as idle, so a queue recreated under the same key keeps its pause and
+  limits.
 
 ## Delays and retry backoff
 

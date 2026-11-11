@@ -40,18 +40,26 @@ func testQueueConfigVersions(_ *testing.T, s *suite) {
 	s.EqualValues(2, r2.Version)
 	s.Greater(r2.Seq, r1.Seq)
 
+	// The returned record does not alias the request's buffer (review config r1 nit).
+	buf := []byte(`{"a":3}`)
+	rA, err := c.PutQueueConfig(s.ctx, &store.PutQueueConfigRequest{Key: s.key, ExpectedVersion: 2, Config: buf,
+		UpdatedBy: "alice", Reason: "r-" + string(buf), UpdateTime: s.now()})
+	s.NoError(err)
+	buf[1] = 'X'
+	s.Equal(`{"a":3}`, string(rA.Config))
+
 	got, err := c.GetQueueConfig(s.ctx, s.key)
 	s.NoError(err)
-	s.Equal(*r2, *got)
+	s.Equal(*rA, *got)
 	s.Equal("alice", got.UpdatedBy)
-	s.Equal(`r-{"a":2}`, got.Reason)
+	s.Equal(`r-{"a":3}`, got.Reason)
 
 	hist, err := c.QueueConfigHistory(s.ctx, s.key, 10)
 	s.NoError(err)
-	s.Equal([]store.QueueConfigRecord{*r2, *r1}, hist)
+	s.Equal([]store.QueueConfigRecord{*rA, *r2, *r1}, hist)
 	hist, err = c.QueueConfigHistory(s.ctx, s.key, 1)
 	s.NoError(err)
-	s.Equal([]store.QueueConfigRecord{*r2}, hist)
+	s.Equal([]store.QueueConfigRecord{*rA}, hist)
 
 	// Changes: every write after a seq, in seq order, across queues.
 	other := s.key
@@ -66,7 +74,7 @@ func testQueueConfigVersions(_ *testing.T, s *suite) {
 			mine = append(mine, r)
 		}
 	}
-	s.Equal([]store.QueueConfigRecord{*r1, *r2, *r3}, mine)
+	s.Equal([]store.QueueConfigRecord{*r1, *r2, *rA, *r3}, mine)
 
 	_, err = c.ListQueueConfigChanges(s.ctx, 0, 0)
 	var ia *store.InvalidArgumentError

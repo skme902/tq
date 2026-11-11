@@ -75,6 +75,7 @@ func TestStoreQueueConfigSourceConcurrentUpdates(t *testing.T) {
 	srcs := []*taskqueue.StoreQueueConfigSource{newStoreSource(t, st, nil), newStoreSource(t, st, nil)}
 	const n = 5
 	var wg sync.WaitGroup
+	errs := make(chan error, 2*n) // require in a worker goroutine does not stop the test cleanly
 	for i, src := range srcs {
 		for j := range n {
 			wg.Add(1)
@@ -89,11 +90,15 @@ func TestStoreQueueConfigSourceConcurrentUpdates(t *testing.T) {
 						c.FairnessWeightOverrides[key] = 2
 						return nil
 					})
-				require.NoError(t, err)
+				errs <- err
 			}()
 		}
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 	for _, src := range srcs {
 		require.Eventually(t, func() bool { return len(src.QueueConfig(q).FairnessWeightOverrides) == 2*n },
 			3*time.Second, 10*time.Millisecond)

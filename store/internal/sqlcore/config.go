@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/skme902/tq/store"
@@ -74,7 +75,7 @@ func (s *Store) PutQueueConfig(ctx context.Context, req *store.PutQueueConfigReq
 		return nil, &store.InvalidArgumentError{Msg: "PutQueueConfig: ExpectedVersion must be >= 0 and Config non-nil"}
 	}
 	k := req.Key
-	rec := store.QueueConfigRecord{Key: k, Version: req.ExpectedVersion + 1, Config: req.Config,
+	rec := store.QueueConfigRecord{Key: k, Version: req.ExpectedVersion + 1, Config: slices.Clone(req.Config), // not aliased to the caller's buffer, like memstore
 		UpdatedBy: req.UpdatedBy, Reason: req.Reason, UpdateTime: req.UpdateTime.UTC()}
 	err := s.txExecute(ctx, "PutQueueConfig", func(tx *sql.Tx) error {
 		if s.d.ConfigLockSQL != "" {
