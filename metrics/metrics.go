@@ -151,6 +151,10 @@ const (
 	// QueuePaused is 1 while the queue is paused (QueueConfig.Paused), per queue.
 	QueuePaused = "queue_paused"
 
+	// Persisted queue config (library-only, from StoreQueueConfigSource; no queue tags).
+	QueueConfigUpdates         = "queue_config_updates"
+	QueueConfigRefreshFailures = "queue_config_refresh_failures"
+
 	// Task admin (library-only), per queue.
 	TasksAdminDeleted = "tasks_admin_deleted"
 	QueuePurges       = "queue_purges"

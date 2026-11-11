@@ -72,6 +72,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"Sweep_LiveTasks", testSweepLiveTasks},
 		{"Sweep_UntrackedSubqueue", testSweepUntrackedSubqueue},
 		{"Sweep_DeadTasks", testSweepDeadTasks},
+		{"QueueConfig_Versions", testQueueConfigVersions},
+		{"QueueConfig_ConcurrentPut", testQueueConfigConcurrentPut},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

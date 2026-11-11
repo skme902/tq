@@ -336,6 +336,13 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     a paused queue returns no match, and tasks of a paused key are skipped in the scan (poll forwarders are not).
     Both read lock-free state cached by the rate limit manager on config changes, which already reprocess all tasks.
     With nothing paused the scan is upstream's.
+32. **Persisted queue config (feat/ops-config).** `StoreQueueConfigSource` over the new `store.QueueConfigStore`
+    (tables `tq_queue_config`, `tq_queue_config_history`, migration 0003). Upstream keeps `TaskQueueConfig` in
+    task-queue user data, versioned, with `update_identity`/`reason`/`update_time`, and propagates it to partitions
+    by user-data long polls; here the whole `QueueConfig` (including library fields) is one JSON version per queue
+    key, propagated by polling a global change feed. No ported matching code changes: it is another
+    `QueueConfigSource` + `QueueConfigWatcher`. Upstream's per-field validation is applied to the whole config on
+    each write.
 
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate

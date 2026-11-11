@@ -12,6 +12,7 @@
 package taskqueue
 
 import (
+	"context"
 	"time"
 
 	"github.com/skme902/tq/internal/counter"
@@ -49,6 +50,16 @@ type (
 	// MemoryQueueConfigSource is a mutable in-process QueueConfigSource with upstream's
 	// override validation, merge and size-limit semantics.
 	MemoryQueueConfigSource = matching.MemoryQueueConfigSource
+	// StoreQueueConfigSource is a QueueConfigSource persisted in a store that implements
+	// store.QueueConfigStore (memstore, sqlite, postgres), shared by every process on the
+	// database, with versioned history (identity, reason, time) of every change.
+	StoreQueueConfigSource = matching.StoreQueueConfigSource
+	// StoreQueueConfigSourceOptions configures NewStoreQueueConfigSource.
+	StoreQueueConfigSourceOptions = matching.StoreQueueConfigSourceOptions
+	// ConfigChange is the identity and reason recorded with a StoreQueueConfigSource update.
+	ConfigChange = matching.ConfigChange
+	// QueueConfigVersion is one entry of StoreQueueConfigSource.History.
+	QueueConfigVersion = matching.QueueConfigVersion
 
 	// CounterParams configures the fairness pass counter (Config.FairnessCounter).
 	CounterParams = counter.CounterParams
@@ -137,6 +148,13 @@ func DefaultCounterParams() CounterParams { return counter.DefaultCounterParams(
 
 // DefaultConfig returns upstream defaults.
 func DefaultConfig() Config { return matching.DefaultConfig() }
+
+// NewStoreQueueConfigSource loads every queue config stored in st and polls for changes
+// made by other processes every opts.PollInterval (default 5s) until Close. Pass it as
+// Config.QueueConfigSource.
+func NewStoreQueueConfigSource(ctx context.Context, st store.QueueConfigStore, opts StoreQueueConfigSourceOptions) (*StoreQueueConfigSource, error) {
+	return matching.NewStoreQueueConfigSource(ctx, st, opts)
+}
 
 // NewMemoryQueueConfigSource returns an empty MemoryQueueConfigSource; maxOverrides <= 0
 // means the upstream default (1000).

@@ -41,7 +41,7 @@ Reference points:
 | 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
 | 4 | Retry backoff and delayed visibility on Nack — **done** (feat/ops-backoff) | P1 | M |
 | 5 | Pause and resume of a queue or a fairness key — **done** (feat/ops-pause) | P1 | M |
-| 6 | Shared, persisted runtime config with an audit trail | P1 | M–L |
+| 6 | Shared, persisted runtime config with an audit trail — **done** (feat/ops-config) | P1 | M–L |
 | 7 | Health and readiness checks — **done** (feat/ops-health) | P1 | S |
 | 8 | Retention and GC of idle queue rows and expired tasks — **done** (feat/ops-retention) | P1 | S–M |
 | 9 | Dashboards and alert rules (Grafana JSON, Prometheus rules) | P1 | S |
@@ -205,7 +205,17 @@ Original analysis (superseded by the status above):
     interval, so other keys are not blocked.
   - Surface `Paused` in DescribeQueue and add a `queue_paused` gauge.
 
-## 6. Shared, persisted runtime config with an audit trail — P1, M–L
+## 6. Shared, persisted runtime config with an audit trail — P1, M–L — done
+
+**Status: implemented in feat/ops-config** (README §Persisted queue config): `store.QueueConfigStore`
+(memstore, sqlite, postgres; migration 0003), `StoreQueueConfigSource` with `Update(ctx, q, ConfigChange, mutate)`,
+`History`, `Refresh`, `Close`. Refinements: one read-modify-write `Update` with version CAS replaces per-setter
+`(identity, reason)` arguments; changes propagate by polling a sequence-numbered change feed (no LISTEN/NOTIFY), and
+Postgres writes take a transaction-scoped advisory lock so sequence order is commit order. Not done: exposing history
+over the admin HTTP API (10).
+
+Original analysis (superseded by the status above):
+
 
 - **Today.**
   - `QueueConfigSource` is an interface.

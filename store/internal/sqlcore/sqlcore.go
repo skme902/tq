@@ -40,6 +40,9 @@ type Dialect struct {
 	// MigrationLockSQL, if set, runs first inside the migration transaction to serialise
 	// concurrent migrators (Postgres advisory lock).
 	MigrationLockSQL string
+	// ConfigLockSQL, if set, runs first in PutQueueConfig so config writes commit in history
+	// seq order (Postgres advisory lock; SQLite has a single writer).
+	ConfigLockSQL string
 	// MaxRowsPerInsert bounds multi-row INSERTs (bind-parameter limits).
 	MaxRowsPerInsert int
 	// RowRef, if set, is the row identity used by the limited range delete instead of the
@@ -55,10 +58,11 @@ type Dialect struct {
 
 // Store implements store.Store on database/sql.
 type Store struct {
-	w *sql.DB // used for every write and for transactions
-	r *sql.DB // used for plain reads; may equal w
-	d Dialect
-	q queries
+	w  *sql.DB // used for every write and for transactions
+	r  *sql.DB // used for plain reads; may equal w
+	d  Dialect
+	q  queries
+	cq configQueries
 }
 
 var (
@@ -86,7 +90,7 @@ func New(w, r *sql.DB, d Dialect) *Store {
 	if d.MaxRowsPerInsert <= 0 {
 		d.MaxRowsPerInsert = 500
 	}
-	return &Store{w: w, r: r, d: d, q: buildQueries(d)}
+	return &Store{w: w, r: r, d: d, q: buildQueries(d), cq: buildConfigQueries(d)}
 }
 
 const (

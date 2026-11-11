@@ -43,4 +43,9 @@ func TestNumberedQueriesHaveNoQuestionMarks(t *testing.T) {
 		require.NotContains(t, v.Field(i).String(), "?", "query %s is not rebound", v.Type().Field(i).Name)
 	}
 	require.True(t, strings.Contains(q.deadExists, "$1"))
+	cq := buildConfigQueries(Dialect{NumberedPlaceholders: true, LockSuffix: " FOR UPDATE"})
+	cv := reflect.ValueOf(cq)
+	for i := range cv.NumField() {
+		require.NotContains(t, cv.Field(i).String(), "?", "config query %s is not rebound", cv.Type().Field(i).Name)
+	}
 }

@@ -6,6 +6,7 @@
 package memstore
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -36,6 +37,9 @@ const (
 	OpDeleteTask            = "DeleteTask"
 	OpCheckHealth           = "CheckHealth"
 	OpDeleteQueueIfIdle     = "DeleteQueueIfIdle"
+	OpGetQueueConfig        = "GetQueueConfig"
+	OpPutQueueConfig        = "PutQueueConfig"
+	OpListQueueConfigs      = "ListQueueConfigChanges"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -43,6 +47,9 @@ type Store struct {
 	mu     sync.Mutex
 	queues map[store.QueueKey]*queueRow
 	faults map[string][]error
+	// configHistory is the queue config history in seq order (seq = index+1).
+	configHistory []store.QueueConfigRecord
+	configCurrent map[store.QueueKey]int // index into configHistory
 }
 
 type queueRow struct {
@@ -53,17 +60,19 @@ type queueRow struct {
 }
 
 var (
-	_ store.Store           = (*Store)(nil)
-	_ store.QueueLister     = (*Store)(nil)
-	_ store.DeadLetterStore = (*Store)(nil)
-	_ store.QueueSweeper    = (*Store)(nil)
+	_ store.Store            = (*Store)(nil)
+	_ store.QueueLister      = (*Store)(nil)
+	_ store.DeadLetterStore  = (*Store)(nil)
+	_ store.QueueSweeper     = (*Store)(nil)
+	_ store.QueueConfigStore = (*Store)(nil)
 )
 
 // New returns an empty store.
 func New() *Store {
 	return &Store{
-		queues: make(map[store.QueueKey]*queueRow),
-		faults: make(map[string][]error),
+		queues:        make(map[store.QueueKey]*queueRow),
+		faults:        make(map[string][]error),
+		configCurrent: make(map[store.QueueKey]int),
 	}
 }
 
@@ -606,4 +615,96 @@ func (s *Store) CheckHealth(ctx context.Context) (store.StoreHealth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return store.StoreHealth{}, s.faultLocked(OpCheckHealth)
+}
+
+func cloneConfigRecord(r store.QueueConfigRecord) store.QueueConfigRecord {
+	r.Config = bytes.Clone(r.Config)
+	return r
+}
+
+// GetQueueConfig implements store.QueueConfigStore.
+func (s *Store) GetQueueConfig(ctx context.Context, key store.QueueKey) (*store.QueueConfigRecord, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpGetQueueConfig); err != nil {
+		return nil, err
+	}
+	i, ok := s.configCurrent[key]
+	if !ok {
+		return nil, &store.NotFoundError{Msg: fmt.Sprintf("queue config %v", key)}
+	}
+	r := cloneConfigRecord(s.configHistory[i])
+	return &r, nil
+}
+
+// PutQueueConfig implements store.QueueConfigStore.
+func (s *Store) PutQueueConfig(ctx context.Context, req *store.PutQueueConfigRequest) (*store.QueueConfigRecord, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if req.ExpectedVersion < 0 || req.Config == nil {
+		return nil, &store.InvalidArgumentError{Msg: "PutQueueConfig: ExpectedVersion must be >= 0 and Config non-nil"}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpPutQueueConfig); err != nil {
+		return nil, err
+	}
+	var cur int64
+	if i, ok := s.configCurrent[req.Key]; ok {
+		cur = s.configHistory[i].Version
+	}
+	if cur != req.ExpectedVersion {
+		return nil, &store.ConditionFailedError{Msg: fmt.Sprintf("queue config version is %d, expected %d", cur, req.ExpectedVersion)}
+	}
+	r := store.QueueConfigRecord{
+		Key: req.Key, Version: cur + 1, Seq: int64(len(s.configHistory) + 1), Config: bytes.Clone(req.Config),
+		UpdatedBy: req.UpdatedBy, Reason: req.Reason, UpdateTime: req.UpdateTime.UTC(),
+	}
+	s.configHistory = append(s.configHistory, r)
+	s.configCurrent[req.Key] = len(s.configHistory) - 1
+	out := cloneConfigRecord(r)
+	return &out, nil
+}
+
+// ListQueueConfigChanges implements store.QueueConfigStore.
+func (s *Store) ListQueueConfigChanges(ctx context.Context, afterSeq int64, limit int) ([]store.QueueConfigRecord, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, &store.InvalidArgumentError{Msg: "ListQueueConfigChanges: limit must be positive"}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpListQueueConfigs); err != nil {
+		return nil, err
+	}
+	var out []store.QueueConfigRecord
+	for i := max(afterSeq, 0); i < int64(len(s.configHistory)) && len(out) < limit; i++ {
+		out = append(out, cloneConfigRecord(s.configHistory[i]))
+	}
+	return out, nil
+}
+
+// QueueConfigHistory implements store.QueueConfigStore.
+func (s *Store) QueueConfigHistory(ctx context.Context, key store.QueueKey, limit int) ([]store.QueueConfigRecord, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, &store.InvalidArgumentError{Msg: "QueueConfigHistory: limit must be positive"}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []store.QueueConfigRecord
+	for i := len(s.configHistory) - 1; i >= 0 && len(out) < limit; i-- {
+		if s.configHistory[i].Key == key {
+			out = append(out, cloneConfigRecord(s.configHistory[i]))
+		}
+	}
+	return out, nil
 }
