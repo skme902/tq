@@ -262,6 +262,20 @@ type DeleteDeadTasksRequest struct {
 	DeadBefore time.Time
 }
 
+// StoreHealth is a HealthChecker's report.
+type StoreHealth struct {
+	// SchemaVersion is the highest migration applied (0 if none or not applicable).
+	SchemaVersion int
+	// WantSchemaVersion is the highest migration this build embeds (0 if not applicable).
+	WantSchemaVersion int
+}
+
+// HealthChecker is implemented by stores that can be probed for readiness (memstore, sqlite
+// and postgres do). CheckHealth must be cheap: a ping and a small read.
+type HealthChecker interface {
+	CheckHealth(ctx context.Context) (StoreHealth, error)
+}
+
 // DeleteTaskRequest deletes one backlog task, identified by its full key, under the rangeID
 // fence.
 type DeleteTaskRequest struct {

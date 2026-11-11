@@ -57,3 +57,14 @@ func testDeleteTaskFenced(_ *testing.T, s *suite) {
 	_, err = d.DeleteTask(s.ctx, &store.DeleteTaskRequest{Key: other.key, RangeID: rangeID, Pass: 1, ID: 1})
 	s.ErrorAs(err, &cf)
 }
+
+func testCheckHealth(_ *testing.T, s *suite) {
+	hc, ok := s.store.(store.HealthChecker)
+	if !ok {
+		s.t.Skip("store does not implement store.HealthChecker")
+	}
+	h, err := hc.CheckHealth(s.ctx)
+	s.NoError(err)
+	s.Equal(h.WantSchemaVersion, h.SchemaVersion, "a migrated store is current")
+	s.GreaterOrEqual(h.SchemaVersion, 0)
+}

@@ -337,6 +337,14 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     trimmed task could be delivered twice; `EnqueueTaskNoWait` now skips evicted tasks
     (`TestEvictedBeforeEnqueueIsNotQueued`). `setEvicted` tolerates a task that was never added.
 
+28. **Health (feat/ops-health).** `Engine.Live`, `Engine.Health` and the `health` HTTP package are library-only
+    (upstream registers gRPC health in the service wrapper and flips it to NOT_SERVING before its drain sleep, which
+    `Shutdown` + `/readyz` mirror). tq has no NOT_SERVING sleep: `Shutdown` marks the engine draining and new polls
+    are refused in the same step readiness flips, and `Health` re-reads draining/stopped after its store probe so a
+    drain that starts mid-probe is never reported ready. The only engine change is that `signalIfFatal` records the
+    last persistence error per queue (not back-pressure, cancellation or shutdown errors); it still decides fatality
+    as upstream does.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

@@ -42,7 +42,7 @@ Reference points:
 | 4 | Retry backoff and delayed visibility on Nack | P1 | M |
 | 5 | Pause and resume of a queue or a fairness key | P1 | M |
 | 6 | Shared, persisted runtime config with an audit trail | P1 | M–L |
-| 7 | Health and readiness checks | P1 | S |
+| 7 | Health and readiness checks — **done** (feat/ops-health) | P1 | S |
 | 8 | Retention and GC of idle queue rows and expired tasks | P1 | S–M |
 | 9 | Dashboards and alert rules (Grafana JSON, Prometheus rules) | P1 | S |
 | 10 | Admin HTTP endpoint and CLI | P1 | M |
@@ -226,9 +226,22 @@ Original analysis (superseded by the status above):
   - Expose the history through the admin API (10).
   - Keep `MemoryQueueConfigSource` for tests.
 
-## 7. Health and readiness — P1, S
+## 7. Health and readiness — P1, S — done
 
-- **Today.** There is no health API. Signals are spread over `LoadedQueues`, `fair_reader_stuck_detected`,
+**Status: implemented in feat/ops-health** (README §Health): `Engine.Live`, `Engine.Health(ctx) HealthReport`,
+`store.HealthChecker`, and package `health` (`/livez`, `/readyz`). Refinements: the degraded list is "a store error
+in the last minute" per loaded queue (recorded where the backlog manager already classifies errors) rather than
+separate stuck/lease flags; the handler lives in its own `health` package now instead of waiting for the admin
+endpoint (10). Review r1 tightened it: GET/HEAD only, `/livez` body is `{"live":bool}`, the probe has a 2s
+deadline and is skipped while draining, a schema at or above the build's newest migration is ready (rolling
+deploys), only persistence errors count as degraded, and the SQLite probe uses the read pool.
+
+### Original notes (superseded)
+
+The bullets below are the pre-implementation design. `Pinger`, the `admin` subpackage and the stuck-reader or
+lease flags were not built; see the status above.
+
+- **Today (before this work).** There was no health API. Signals are spread over `LoadedQueues`, `fair_reader_stuck_detected`,
   `lease_failures` and the store's own errors.
 - **Missing.**
   - liveness: the engine is not stopped

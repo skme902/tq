@@ -71,6 +71,10 @@ type (
 	RedriveOptions = matching.RedriveOptions
 	// NackOption configures Delivery.Nack.
 	NackOption = matching.NackOption
+	// HealthReport is Engine.Health's result.
+	HealthReport = matching.HealthReport
+	// QueueProblem is one degraded queue in a HealthReport.
+	QueueProblem = matching.QueueProblem
 	// TaskRef identifies one backlog task (PeekedTask.Ref, Engine.DeleteTask).
 	TaskRef = matching.TaskRef
 	// PeekOptions selects the tasks Engine.PeekTasks returns.

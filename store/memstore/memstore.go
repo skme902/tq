@@ -34,6 +34,7 @@ const (
 	OpDeleteDeadTasks       = "DeleteDeadTasks"
 	OpCountDeadTasks        = "CountDeadTasks"
 	OpDeleteTask            = "DeleteTask"
+	OpCheckHealth           = "CheckHealth"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -54,6 +55,7 @@ var (
 	_ store.Store           = (*Store)(nil)
 	_ store.QueueLister     = (*Store)(nil)
 	_ store.DeadLetterStore = (*Store)(nil)
+	_ store.HealthChecker   = (*Store)(nil)
 )
 
 // New returns an empty store.
@@ -560,4 +562,14 @@ func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (b
 	}
 	_, ok := tree.Delete(store.TaskInfo{Pass: req.Pass, ID: req.ID})
 	return ok, nil
+}
+
+// CheckHealth implements store.HealthChecker (no schema: versions are 0).
+func (s *Store) CheckHealth(ctx context.Context) (store.StoreHealth, error) {
+	if err := ctxErr(ctx); err != nil {
+		return store.StoreHealth{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return store.StoreHealth{}, s.faultLocked(OpCheckHealth)
 }

@@ -147,6 +147,8 @@ const (
 	QueuePurges       = "queue_purges"
 
 	// Engine-level (no queue tags), library-only.
+	EngineReady        = "engine_ready"
+	StoreHealthLatency = "store_health_latency"
 	// EngineDraining is 1 while Engine.Shutdown drains and 0 once it stops.
 	EngineDraining = "engine_draining"
 	// EngineDrainLeases is the number of leases still outstanding when a drain ends (0 for a

@@ -203,6 +203,37 @@ if err := e.Shutdown(ctx); err != nil {
   lease lock when Shutdown decides; 0 when the drain finishes), `engine_drain_duration`. The lease gauge and the duration
   are emitted once, by the call that stops the engine.
 
+## Health
+
+```go
+http.Handle("/", health.Handler(engine, health.Options{Timeout: 2 * time.Second}))
+// GET /livez  -> 200 while the engine is not stopped, else 503; body {"live":bool}; never touches the store
+// GET /readyz -> 200 when Engine.Health(ctx).Ready, else 503; JSON report
+// Only GET and HEAD are served (HEAD: same status, no body); other methods get 405 with Allow.
+```
+
+- `Engine.Live()` is false once the engine is stopped.
+- `Engine.Health(ctx)` reports `Ready` = live, not draining, the store answered a ping, and its
+  schema is current (`SchemaVersion >= WantSchemaVersion`: the newest migration the build embeds).
+  A schema *ahead* of the build counts as current on purpose: migrations are additive, so during a
+  rolling deploy old binaries keep serving after a newer one migrated. There is no exact-match mode.
+  The store probe uses the caller's deadline (for `/readyz`, `Options.Timeout`), or 2s if the
+  caller's context has none, and is skipped
+  once the engine is draining or stopped (readiness is re-checked after the probe, so a drain that
+  starts mid-probe still reports unready). On SQLite the probe uses the read pool, so a long write
+  does not make the engine unready; a writer that returns errors shows up as `Degraded` queues
+  instead. A write that hangs without returning is not detected by either.
+  Stores opt in with `store.HealthChecker` (memstore, sqlite and postgres do); for another store
+  only liveness and draining count.
+- `Degraded` lists loaded queues that saw a persistence error in the last minute
+  (`HealthDegradedWindow`), with the error. Back-pressure (`ErrResourceExhausted`), cancellation
+  and shutdown errors are not counted, notes expire after the window, and a stopped queue's
+  note is cleared. It does not make the engine unready.
+- `Health` never loads or takes over a queue. Metrics: `engine_ready` (0/1, set on each call),
+  `store_health_latency`.
+- During `Shutdown` readiness turns false first, so a load balancer stops routing before leases
+  drain.
+
 ## Dead letters
 
 By default a task that is nacked or whose lease expires is redelivered forever. Set a limit to
