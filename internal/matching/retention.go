@@ -14,10 +14,12 @@ import (
 )
 
 // MinSweepIdle is the shortest SweepOptions.IdleFor accepted. A loaded queue rewrites its row
-// at least every 12h even when nothing changes (half the upstream persistence TTL), so a row
-// untouched for 24h has no live owner anywhere. A shorter window could delete the row under a
-// quiet owner that would then share rangeID 1 with whoever recreates the queue.
-const MinSweepIdle = 24 * time.Hour
+// at least every 12h (plus one UpdateAckInterval) even when nothing changes: SyncState's
+// heartbeat is half its 24h default TTL, since normal partitions have persistence TTL 0. 48h
+// tolerates a missed heartbeat (DB errors, clock skew), the same grace as upstream's task
+// queue scavenger. A shorter window could delete the row under a quiet owner that would then
+// share rangeID 1 with whoever recreates the queue.
+const MinSweepIdle = 48 * time.Hour
 
 // SweepOptions configures SweepIdleQueues.
 type SweepOptions struct {
@@ -117,17 +119,31 @@ func (e *Engine) SweepIdleQueues(ctx context.Context, opts SweepOptions) (SweepR
 	}
 }
 
-// deleteIfIdle deletes the queue unless it is loaded here. partitionsLock is held (read)
-// across the store call so this Engine cannot start loading the queue in between; a load
-// elsewhere is excluded by the store's rangeID condition.
+// deleteIfIdle deletes the queue unless it is loaded here. The key is reserved in e.sweeping
+// for the store call, so this Engine cannot start loading the queue in between (a load waits
+// for the delete) while loads and unloads of other queues go ahead; a load elsewhere is
+// excluded by the store's rangeID condition.
 func (e *Engine) deleteIfIdle(ctx context.Context, sw store.QueueSweeper, key store.QueueKey, rangeID int64, idleBefore time.Time) (bool, error) {
-	e.partitionsLock.RLock()
-	defer e.partitionsLock.RUnlock()
+	e.partitionsLock.Lock()
 	if e.stopped {
+		e.partitionsLock.Unlock()
 		return false, ErrEngineStopped
 	}
 	if _, loaded := e.partitions[key]; loaded {
+		e.partitionsLock.Unlock()
 		return false, nil
 	}
-	return sw.DeleteQueueIfIdle(ctx, &store.DeleteQueueIfIdleRequest{Key: key, RangeID: rangeID, IdleBefore: idleBefore})
+	if e.sweeping == nil {
+		e.sweeping = make(map[store.QueueKey]chan struct{})
+	}
+	done := make(chan struct{})
+	e.sweeping[key] = done
+	e.partitionsLock.Unlock()
+	defer func() {
+		e.partitionsLock.Lock()
+		delete(e.sweeping, key)
+		e.partitionsLock.Unlock()
+		close(done)
+	}()
+	return sw.DeleteQueueIfIdle(ctx, &store.DeleteQueueIfIdleRequest{Key: key, RangeID: rangeID, IdleBefore: idleBefore, Now: e.timeSource.Now()})
 }

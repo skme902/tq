@@ -137,6 +137,12 @@ func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
 	age := pm.config.MaxTaskAge
 	if src := pm.engine.configSource; src != nil {
 		if v := src.QueueConfig(pm.partition).MaxTaskAge; v != nil {
+			if *v < 0 {
+				// Same as MaxAttempts: a negative override is ignored, not read as "off".
+				pm.logger.Warn("ignoring negative QueueConfig.MaxTaskAge; keeping the previous cap",
+					"max_task_age", *v, "cap", time.Duration(pm.maxTaskAge.Load()))
+				return
+			}
 			age = *v
 		}
 	}

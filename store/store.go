@@ -317,6 +317,10 @@ type DeleteQueueIfIdleRequest struct {
 	// before it, checked in the same transaction (so an owner that wrote after the listing
 	// keeps its queue).
 	IdleBefore time.Time
+	// Now, if non-zero, makes a task above the ack level count as live only while it has not
+	// expired (ExpiryTime unset or not before Now, the reader's rule), so a queue holding only
+	// expired tasks is deleted with them. Zero: every row above the ack level is live.
+	Now time.Time
 }
 
 // QueueSweeper is implemented by stores that can delete idle queues (memstore, sqlite and

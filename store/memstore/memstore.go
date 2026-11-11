@@ -200,7 +200,15 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 			ack = q.info.Subqueues[sq].FairAckLevel
 		}
 		live := false
-		tree.Ascend(store.TaskInfo{Pass: ack.Pass, ID: ack.ID + 1}, func(store.TaskInfo) bool {
+		// Ascend from the ack level itself (ack.ID+1 would overflow at MaxInt64) and skip a
+		// row exactly at it: live means strictly above, as in SQL (pass, task_id) > ack.
+		tree.Ascend(store.TaskInfo{Pass: ack.Pass, ID: ack.ID}, func(ti store.TaskInfo) bool {
+			if ti.Pass == ack.Pass && ti.ID == ack.ID {
+				return true
+			}
+			if !req.Now.IsZero() && ti.Data.ExpiryTime.Unix() > 0 && ti.Data.ExpiryTime.Before(req.Now) {
+				return true // expired: goes with the queue
+			}
 			live = true
 			return false
 		})
