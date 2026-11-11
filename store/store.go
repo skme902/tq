@@ -50,6 +50,9 @@ type (
 		CreateTime time.Time
 		// ExpiryTime: zero means never expires.
 		ExpiryTime time.Time
+		// Attempts is the number of deliveries of this task that have started (set by the
+		// queue; AddTask ignores it). See Delivery.Attempt and Config.MaxAttempts.
+		Attempts int32 `json:",omitzero"`
 	}
 
 	// TaskInfo is an allocated (persisted) task (replaces persistencespb.AllocatedTaskInfo).
@@ -163,7 +166,8 @@ type (
 		GetQueue(ctx context.Context, key QueueKey) (*GetQueueResponse, error)
 		// UpdateQueue writes the row if the stored rangeID == PrevRangeID, setting it to RangeID.
 		UpdateQueue(ctx context.Context, req *UpdateQueueRequest) error
-		// DeleteQueue deletes the row and its tasks if the stored rangeID == RangeID.
+		// DeleteQueue deletes the row and its tasks (and dead tasks, for a DeadLetterStore) if
+		// the stored rangeID == RangeID.
 		DeleteQueue(ctx context.Context, req *DeleteQueueRequest) error
 		// CreateTasks writes all tasks or none.
 		CreateTasks(ctx context.Context, req *CreateTasksRequest) (*CreateTasksResponse, error)
@@ -202,6 +206,70 @@ type ListQueuesResponse struct {
 // interface so custom Store implementations written before it existed keep compiling.
 type QueueLister interface {
 	ListQueues(ctx context.Context, req *ListQueuesRequest) (*ListQueuesResponse, error)
+}
+
+// DeadTask is a dead-lettered task: a task whose deliveries reached its queue's max attempts.
+type DeadTask struct {
+	// Task is the task as it was dead-lettered (ID and Pass from the backlog; Data.Attempts is
+	// the number of deliveries it had).
+	Task     TaskInfo
+	Reason   string
+	DeadTime time.Time
+}
+
+// UpdateTaskRequest rewrites the Data of one existing backlog task in place, keeping its
+// subqueue, Pass and ID (so its position in fair order does not change).
+type UpdateTaskRequest struct {
+	Key      QueueKey
+	RangeID  int64 // fence: *ConditionFailedError if the stored rangeID differs
+	Subqueue int
+	Task     TaskInfo
+}
+
+// DeadLetterTaskRequest moves Task from the backlog (Subqueue, Task.Pass, Task.ID) to the
+// queue's dead-letter set in one atomic write, so a reload cannot read it back. A backlog row
+// that is already gone (deleted by ack-level GC) is not an error. Recording the same task ID
+// again overwrites the dead entry, so a retry does not duplicate it.
+type DeadLetterTaskRequest struct {
+	Key      QueueKey
+	RangeID  int64 // fence: *ConditionFailedError if the stored rangeID differs
+	Subqueue int
+	Task     TaskInfo
+	Reason   string
+	DeadTime time.Time
+}
+
+// ListDeadTasksRequest pages through a queue's dead tasks in task ID order. PageSize must be
+// positive; PageToken is nil for the first page.
+type ListDeadTasksRequest struct {
+	Key       QueueKey
+	PageSize  int
+	PageToken []byte
+}
+
+// ListDeadTasksResponse is one page; NextPageToken is nil after the last page.
+type ListDeadTasksResponse struct {
+	Tasks         []DeadTask
+	NextPageToken []byte
+}
+
+// DeleteDeadTasksRequest deletes dead tasks: those in TaskIDs if it is non-nil, otherwise
+// those with DeadTime before DeadBefore (which must then be non-zero).
+type DeleteDeadTasksRequest struct {
+	Key        QueueKey
+	TaskIDs    []int64
+	DeadBefore time.Time
+}
+
+// DeadLetterStore is implemented by stores that support max attempts and dead-lettering
+// (memstore, sqlite and postgres do). The dead-letter set belongs to the queue: DeleteQueue
+// removes it too. Dead-letter reads and deletes are not fenced, since no engine owns them.
+type DeadLetterStore interface {
+	UpdateTask(ctx context.Context, req *UpdateTaskRequest) error
+	DeadLetterTask(ctx context.Context, req *DeadLetterTaskRequest) error
+	ListDeadTasks(ctx context.Context, req *ListDeadTasksRequest) (*ListDeadTasksResponse, error)
+	DeleteDeadTasks(ctx context.Context, req *DeleteDeadTasksRequest) (int, error)
+	CountDeadTasks(ctx context.Context, key QueueKey) (int64, error)
 }
 
 // Less reports whether a < b lexicographically by (Pass, ID).

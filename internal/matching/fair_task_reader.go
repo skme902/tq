@@ -531,6 +531,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 		} else {
 			task := newInternalTaskFromBacklog(t, tr.completeTask)
 			task.event.leaseFunc = tr.leaseTask
+			task.event.subqueue = tr.subqueue
 			tr.backlogMgr.setPriority(task)
 			merged.SetHint(outstandingTask{level: level, task: task}, &hint)
 			created = append(created, task)

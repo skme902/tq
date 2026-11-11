@@ -180,6 +180,47 @@ if err := e.Shutdown(ctx); err != nil {
 - Metrics (no queue tags): `engine_draining` (1 while draining, 0 after),
   `engine_drain_leases_remaining` (leases `Stop` had to end), `engine_drain_duration`.
 
+## Dead letters
+
+By default a task that is nacked or whose lease expires is redelivered forever. Set a limit to
+move poison tasks aside instead:
+
+```go
+cfg := taskqueue.Config{MaxAttempts: 5}           // engine default; 0 = unlimited (the default)
+three := int32(3)
+src.SetMaxAttempts(queue, &three)                  // per queue (MemoryQueueConfigSource)
+
+d, _ := e.PollTask(ctx, queue, taskqueue.PollOptions{})
+log.Print(d.Task.Attempts)                         // 1 on the first delivery
+d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was attempt 5
+```
+
+- `Task.Attempts` counts deliveries started (`PollTask` returning the task). A delivery that ends
+  without `Ack` (Nack, lease expiry, `Stop`, a crash) used one. A `Starter` error does not count.
+  `AddTask` ignores the field.
+- With a limit, each backlog delivery writes its new count to the store before `PollTask`
+  returns (one extra fenced write per delivery), so a task that crashes its consumer is counted.
+- A Nack or expiry on the last attempt moves the task from the backlog to the dead-letter set in
+  one fenced write. A task matched with no attempts left (read back after a crash, or the limit
+  was lowered) is dead-lettered instead of delivered. A sync-matched task has no row to move: it
+  is spooled with its count and dead-lettered when next matched.
+- If the dead-letter write fails the task is redelivered, never dropped
+  (`dead_letter_failures`).
+- `DeadTask.Reason` is `nack` (or `nack: <NackReason>`), `lease_expired` or
+  `attempts_exhausted`.
+- Admin calls. `ListDeadTasks`, `DeleteDeadTasks`, `PurgeDeadTasks(queue, deadBefore)` (zero time =
+  all) and `DescribeQueue().DeadTasks` read or write the store only: they do not load the queue,
+  take it over, or bump its rangeID. `RedriveDeadTasks(queue, RedriveOptions{TaskIDs, Max})`
+  re-adds tasks as new ones (new ID, `Attempts` 0) through `AddTask`, so it loads the queue on the
+  calling engine, taking it over from another owner like any `AddTask`. It is at-least-once: a
+  dead entry is deleted after its task was added, so a failure in between can redrive it twice.
+- Needs a store that implements `store.DeadLetterStore` (memstore, sqlite and postgres do;
+  migration `0002_dead_tasks`). With another store the limit is ignored (logged at start) and the
+  admin calls fail with `*store.InvalidArgumentError`.
+- Metrics, queue-tagged: `tasks_dead_lettered{reason}`, `dead_letter_failures`,
+  `tasks_redriven`, `task_attempt_record_failures`. There is no dead-letter gauge: poll
+  `DescribeQueue().DeadTasks`, which is a `COUNT` query.
+
 ## Observability
 
 ### Metrics

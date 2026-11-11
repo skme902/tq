@@ -11,6 +11,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/skme902/tq/metrics"
@@ -32,6 +33,10 @@ type taskQueuePartitionManagerImpl struct {
 	// metricsCtx ends the periodic backlog-metrics emission (upstream initCtx).
 	metricsCtx    context.Context
 	metricsCancel context.CancelFunc
+
+	// maxAttempts is the effective QueueConfig.MaxAttempts / Config.MaxAttempts (0 =
+	// unlimited), refreshed on load and on every config notification.
+	maxAttempts atomic.Int32
 }
 
 func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *taskQueueConfig) *taskQueuePartitionManagerImpl {
@@ -51,6 +56,7 @@ func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *t
 }
 
 func (pm *taskQueuePartitionManagerImpl) Start() {
+	pm.refreshQueueConfig()
 	pm.rateLimitManager.Start(pm.userDataChanged)
 	// initial user data load (upstream: userDataManager.Start -> onUserDataChanged)
 	pm.rateLimitManager.UserDataChanged()
@@ -113,9 +119,22 @@ func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog() {
 
 // userDataChanged is called on QueueConfigWatcher notifications.
 func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
+	pm.refreshQueueConfig()
 	// Update rateLimits if any change is userData.
 	pm.rateLimitManager.UserDataChanged()
 	pm.defaultQueue.UserDataChanged()
+}
+
+// refreshQueueConfig caches the library-only QueueConfig fields (the rate limit manager caches
+// the upstream ones).
+func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
+	n := pm.config.MaxAttempts
+	if src := pm.engine.configSource; src != nil {
+		if v := src.QueueConfig(pm.partition).MaxAttempts; v != nil {
+			n = *v
+		}
+	}
+	pm.maxAttempts.Store(max(n, 0))
 }
 
 // GetRateLimitManager returns the partition's rate limit manager.

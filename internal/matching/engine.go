@@ -56,6 +56,9 @@ type Engine struct {
 	validator      Validator
 	configSource   QueueConfigSource
 	router         PartitionRouter
+	// deadLetters is store as a DeadLetterStore, or nil if it does not implement one (then
+	// MaxAttempts is ignored and the dead-letter APIs fail).
+	deadLetters store.DeadLetterStore
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -112,7 +115,12 @@ func NewEngine(opts Options) (*Engine, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	drainCtx, drainCancel := context.WithCancel(context.Background())
+	dls, _ := opts.Store.(store.DeadLetterStore)
+	if dls == nil && config.MaxAttempts > 0 {
+		opts.Logger.Warn("Config.MaxAttempts is ignored: the store does not implement store.DeadLetterStore")
+	}
 	return &Engine{
+		deadLetters:    dls,
 		drainCtx:       drainCtx,
 		drainCancel:    drainCancel,
 		config:         config,
@@ -415,6 +423,7 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 		return false, err
 	}
 	start := e.timeSource.Now()
+	task.Attempts = 0 // owned by the queue
 	if task.CreateTime.IsZero() {
 		task.CreateTime = start
 	}
@@ -497,6 +506,13 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 			}
 			return nil, err
 		}
+		if exhausted(task, dbq.maxAttempts()) {
+			// Delivered max times already without an outcome (crash, Stop) or re-spooled
+			// after its last attempt: dead-letter it instead of delivering it.
+			if e.deadLetter(dbq, task, DeadReasonAttemptsExhausted, "", false) {
+				continue
+			}
+		}
 		if e.starter != nil {
 			req := &StartRequest{Queue: queue, Task: task.event.Data, Identity: opts.Identity}
 			if !task.isSyncMatchTask() {
@@ -513,11 +529,21 @@ func (e *Engine) PollTask(ctx context.Context, queue store.QueueKey, opts PollOp
 				continue
 			}
 		}
-		return e.newDelivery(task, dbq, queue, opts.LeaseDuration)
+		d, err := e.newDelivery(task, dbq, queue, opts.LeaseDuration)
+		if err == nil && !d.SyncMatched && dbq.maxAttempts() > 0 {
+			e.recordAttempt(dbq, task)
+		}
+		return d, err
 	}
 }
 
 // respoolSyncTaskLocked writes a sync-matched task (that was never persisted) to the backlog.
+func (e *Engine) isStopped() bool {
+	e.partitionsLock.RLock()
+	defer e.partitionsLock.RUnlock()
+	return e.stopped
+}
+
 func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

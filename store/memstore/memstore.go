@@ -28,6 +28,11 @@ const (
 	OpGetTasks              = "GetTasks"
 	OpCompleteTasksLessThan = "CompleteTasksLessThan"
 	OpListQueues            = "ListQueues"
+	OpUpdateTask            = "UpdateTask"
+	OpDeadLetterTask        = "DeadLetterTask"
+	OpListDeadTasks         = "ListDeadTasks"
+	OpDeleteDeadTasks       = "DeleteDeadTasks"
+	OpCountDeadTasks        = "CountDeadTasks"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -41,11 +46,13 @@ type queueRow struct {
 	rangeID   int64
 	info      *store.QueueInfo
 	subqueues map[int]*btree.BTreeG[store.TaskInfo]
+	dead      map[int64]store.DeadTask
 }
 
 var (
-	_ store.Store       = (*Store)(nil)
-	_ store.QueueLister = (*Store)(nil)
+	_ store.Store           = (*Store)(nil)
+	_ store.QueueLister     = (*Store)(nil)
+	_ store.DeadLetterStore = (*Store)(nil)
 )
 
 // New returns an empty store.
@@ -281,6 +288,164 @@ func (s *Store) CompleteTasksLessThan(ctx context.Context, req *store.CompleteTa
 		tree.Delete(t)
 	}
 	return len(del), nil
+}
+
+func (s *Store) fencedLocked(key store.QueueKey, rangeID int64) (*queueRow, error) {
+	q, ok := s.queues[key]
+	if !ok {
+		return nil, &store.ConditionFailedError{Msg: fmt.Sprintf("queue %v does not exist", key)}
+	}
+	if q.rangeID != rangeID {
+		return nil, &store.ConditionFailedError{
+			Msg: fmt.Sprintf("rangeID mismatch: stored %d, request %d", q.rangeID, rangeID),
+		}
+	}
+	return q, nil
+}
+
+// UpdateTask implements store.DeadLetterStore.
+func (s *Store) UpdateTask(ctx context.Context, req *store.UpdateTaskRequest) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpUpdateTask); err != nil {
+		return err
+	}
+	q, err := s.fencedLocked(req.Key, req.RangeID)
+	if err != nil {
+		return err
+	}
+	tree := q.subqueues[req.Subqueue]
+	if tree == nil {
+		return &store.NotFoundError{Msg: fmt.Sprintf("task %d", req.Task.ID)}
+	}
+	if _, ok := tree.Get(store.TaskInfo{Pass: req.Task.Pass, ID: req.Task.ID}); !ok {
+		return &store.NotFoundError{Msg: fmt.Sprintf("task %d", req.Task.ID)}
+	}
+	tree.Set(cloneTask(req.Task))
+	return nil
+}
+
+// DeadLetterTask implements store.DeadLetterStore.
+func (s *Store) DeadLetterTask(ctx context.Context, req *store.DeadLetterTaskRequest) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpDeadLetterTask); err != nil {
+		return err
+	}
+	q, err := s.fencedLocked(req.Key, req.RangeID)
+	if err != nil {
+		return err
+	}
+	if q.dead == nil {
+		q.dead = make(map[int64]store.DeadTask)
+	}
+	q.dead[req.Task.ID] = store.DeadTask{Task: cloneTask(req.Task), Reason: req.Reason, DeadTime: req.DeadTime}
+	if tree := q.subqueues[req.Subqueue]; tree != nil {
+		tree.Delete(store.TaskInfo{Pass: req.Task.Pass, ID: req.Task.ID})
+	}
+	return nil
+}
+
+// ListDeadTasks implements store.DeadLetterStore: task ID order; the token is the last ID.
+func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksRequest) (*store.ListDeadTasksResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if req.PageSize <= 0 {
+		return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListDeadTasks: PageSize %d must be positive", req.PageSize)}
+	}
+	var after *int64
+	if len(req.PageToken) > 0 {
+		after = new(int64)
+		if err := json.Unmarshal(req.PageToken, after); err != nil {
+			return nil, &store.InvalidArgumentError{Msg: "ListDeadTasks: invalid page token"}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpListDeadTasks); err != nil {
+		return nil, err
+	}
+	resp := &store.ListDeadTasksResponse{}
+	q, ok := s.queues[req.Key]
+	if !ok {
+		return resp, nil
+	}
+	ids := make([]int64, 0, len(q.dead))
+	for id := range q.dead {
+		if after == nil || id > *after {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	for i, id := range ids {
+		if i == req.PageSize {
+			resp.NextPageToken, _ = json.Marshal(ids[i-1])
+			break
+		}
+		d := q.dead[id]
+		d.Task = cloneTask(d.Task)
+		resp.Tasks = append(resp.Tasks, d)
+	}
+	return resp, nil
+}
+
+// DeleteDeadTasks implements store.DeadLetterStore.
+func (s *Store) DeleteDeadTasks(ctx context.Context, req *store.DeleteDeadTasksRequest) (int, error) {
+	if err := ctxErr(ctx); err != nil {
+		return 0, err
+	}
+	if req.TaskIDs == nil && req.DeadBefore.IsZero() {
+		return 0, &store.InvalidArgumentError{Msg: "DeleteDeadTasks: TaskIDs or DeadBefore is required"}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpDeleteDeadTasks); err != nil {
+		return 0, err
+	}
+	q, ok := s.queues[req.Key]
+	if !ok {
+		return 0, nil
+	}
+	n := 0
+	if req.TaskIDs != nil {
+		for _, id := range req.TaskIDs {
+			if _, ok := q.dead[id]; ok {
+				delete(q.dead, id)
+				n++
+			}
+		}
+		return n, nil
+	}
+	for id, d := range q.dead {
+		if d.DeadTime.Before(req.DeadBefore) {
+			delete(q.dead, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CountDeadTasks implements store.DeadLetterStore.
+func (s *Store) CountDeadTasks(ctx context.Context, key store.QueueKey) (int64, error) {
+	if err := ctxErr(ctx); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpCountDeadTasks); err != nil {
+		return 0, err
+	}
+	if q, ok := s.queues[key]; ok {
+		return int64(len(q.dead)), nil
+	}
+	return 0, nil
 }
 
 // TaskCount returns the number of stored tasks in a subqueue (test helper).

@@ -36,7 +36,7 @@ Reference points:
 
 | # | Gap | Priority | Effort |
 |---|---|---|---|
-| 1 | Max attempts, poison tasks and a DLQ (with redrive) | P0 | M–L |
+| 1 | Max attempts, poison tasks and a DLQ (with redrive) — **done** (feat/ops-dlq) | P0 | M–L |
 | 2 | Task admin: peek and browse, delete one task, purge a queue | P0 | M |
 | 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
 | 4 | Retry backoff and delayed visibility on Nack | P1 | M |
@@ -57,7 +57,15 @@ Reference points:
 
 The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so build them as one design.
 
-## 1. Max attempts, poison tasks and a DLQ — P0, M–L
+## 1. Max attempts, poison tasks and a DLQ — P0, M–L — done
+
+**Status: implemented in feat/ops-dlq** (README §Dead letters). Refinements to the design below:
+`Attempts` lives in `store.Task` (the JSON blob, no column) and counts deliveries started, persisted with a
+fenced in-place `UpdateTask` on each backlog delivery when a limit is set, rather than a rewrite with a new ID
+(which would move the task in fair order). `Nack(NackReason(s))` records a string, not an error. `PurgeDeadTasks`
+takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count` gauge:
+`DescribeQueue().DeadTasks` reads the count.
+
 
 - **Today.**
   - `Delivery.Nack`, lease expiry, and a Starter that returns a retryable error all redeliver the task. This is

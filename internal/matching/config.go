@@ -102,6 +102,14 @@ type Config struct {
 	// negative value disables the periodic emission, and the sync emits the unprefixed names
 	// instead (upstream's interval 0).
 	BacklogMetricsEmitInterval time.Duration
+
+	// MaxAttempts is the default number of deliveries a task gets before it is dead-lettered
+	// (library addition; QueueConfig.MaxAttempts overrides it per queue). 0, the default,
+	// means unlimited: tasks are redelivered forever, as before. When a queue's limit is
+	// positive, every backlog delivery also records its attempt count in the store before
+	// PollTask returns (one extra write), so the count survives crashes. Needs a store that
+	// implements store.DeadLetterStore; with any other store the limit is ignored.
+	MaxAttempts int32
 }
 
 // DefaultConfig returns upstream defaults.
@@ -187,6 +195,9 @@ func (c Config) WithDefaults() Config {
 func (c Config) validate() error {
 	if c.GetTasksBatchSize < 1 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasksBatchSize must be positive, got %d", c.GetTasksBatchSize)}
+	}
+	if c.MaxAttempts < 0 {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxAttempts must be non-negative, got %d", c.MaxAttempts)}
 	}
 	if c.GetTasksReloadAt < 0 || c.GetTasksReloadAt >= c.GetTasksBatchSize {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf(

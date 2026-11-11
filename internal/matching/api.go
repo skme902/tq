@@ -55,6 +55,9 @@ type (
 		// dynamic config). nil means the Config value.
 		AdminNamespaceDispatchRate *float64
 		AdminQueueDispatchRate     *float64
+		// MaxAttempts overrides Config.MaxAttempts for this queue (library addition). nil means
+		// the Config value; 0 means unlimited.
+		MaxAttempts *int32
 	}
 
 	// QueueConfigSource replaces userDataManager for per-queue config. A loaded queue reads

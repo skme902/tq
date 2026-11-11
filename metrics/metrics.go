@@ -75,6 +75,8 @@ const (
 	// TagTaskQueue is the queue's QueueKey.Name, or OmittedValue when the per-queue breakdown
 	// is disabled or its cardinality cap is reached.
 	TagTaskQueue = "taskqueue"
+	// TagReason is why a task was dead-lettered (library-only; tasks_dead_lettered).
+	TagReason = "reason"
 	// TagPartition is the queue's QueueKey.Partition as a decimal string.
 	TagPartition = "partition"
 	// TagTaskPriority is the task's priority key; "" for the default priority (upstream
@@ -132,6 +134,13 @@ const (
 	TaskQueueStopped        = "task_queue_stopped"
 	ApproximateBacklogCount = "approximate_backlog_count"
 	TasksRateLimited        = "tasks_rate_limited"
+
+	// Dead letters (library-only), per queue. tasks_dead_lettered is tagged reason (nack,
+	// lease_expired, attempts_exhausted).
+	TasksDeadLettered         = "tasks_dead_lettered"
+	DeadLetterFailures        = "dead_letter_failures"
+	TasksRedriven             = "tasks_redriven"
+	TaskAttemptRecordFailures = "task_attempt_record_failures"
 
 	// Engine-level (no queue tags), library-only.
 	// EngineDraining is 1 while Engine.Shutdown drains and 0 once it stops.

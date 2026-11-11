@@ -296,6 +296,13 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     `ErrEngineDraining` (counted as `poll_timeouts` by the matcher, since they end through the poll context), so
     `AddTask` spools instead of sync-matching. Matching, fairness, the limiter and fencing are unchanged.
 
+26. **Max attempts and dead letters (feat/ops-dlq).** Library-only: upstream matching acks a task once history
+    starts it, and history owns retries. `store.Task.Attempts` (in the task blob, no column) counts deliveries;
+    with `MaxAttempts > 0` each backlog delivery does one extra fenced `UpdateTask` before `PollTask` returns, and
+    a last failed attempt moves the row to `tq_dead_tasks` instead of `addTaskToMatcher`. The default (0) adds no
+    writes and keeps upstream's redelivery path. Fair order, the limiter, sync match vs backlog and fencing are
+    unchanged; a dead-lettered task is finished like an ack, so the ack level advances past it as usual.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

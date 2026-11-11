@@ -52,6 +52,8 @@ type (
 		// leaseFunc, if set, is called when a backlog task is handed out under a delivery lease
 		// (library addition; see fairTaskReader.leaseTask).
 		leaseFunc func(*internalTask)
+		// subqueue is the backlog subqueue the task was read from (backlog tasks only).
+		subqueue subqueueIndex
 	}
 
 	// internalTask represents a task from AddTask (sync match) or from the backlog.

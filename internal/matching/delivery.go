@@ -26,7 +26,8 @@ import (
 type Delivery struct {
 	Queue store.QueueKey
 	// TaskID is the persisted task ID, or 0 for a sync-matched task.
-	TaskID      int64
+	TaskID int64
+	// Task is the task; Task.Attempts counts deliveries including this one (1 on the first).
 	Task        store.Task
 	SyncMatched bool
 
@@ -53,6 +54,7 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		lease = e.config.DeliveryLeaseDuration
 	}
 	now := e.timeSource.Now()
+	task.event.Data.Attempts++
 	d := &Delivery{
 		Queue:       queue,
 		Task:        task.event.Data,
@@ -74,6 +76,7 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 	e.leasesLock.Lock()
 	if e.leasesClosed {
 		e.leasesLock.Unlock()
+		task.event.Data.Attempts-- // not delivered
 		if d.SyncMatched {
 			task.finish(taskFinishResult{err: ErrEngineStopped})
 		} else {
@@ -186,15 +189,33 @@ func (d *Delivery) Ack() error {
 	return nil
 }
 
-// Nack releases the task for immediate redelivery.
-func (d *Delivery) Nack() error {
+// NackOption configures Nack.
+type NackOption func(*nackOptions)
+
+type nackOptions struct {
+	reason string
+}
+
+// NackReason records why the consumer gave up on the task. It is kept only if this Nack
+// dead-letters the task (DeadTask.Reason "nack: <reason>").
+func NackReason(reason string) NackOption {
+	return func(o *nackOptions) { o.reason = reason }
+}
+
+// Nack releases the task for immediate redelivery, or, if this was its last attempt
+// (QueueConfig.MaxAttempts), dead-letters it.
+func (d *Delivery) Nack(opts ...NackOption) error {
+	var o nackOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if !d.settle() {
 		return d.lost()
 	}
 	d.stopTimer()
 	d.release()
 	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
-	d.redeliver(errNacked)
+	d.redeliver(errNacked, DeadReasonNack, o.reason)
 	return nil
 }
 
@@ -227,13 +248,21 @@ func (d *Delivery) expire() {
 	d.mu.Unlock()
 	d.pqm.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
 	d.release()
-	go d.redeliver(errLeaseExpired) // not under the timer callback
+	go d.redeliver(errLeaseExpired, DeadReasonLeaseExpired, "") // not under the timer callback
 }
 
-func (d *Delivery) redeliver(err error) {
+// redeliver returns a failed delivery's task to the queue, or dead-letters a backlog task that
+// used its last attempt. A sync-matched task has no backlog row to move: it is spooled with its
+// attempt count and dead-lettered when next matched (reason attempts_exhausted).
+func (d *Delivery) redeliver(err error, reason, detail string) {
 	if d.SyncMatched {
 		d.engine.respoolSyncTaskLocked(d, false)
 		return
+	}
+	if max := d.pqm.maxAttempts(); max > 0 && d.Task.Attempts >= max {
+		if d.engine.deadLetter(d.pqm, d.task, reason, detail, true) {
+			return
+		}
 	}
 	d.task.finish(taskFinishResult{err: err, consumedToken: true})
 }

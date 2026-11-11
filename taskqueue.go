@@ -62,6 +62,12 @@ type (
 	SubqueueStatus = matching.SubqueueStatus
 	// QueueDescription is Engine.DescribeQueue's snapshot (upstream DescribeTaskQueue stats).
 	QueueDescription = matching.QueueDescription
+	// DeadTask is a dead-lettered task (Engine.ListDeadTasks).
+	DeadTask = matching.DeadTask
+	// RedriveOptions selects the dead tasks Engine.RedriveDeadTasks moves back.
+	RedriveOptions = matching.RedriveOptions
+	// NackOption configures Delivery.Nack.
+	NackOption = matching.NackOption
 	// QueueStats are backlog count/age and add/dispatch rates (upstream TaskQueueStats).
 	QueueStats = matching.QueueStats
 	// QueueListing is one row of Engine.ListQueues.
@@ -122,3 +128,13 @@ func NewMemoryQueueConfigSource(maxOverrides int) *MemoryQueueConfigSource {
 
 // Retryable marks a Starter error as transient (redeliver instead of re-spool).
 func Retryable(err error) error { return matching.Retryable(err) }
+
+// NackReason records why a consumer gave up on a task; it is kept if the Nack dead-letters it.
+func NackReason(reason string) NackOption { return matching.NackReason(reason) }
+
+// Dead-letter reasons (DeadTask.Reason prefix, tasks_dead_lettered "reason" tag).
+const (
+	DeadReasonNack              = matching.DeadReasonNack
+	DeadReasonLeaseExpired      = matching.DeadReasonLeaseExpired
+	DeadReasonAttemptsExhausted = matching.DeadReasonAttemptsExhausted
+)

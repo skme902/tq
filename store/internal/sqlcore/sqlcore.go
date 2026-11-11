@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/skme902/tq/store"
 )
@@ -61,15 +62,18 @@ type Store struct {
 }
 
 var (
-	_ store.Store       = (*Store)(nil)
-	_ store.QueueLister = (*Store)(nil)
+	_ store.Store           = (*Store)(nil)
+	_ store.QueueLister     = (*Store)(nil)
+	_ store.DeadLetterStore = (*Store)(nil)
 )
 
 type queries struct {
-	insertQueue, getQueue, lockQueue, updateQueue, updateQueueData, deleteQueue string
-	deleteAllTasks, insertTasksPrefix, insertTasksSuffix, getTasks              string
-	rangeDelete, rangeDeleteNoLimit                                             string
-	listQueuesFirst, listQueuesAfter                                            string
+	insertQueue, getQueue, lockQueue, updateQueue, updateQueueData, deleteQueue        string
+	deleteAllTasks, insertTasksPrefix, insertTasksSuffix, getTasks                     string
+	rangeDelete, rangeDeleteNoLimit                                                    string
+	listQueuesFirst, listQueuesAfter                                                   string
+	updateTask, deleteTask, insertDead, listDeadFirst, listDeadAfter, deleteDeadBefore string
+	countDead, deleteAllDead                                                           string
 }
 
 // New returns a Store that writes through w and reads through r (r may be nil to use w).
@@ -116,6 +120,18 @@ func buildQueries(d Dialect) queries {
 			`ORDER BY range_hash, task_queue_id LIMIT ?`,
 		listQueuesAfter: `SELECT range_hash, task_queue_id, range_id, data, data_encoding FROM tq_task_queues ` +
 			`WHERE (range_hash, task_queue_id) > (?, ?) ORDER BY range_hash, task_queue_id LIMIT ?`,
+		deleteTask: `DELETE FROM tq_tasks WHERE ` + taskKey + ` AND pass = ? AND task_id = ?`,
+		updateTask: `UPDATE tq_tasks SET data = ?, data_encoding = ? WHERE ` + taskKey + ` AND pass = ? AND task_id = ?`,
+		insertDead: `INSERT INTO tq_dead_tasks (range_hash, task_queue_id, task_id, pass, dead_time, reason, data, data_encoding) ` +
+			`VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (range_hash, task_queue_id, task_id) DO UPDATE SET ` +
+			`pass = excluded.pass, dead_time = excluded.dead_time, reason = excluded.reason, data = excluded.data, data_encoding = excluded.data_encoding`,
+		listDeadFirst: `SELECT task_id, pass, dead_time, reason, data, data_encoding FROM tq_dead_tasks WHERE ` + queueKey +
+			` ORDER BY task_id LIMIT ?`,
+		listDeadAfter: `SELECT task_id, pass, dead_time, reason, data, data_encoding FROM tq_dead_tasks WHERE ` + queueKey +
+			` AND task_id > ? ORDER BY task_id LIMIT ?`,
+		deleteDeadBefore: `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND dead_time < ?`,
+		countDead:        `SELECT COUNT(*) FROM tq_dead_tasks WHERE ` + queueKey,
+		deleteAllDead:    `DELETE FROM tq_dead_tasks WHERE ` + queueKey,
 	}
 	if d.RowRef != "" {
 		q.rangeDelete = `DELETE FROM tq_tasks WHERE ` + taskKey + ` AND ` + d.RowRef + ` = ANY(ARRAY(` +
@@ -135,6 +151,14 @@ func buildQueries(d Dialect) queries {
 		q.rangeDeleteNoLimit = rebind(q.rangeDeleteNoLimit, 0)
 		q.listQueuesFirst = rebind(q.listQueuesFirst, 0)
 		q.listQueuesAfter = rebind(q.listQueuesAfter, 0)
+		q.updateTask = rebind(q.updateTask, 0)
+		q.deleteTask = rebind(q.deleteTask, 0)
+		q.insertDead = rebind(q.insertDead, 0)
+		q.listDeadFirst = rebind(q.listDeadFirst, 0)
+		q.listDeadAfter = rebind(q.listDeadAfter, 0)
+		q.deleteDeadBefore = rebind(q.deleteDeadBefore, 0)
+		q.countDead = rebind(q.countDead, 0)
+		q.deleteAllDead = rebind(q.deleteAllDead, 0)
 	}
 	return q
 }
@@ -390,6 +414,9 @@ func (s *Store) DeleteQueue(ctx context.Context, req *store.DeleteQueueRequest) 
 		if _, err := tx.ExecContext(ctx, s.q.deleteAllTasks, int64(hash), id); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, s.q.deleteAllDead, int64(hash), id); err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, s.q.deleteQueue, int64(hash), id, req.RangeID)
 		if err != nil {
 			return err
@@ -566,4 +593,151 @@ func (s *Store) CompleteTasksLessThan(ctx context.Context, req *store.CompleteTa
 		return 0, err
 	}
 	return int(n), nil
+}
+
+// ---- dead letters (library addition; store.DeadLetterStore) ----
+
+// UpdateTask rewrites one task's data in place under the rangeID fence.
+func (s *Store) UpdateTask(ctx context.Context, req *store.UpdateTaskRequest) error {
+	blob, err := json.Marshal(&req.Task.Data)
+	if err != nil {
+		return &store.InvalidArgumentError{Msg: "encode task: " + err.Error()}
+	}
+	id, hash := queueIDAndHash(req.Key)
+	return s.txExecute(ctx, "UpdateTask", func(tx *sql.Tx) error {
+		if err := s.lockTaskQueue(ctx, tx, id, hash, req.RangeID); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, s.q.updateTask, blob, DataEncoding, int64(hash), id, req.Subqueue, req.Task.Pass, req.Task.ID)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			return &store.NotFoundError{Msg: fmt.Sprintf("task %d", req.Task.ID)}
+		}
+		return nil
+	})
+}
+
+// DeadLetterTask upserts the dead-letter row under the rangeID fence.
+func (s *Store) DeadLetterTask(ctx context.Context, req *store.DeadLetterTaskRequest) error {
+	blob, err := json.Marshal(&req.Task.Data)
+	if err != nil {
+		return &store.InvalidArgumentError{Msg: "encode task: " + err.Error()}
+	}
+	id, hash := queueIDAndHash(req.Key)
+	return s.txExecute(ctx, "DeadLetterTask", func(tx *sql.Tx) error {
+		if err := s.lockTaskQueue(ctx, tx, id, hash, req.RangeID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.q.insertDead, int64(hash), id, req.Task.ID, req.Task.Pass,
+			req.DeadTime.UnixNano(), req.Reason, blob, DataEncoding); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, s.q.deleteTask, int64(hash), id, req.Subqueue, req.Task.Pass, req.Task.ID)
+		return err
+	})
+}
+
+// ListDeadTasks pages a queue's dead tasks in task ID order; the token is the last ID.
+func (s *Store) ListDeadTasks(ctx context.Context, req *store.ListDeadTasksRequest) (*store.ListDeadTasksResponse, error) {
+	if req.PageSize <= 0 {
+		return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListDeadTasks: PageSize %d must be positive", req.PageSize)}
+	}
+	id, hash := queueIDAndHash(req.Key)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if len(req.PageToken) == 0 {
+		rows, err = s.r.QueryContext(ctx, s.q.listDeadFirst, int64(hash), id, req.PageSize+1)
+	} else {
+		var after int64
+		if jerr := json.Unmarshal(req.PageToken, &after); jerr != nil {
+			return nil, &store.InvalidArgumentError{Msg: "ListDeadTasks: invalid page token"}
+		}
+		rows, err = s.r.QueryContext(ctx, s.q.listDeadAfter, int64(hash), id, after, req.PageSize+1)
+	}
+	if err != nil {
+		return nil, s.wrap("ListDeadTasks", err)
+	}
+	defer rows.Close()
+	resp := &store.ListDeadTasksResponse{}
+	for rows.Next() {
+		var (
+			d    store.DeadTask
+			dead int64
+			data []byte
+			enc  string
+		)
+		if err := rows.Scan(&d.Task.ID, &d.Task.Pass, &dead, &d.Reason, &data, &enc); err != nil {
+			return nil, s.wrap("ListDeadTasks: scan", err)
+		}
+		if len(resp.Tasks) == req.PageSize {
+			resp.NextPageToken, _ = json.Marshal(resp.Tasks[len(resp.Tasks)-1].Task.ID)
+			break
+		}
+		if enc != DataEncoding {
+			return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListDeadTasks: task %d: unsupported data_encoding %q", d.Task.ID, enc)}
+		}
+		if err := json.Unmarshal(data, &d.Task.Data); err != nil {
+			return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListDeadTasks: task %d: decode: %v", d.Task.ID, err)}
+		}
+		d.DeadTime = time.Unix(0, dead).UTC()
+		resp.Tasks = append(resp.Tasks, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, s.wrap("ListDeadTasks: rows", err)
+	}
+	return resp, nil
+}
+
+// DeleteDeadTasks deletes by ID (TaskIDs non-nil) or by DeadBefore.
+func (s *Store) DeleteDeadTasks(ctx context.Context, req *store.DeleteDeadTasksRequest) (int, error) {
+	if req.TaskIDs == nil && req.DeadBefore.IsZero() {
+		return 0, &store.InvalidArgumentError{Msg: "DeleteDeadTasks: TaskIDs or DeadBefore is required"}
+	}
+	id, hash := queueIDAndHash(req.Key)
+	if req.TaskIDs == nil {
+		res, err := s.w.ExecContext(ctx, s.q.deleteDeadBefore, int64(hash), id, req.DeadBefore.UnixNano())
+		if err != nil {
+			return 0, s.wrap("DeleteDeadTasks", err)
+		}
+		n, err := res.RowsAffected()
+		return int(n), s.wrap("DeleteDeadTasks", err)
+	}
+	total := 0
+	for start := 0; start < len(req.TaskIDs); start += s.d.MaxRowsPerInsert {
+		ids := req.TaskIDs[start:min(start+s.d.MaxRowsPerInsert, len(req.TaskIDs))]
+		q := `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND task_id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`
+		if s.d.NumberedPlaceholders {
+			q = rebind(q, 0)
+		}
+		args := []any{int64(hash), id}
+		for _, t := range ids {
+			args = append(args, t)
+		}
+		res, err := s.w.ExecContext(ctx, q, args...)
+		if err != nil {
+			return total, s.wrap("DeleteDeadTasks", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, s.wrap("DeleteDeadTasks", err)
+		}
+		total += int(n)
+	}
+	return total, nil
+}
+
+// CountDeadTasks returns the number of dead tasks of a queue.
+func (s *Store) CountDeadTasks(ctx context.Context, key store.QueueKey) (int64, error) {
+	id, hash := queueIDAndHash(key)
+	var n int64
+	if err := s.r.QueryRowContext(ctx, s.q.countDead, int64(hash), id).Scan(&n); err != nil {
+		return 0, s.wrap("CountDeadTasks", err)
+	}
+	return n, nil
 }
