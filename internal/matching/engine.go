@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strconv"
 	"sync"
 	"time"
 
@@ -68,6 +69,11 @@ type Engine struct {
 	leases       map[*Delivery]struct{}
 	leasesClosed bool
 
+	// queueTags holds the queues (namespace, name) granted a real taskqueue metrics tag,
+	// at most config.MetricsQueueTagLimit of them.
+	queueTagsLock sync.Mutex
+	queueTags     map[[2]string]struct{}
+
 	// testHookStopAfterSyncLeases, if set, runs in Stop after sync leases are re-spooled and
 	// before queues unload (tests only).
 	testHookStopAfterSyncLeases func()
@@ -109,7 +115,52 @@ func NewEngine(opts Options) (*Engine, error) {
 		cancel:         cancel,
 		partitions:     make(map[store.QueueKey]*taskQueuePartitionManagerImpl),
 		leases:         make(map[*Delivery]struct{}),
+		queueTags:      make(map[[2]string]struct{}),
 	}, nil
+}
+
+// queueMetricsHandler returns the handler for one queue's metrics, tagged namespace, taskqueue
+// and partition (upstream GetPerTaskQueuePartitionIDScope), and whether the taskqueue tag is the
+// real name. Past MetricsQueueTagLimit distinct queues, or with a negative limit, the taskqueue
+// tag is "__omitted__" (upstream: metrics.breakdownByTaskQueue=false).
+func (e *Engine) queueMetricsHandler(q store.QueueKey) (metrics.Handler, bool) {
+	breakdown := e.grantQueueTag(q)
+	name := metrics.OmittedValue
+	if breakdown {
+		name = q.Name
+	}
+	ns := q.Namespace
+	if ns == "" {
+		ns = "_unknown_" // upstream NamespaceTag
+	}
+	return metrics.WithTags(e.metricsHandler,
+		metrics.Tag{Key: metrics.TagNamespace, Value: ns},
+		metrics.Tag{Key: metrics.TagTaskQueue, Value: name},
+		metrics.Tag{Key: metrics.TagPartition, Value: strconv.Itoa(q.Partition)},
+	), breakdown
+}
+
+// newTaskTracker is upstream's: 5 s buckets over a 30 s window.
+func (e *Engine) newTaskTracker() *taskTracker {
+	return newTaskTracker(e.timeSource, 5*time.Second, 30*time.Second)
+}
+
+func (e *Engine) grantQueueTag(q store.QueueKey) bool {
+	limit := e.config.MetricsQueueTagLimit
+	if limit < 0 {
+		return false
+	}
+	k := [2]string{q.Namespace, q.Name}
+	e.queueTagsLock.Lock()
+	defer e.queueTagsLock.Unlock()
+	if _, ok := e.queueTags[k]; ok {
+		return true
+	}
+	if len(e.queueTags) >= limit {
+		return false
+	}
+	e.queueTags[k] = struct{}{}
+	return true
 }
 
 // Config returns the effective configuration.
@@ -259,8 +310,9 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 	if err := e.validatePriority(task.Priority); err != nil {
 		return false, err
 	}
+	start := e.timeSource.Now()
 	if task.CreateTime.IsZero() {
-		task.CreateTime = e.timeSource.Now()
+		task.CreateTime = start
 	}
 	for attempt := 1; ; attempt++ {
 		pm, err := e.getTaskQueuePartitionManager(ctx, queue, true)
@@ -269,6 +321,10 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 		}
 		t := task
 		matched, err := pm.AddTask(ctx, &t, nil)
+		if matched && err == nil {
+			// upstream handler.AddActivityTask: the whole call, for sync matches only
+			pm.metricsHandler.Timer(metrics.SyncMatchLatency, e.timeSource.Since(start))
+		}
 		// Deviation: upstream returns these to history, which retries. We retry on a reloaded
 		// queue when the queue unloaded (idle/conflict) underneath the call.
 		if err != nil && attempt < addTaskMaxAttempts && isShutdownOrConflict(err) && ctx.Err() == nil {

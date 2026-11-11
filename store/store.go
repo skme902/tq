@@ -175,6 +175,35 @@ type (
 	}
 )
 
+// ListQueuesRequest pages through every persisted queue (upstream
+// persistence.TaskManager.ListTaskQueue). PageSize must be positive; PageToken is nil for the
+// first page and otherwise the NextPageToken of the previous page.
+type ListQueuesRequest struct {
+	PageSize  int
+	PageToken []byte
+}
+
+// ListedQueue is one persisted queue row.
+type ListedQueue struct {
+	RangeID int64
+	Info    *QueueInfo
+}
+
+// ListQueuesResponse is one page. NextPageToken is nil when there are no more pages. The order
+// is implementation-defined but stable, and every queue that exists for the whole listing is
+// returned exactly once.
+type ListQueuesResponse struct {
+	Queues        []ListedQueue
+	NextPageToken []byte
+}
+
+// QueueLister is implemented by stores that can enumerate their queues without loading or
+// taking ownership of them. memstore, sqlite and postgres implement it; it is a separate
+// interface so custom Store implementations written before it existed keep compiling.
+type QueueLister interface {
+	ListQueues(ctx context.Context, req *ListQueuesRequest) (*ListQueuesResponse, error)
+}
+
 // Less reports whether a < b lexicographically by (Pass, ID).
 func (a Level) Less(b Level) bool {
 	return a.Pass < b.Pass || a.Pass == b.Pass && a.ID < b.ID

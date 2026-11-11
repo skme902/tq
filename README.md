@@ -156,6 +156,65 @@ Dispatch from the matcher is paced by upstream's GCRA-style limiter. A limit of 
 - `Engine.RateLimit(queue)` reports the effective rate (× read partitions) and its source (API, Worker, System).
   Throttled matches increment the `tasks_rate_limited` metric.
 
+## Observability
+
+### Metrics
+
+Pass a `metrics.Handler` in `Options.Metrics` (default: no-op). Handlers that implement `metrics.TagBinder`
+can pre-bind each queue's tags once; `metrics/metricstest.Recorder` records everything for tests.
+
+Every per-queue metric carries upstream's `GetPerTaskQueuePartitionIDScope` tags: `namespace`
+(`QueueKey.Namespace`, `_unknown_` if empty), `taskqueue` and `partition` (the partition ID).
+**Fairness keys are never tags.** Cardinality is capped by `Config.MetricsQueueTagLimit` (default 1000, per
+engine, first come first served): queues beyond the cap are tagged `taskqueue=__omitted__` and emit no
+per-queue gauges, which is what upstream does with `metrics.breakdownByTaskQueue=false`. A negative limit
+omits every queue.
+
+| Metric | Type | Extra tags | When |
+|---|---|---|---|
+| `tasks_added` | counter | | `AddTask` reached the partition |
+| `sync_match` / `tasks_spooled` | counter | | task handed to a waiting poller / written to the backlog |
+| `syncmatch_latency` | timer | | `AddTask` duration, sync-matched tasks only |
+| `task_dispatch_latency` | timer | `source` (`History` = sync, `DbBacklog`), `forwarded`, `task_priority` | task create time → delivery to a poller |
+| `asyncmatch_latency` | timer | | as above, backlog tasks only |
+| `poll_success`, `poll_success_sync`, `poll_timeouts` | counter | | poll outcome |
+| `pending_polls` | gauge | | pollers currently waiting |
+| `delivery_acked`, `delivery_nacked`, `delivery_lease_extended`, `delivery_lease_expired` | counter | | lease outcomes (library-only names) |
+| `delivery_ack_latency` | timer | | delivery → `Ack` |
+| `approximate_backlog_count` | gauge | `task_priority` | every `Config.BacklogMetricsEmitInterval` (1m, ±5% jitter) |
+| `approximate_backlog_age_seconds` | gauge | | age of the oldest backlog task, same cadence; both zeroed on unload |
+| `physical_approximate_backlog_count`, `physical_approximate_backlog_age_seconds` | gauge | `task_priority` (count) | at each ack-level sync; unprefixed names if the interval is negative |
+| `task_write_latency`, `task_write_throttle` | timer, counter | | backlog writes |
+| `tasks_rate_limited` | counter | | match throttled by the rate limiter |
+| `tasks_dropped` | counter | `reason` (`expired_read`, `expired_memory`, `invalid`, `starter`) | task dropped |
+| `task_rewrites`, `task_retry_transient`, `task_completed_missing`, `condition_failed_errors`, `lease_requests`, `lease_failures`, `fair_reader_stuck_detected` | counter | | backlog internals |
+| `task_queue_started`, `task_queue_stopped` | counter | `cause` (stopped) | queue load / unload |
+
+`task_priority` is `""` for the default priority, as upstream. Differences from upstream are listed in
+`docs/PARITY_REPORT.md` §3.
+
+### DescribeQueue and ListQueues
+
+`Engine.DescribeQueue` is modeled on upstream `DescribeTaskQueue` with enhanced stats. A loaded queue reports
+live values; an unloaded queue is read from the store without loading it (no ownership takeover, no rangeID
+bump): `Loaded=false`, stats and the effective rate limit come from the stored rows and config, and the poller, task and lease fields are zero.
+
+```go
+d, err := e.DescribeQueue(ctx, store.QueueKey{Namespace: "ns", Name: "emails"})
+// d.Stats.ApproximateBacklogCount, d.Stats.ApproximateBacklogAge
+// d.Stats.TasksAddRate, d.Stats.TasksDispatchRate (tasks/s over the last 30s), d.Stats.RateLimitingActive
+// d.StatsByPriority[3]                       // the same, per priority
+// d.EffectiveRateLimit, d.RateLimitSource    // as Engine.RateLimit
+// d.WaitingPollers, d.LoadedTasks, d.MatcherTasks, d.OutstandingLeases
+// d.RangeID, d.LastUpdateTime, d.Loaded
+
+page, err := e.ListQueues(ctx, 100, nil) // store must implement store.QueueLister (all bundled stores do)
+for _, q := range page.Queues { fmt.Println(q.Queue, q.ApproximateBacklogCount, q.Loaded) }
+// pass page.NextPageToken for the next page; nil means done
+```
+
+Unloaded-queue backlog age is approximate: the oldest create time among the first 100 tasks of each subqueue.
+
 ## Layout
 
 | Package | Contents |

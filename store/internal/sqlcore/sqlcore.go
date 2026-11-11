@@ -60,12 +60,16 @@ type Store struct {
 	q queries
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store       = (*Store)(nil)
+	_ store.QueueLister = (*Store)(nil)
+)
 
 type queries struct {
 	insertQueue, getQueue, lockQueue, updateQueue, updateQueueData, deleteQueue string
 	deleteAllTasks, insertTasksPrefix, insertTasksSuffix, getTasks              string
 	rangeDelete, rangeDeleteNoLimit                                             string
+	listQueuesFirst, listQueuesAfter                                            string
 }
 
 // New returns a Store that writes through w and reads through r (r may be nil to use w).
@@ -107,6 +111,11 @@ func buildQueries(d Dialect) queries {
 			`SELECT pass, task_id FROM tq_tasks WHERE ` + taskKey +
 			` AND (pass, task_id) < (?, ?) ORDER BY pass, task_id LIMIT ?)`,
 		rangeDeleteNoLimit: `DELETE FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) < (?, ?)`,
+		// Upstream ListTaskQueue pages by (range_hash, task_queue_id) the same way.
+		listQueuesFirst: `SELECT range_hash, task_queue_id, range_id, data, data_encoding FROM tq_task_queues ` +
+			`ORDER BY range_hash, task_queue_id LIMIT ?`,
+		listQueuesAfter: `SELECT range_hash, task_queue_id, range_id, data, data_encoding FROM tq_task_queues ` +
+			`WHERE (range_hash, task_queue_id) > (?, ?) ORDER BY range_hash, task_queue_id LIMIT ?`,
 	}
 	if d.RowRef != "" {
 		q.rangeDelete = `DELETE FROM tq_tasks WHERE ` + taskKey + ` AND ` + d.RowRef + ` = ANY(ARRAY(` +
@@ -124,6 +133,8 @@ func buildQueries(d Dialect) queries {
 		q.getTasks = rebind(q.getTasks, 0)
 		q.rangeDelete = rebind(q.rangeDelete, 0)
 		q.rangeDeleteNoLimit = rebind(q.rangeDeleteNoLimit, 0)
+		q.listQueuesFirst = rebind(q.listQueuesFirst, 0)
+		q.listQueuesAfter = rebind(q.listQueuesAfter, 0)
 	}
 	return q
 }
@@ -271,6 +282,67 @@ func (s *Store) GetQueue(ctx context.Context, key store.QueueKey) (*store.GetQue
 		return nil, err
 	}
 	return &store.GetQueueResponse{RangeID: rangeID, Info: info}, nil
+}
+
+// listToken is the ListQueues page token: the primary key of the last row returned.
+type listToken struct {
+	Hash int64  `json:"h"`
+	ID   []byte `json:"id"`
+}
+
+// ListQueues pages through tq_task_queues in primary-key order. It only reads; no row is
+// locked and no rangeID changes.
+func (s *Store) ListQueues(ctx context.Context, req *store.ListQueuesRequest) (*store.ListQueuesResponse, error) {
+	if req.PageSize <= 0 {
+		return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListQueues: PageSize %d must be positive", req.PageSize)}
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	// Fetch one extra row to know whether another page exists.
+	if len(req.PageToken) == 0 {
+		rows, err = s.r.QueryContext(ctx, s.q.listQueuesFirst, req.PageSize+1)
+	} else {
+		var tok listToken
+		if jerr := json.Unmarshal(req.PageToken, &tok); jerr != nil || tok.ID == nil {
+			return nil, &store.InvalidArgumentError{Msg: "ListQueues: invalid page token"}
+		}
+		rows, err = s.r.QueryContext(ctx, s.q.listQueuesAfter, tok.Hash, tok.ID, req.PageSize+1)
+	}
+	if err != nil {
+		return nil, s.wrap("ListQueues", err)
+	}
+	defer rows.Close()
+	resp := &store.ListQueuesResponse{}
+	var last listToken
+	for rows.Next() {
+		var (
+			hash    int64
+			id      []byte
+			rangeID int64
+			data    []byte
+			enc     string
+		)
+		if err := rows.Scan(&hash, &id, &rangeID, &data, &enc); err != nil {
+			return nil, s.wrap("ListQueues", err)
+		}
+		if len(resp.Queues) == req.PageSize {
+			tok, _ := json.Marshal(last)
+			resp.NextPageToken = tok
+			break
+		}
+		info, err := decodeInfo(data, enc)
+		if err != nil {
+			return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListQueues: queue row: %v", err)}
+		}
+		resp.Queues = append(resp.Queues, store.ListedQueue{RangeID: rangeID, Info: info})
+		last = listToken{Hash: hash, ID: id}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, s.wrap("ListQueues", err)
+	}
+	return resp, nil
 }
 
 func (s *Store) UpdateQueue(ctx context.Context, req *store.UpdateQueueRequest) error {

@@ -282,6 +282,34 @@ func (c *fairBacklogManagerImpl) BacklogCountHint() (total int64) {
 	return
 }
 
+// BacklogStatsByPriority is upstream's: per priority key, the summed approximate backlog count
+// and the greatest age of a loaded backlog task.
+func (c *fairBacklogManagerImpl) BacklogStatsByPriority() map[int32]*QueueStats {
+	c.subqueueLock.Lock()
+	defer c.subqueueLock.Unlock()
+
+	result := make(map[int32]*QueueStats)
+	backlogCounts := c.db.getApproximateBacklogCountsBySubqueue()
+	for subqueueIdx, priorityKey := range c.priorityBySubqueue {
+		pk := int32(priorityKey)
+		if _, ok := result[pk]; !ok {
+			result[pk] = &QueueStats{}
+		}
+		if int(subqueueIdx) < len(backlogCounts) {
+			result[pk].ApproximateBacklogCount += backlogCounts[subqueueIdx]
+		}
+		if int(subqueueIdx) >= len(c.subqueues) {
+			continue
+		}
+		if oldest := c.subqueues[subqueueIdx].getOldestBacklogTime(); !oldest.IsZero() {
+			if age := c.timeSource.Since(oldest); age > result[pk].ApproximateBacklogAge {
+				result[pk].ApproximateBacklogAge = age
+			}
+		}
+	}
+	return result
+}
+
 // SubqueueStatus is a debugging snapshot of one subqueue (replaces InternalTaskQueueStatus).
 type SubqueueStatus struct {
 	Priority                int32

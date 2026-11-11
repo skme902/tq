@@ -88,6 +88,20 @@ type Config struct {
 	// when the effective rate later changes, so a queue with no API/poller rate and default
 	// admin rates is unlimited rather than capped at 1000/s.
 	ApplySystemRateLimitOnLoad bool
+
+	// MetricsQueueTagLimit caps the number of distinct queues (namespace + name) whose metrics
+	// carry their real name in the "taskqueue" tag (default 1000). Queues beyond the cap, or all
+	// queues when the value is negative, are tagged "__omitted__" and emit no per-queue gauges
+	// (backlog count and age), like upstream with metrics.breakdownByTaskQueue=false. The cap is
+	// per Engine and first come, first served; a queue keeps its tag for the Engine's lifetime.
+	// Fairness keys are never used as tags.
+	MetricsQueueTagLimit int
+	// BacklogMetricsEmitInterval is how often a loaded queue emits approximate_backlog_count and
+	// approximate_backlog_age_seconds from its live stats (matching.backlogMetricsEmitInterval,
+	// 1m, 5% jitter); the ack-level sync then emits the physical_* variants, as upstream. A
+	// negative value disables the periodic emission, and the sync emits the unprefixed names
+	// instead (upstream's interval 0).
+	BacklogMetricsEmitInterval time.Duration
 }
 
 // DefaultConfig returns upstream defaults.
@@ -116,6 +130,8 @@ func DefaultConfig() Config {
 		AdminNamespaceTaskQueueToPartitionDispatchRate: 1000,
 		NumReadPartitions:                              1,
 		FairnessKeyRateLimitCacheSize:                  2000,
+		MetricsQueueTagLimit:                           1000,
+		BacklogMetricsEmitInterval:                     time.Minute,
 	}
 }
 
@@ -161,6 +177,8 @@ func (c Config) WithDefaults() Config {
 	}
 	setI(&c.NumReadPartitions, d.NumReadPartitions)
 	setI(&c.FairnessKeyRateLimitCacheSize, d.FairnessKeyRateLimitCacheSize)
+	setI(&c.MetricsQueueTagLimit, d.MetricsQueueTagLimit)
+	setD(&c.BacklogMetricsEmitInterval, d.BacklogMetricsEmitInterval)
 	return c
 }
 
@@ -182,6 +200,10 @@ type taskQueueConfig struct {
 	Config
 	PriorityLevels     priorityKey
 	DefaultPriorityKey priorityKey
+	// BreakdownMetricsByTaskQueue is true when this queue's metrics carry its real taskqueue
+	// tag (upstream BreakdownMetricsByTaskQueue && BreakdownMetricsByPartition). Per-queue
+	// gauges are emitted only then.
+	BreakdownMetricsByTaskQueue bool
 }
 
 func newTaskQueueConfig(c Config) *taskQueueConfig {

@@ -1,6 +1,7 @@
 // Ported from temporalio/temporal v1.32.1 af08a5e5, service/matching/physical_task_queue_manager.go
 // Changes: fair backlog + priMatcher only (classic/pri backlogs, old matcher, draining, versioning,
-// deployments, poller history, scaling decisions, task trackers removed); injected clock.
+// deployments, poller history, scaling decisions removed); injected clock. Task trackers feed
+// Engine.DescribeQueue rates (upstream GetStatsByPriority).
 // Copyright (c) 2025 Temporal Technologies Inc. MIT License; see UPSTREAM_LICENSE and NOTICE.
 
 package matching
@@ -9,6 +10,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,6 +79,14 @@ type physicalTaskQueueManagerImpl struct {
 
 	// outstandingLeases counts deliveries not yet acked/nacked/expired (library addition).
 	outstandingLeases atomic.Int64
+
+	currentPolls atomic.Int64
+
+	// Rate trackers, keyed by priority (upstream).
+	taskTrackerLock  sync.Mutex
+	tasksAdded       map[priorityKey]*taskTracker
+	tasksDispatched  map[priorityKey]*taskTracker
+	tasksRateLimited *taskTracker
 }
 
 var _ fairBacklogPQM = (*physicalTaskQueueManagerImpl)(nil)
@@ -100,6 +110,10 @@ func newPhysicalTaskQueueManager(
 		logger:         partitionMgr.logger,
 		metricsHandler: partitionMgr.metricsHandler,
 		timeSource:     e.timeSource,
+
+		tasksAdded:       make(map[priorityKey]*taskTracker),
+		tasksDispatched:  make(map[priorityKey]*taskTracker),
+		tasksRateLimited: e.newTaskTracker(),
 	}
 
 	pqMgr.liveness = newLiveness(
@@ -173,6 +187,9 @@ func (c *physicalTaskQueueManagerImpl) Stop(unloadCause unloadCause) {
 	c.priMatcher.Stop()
 	c.liveness.Stop()
 	c.tqCtxCancel()
+	// Upstream: zero the backlog gauges so a stale value does not outlive the unload. Done
+	// after tqCtx is cancelled so no write can race it.
+	c.backlogMgr.getDB().emitZeroPhysicalBacklogGauges()
 	c.logger.Debug("Stopped physicalTaskQueueManager", "cause", unloadCause.String())
 	c.metricsHandler.Counter(metrics.TaskQueueStopped, 1, metrics.Tag{Key: "cause", Value: unloadCause.String()})
 }
@@ -203,6 +220,11 @@ func (c *physicalTaskQueueManagerImpl) PollTask(
 ) (*internalTask, error) {
 	c.liveness.markAlive()
 
+	c.metricsHandler.Gauge(metrics.PendingPolls, float64(c.currentPolls.Add(1)))
+	defer func() {
+		c.metricsHandler.Gauge(metrics.PendingPolls, float64(c.currentPolls.Add(-1)))
+	}()
+
 	for {
 		task, err := c.priMatcher.Poll(ctx, pollMetadata)
 		if err != nil {
@@ -215,6 +237,9 @@ func (c *physicalTaskQueueManagerImpl) PollTask(
 		if task.event != nil && isTaskExpired(task.event.TaskInfo, c.timeSource.Now()) {
 			task.finish(taskFinishResult{dropReason: dropReasonExpiredMemory})
 			continue
+		}
+		if pollMetadata.forwardedFrom == "" { // track the task on the child, not where a poll was forwarded to
+			c.incTaskTracker(c.tasksDispatched, priorityKey(task.getPriority().PriorityKey), 1)
 		}
 		return task, nil
 	}
@@ -237,6 +262,7 @@ func (c *physicalTaskQueueManagerImpl) TrySyncMatch(ctx context.Context, task *i
 	if !task.isForwarded() {
 		// request sent by AddTask
 		c.liveness.markAlive()
+		c.incTaskTracker(c.tasksAdded, priorityKey(task.getPriority().PriorityKey), 1)
 	}
 	return c.priMatcher.Offer(ctx, task)
 }
@@ -254,9 +280,63 @@ func (c *physicalTaskQueueManagerImpl) counterFactory() counter.Counter {
 	return counter.NewHybridCounter(c.config.FairnessCounter, src)
 }
 
-// onRateLimited replaces upstream's tasksRateLimited task tracker with a counter metric.
+// onRateLimited records a rate-limit event (upstream tracker) and counts it (library metric).
 func (c *physicalTaskQueueManagerImpl) onRateLimited() {
+	c.taskTrackerLock.Lock()
+	c.tasksRateLimited.inc(1)
+	c.taskTrackerLock.Unlock()
 	c.metricsHandler.Counter(metrics.TasksRateLimited, 1)
+}
+
+// incTaskTracker is upstream's.
+func (c *physicalTaskQueueManagerImpl) incTaskTracker(
+	intervals map[priorityKey]*taskTracker,
+	priorityKey priorityKey,
+	n int,
+) {
+	if priorityKey == 0 {
+		priorityKey = c.config.DefaultPriorityKey
+	}
+
+	c.taskTrackerLock.Lock()
+	defer c.taskTrackerLock.Unlock()
+
+	tracker, ok := intervals[priorityKey]
+	if !ok {
+		// Initialize all task trackers together; or the timeframes won't line up.
+		c.tasksAdded[priorityKey] = c.partitionMgr.engine.newTaskTracker()
+		c.tasksDispatched[priorityKey] = c.partitionMgr.engine.newTaskTracker()
+		tracker = intervals[priorityKey]
+	}
+	tracker.inc(n)
+}
+
+// statsByPriority is upstream GetStatsByPriority(includeRates=true), with backlog stats from
+// the backlog manager. Keys are priority keys.
+func (c *physicalTaskQueueManagerImpl) statsByPriority() map[int32]*QueueStats {
+	stats := c.backlogMgr.BacklogStatsByPriority()
+	c.taskTrackerLock.Lock()
+	for pri, tt := range c.tasksAdded {
+		getOrSetNewStats(stats, int32(pri)).TasksAddRate = tt.rate()
+	}
+	for pri, tt := range c.tasksDispatched {
+		getOrSetNewStats(stats, int32(pri)).TasksDispatchRate = tt.rate()
+	}
+	rateLimitingActive := c.tasksRateLimited.rate() > 0
+	c.taskTrackerLock.Unlock()
+	for _, s := range stats {
+		s.RateLimitingActive = rateLimitingActive
+	}
+	return stats
+}
+
+func getOrSetNewStats(m map[int32]*QueueStats, k int32) *QueueStats {
+	s, ok := m[k]
+	if !ok {
+		s = &QueueStats{}
+		m[k] = s
+	}
+	return s
 }
 
 // UserDataChanged is upstream's: re-match in-matcher tasks after a config change (this is

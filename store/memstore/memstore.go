@@ -6,7 +6,9 @@
 package memstore
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sync"
@@ -25,6 +27,7 @@ const (
 	OpCreateTasks           = "CreateTasks"
 	OpGetTasks              = "GetTasks"
 	OpCompleteTasksLessThan = "CompleteTasksLessThan"
+	OpListQueues            = "ListQueues"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -40,7 +43,10 @@ type queueRow struct {
 	subqueues map[int]*btree.BTreeG[store.TaskInfo]
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store       = (*Store)(nil)
+	_ store.QueueLister = (*Store)(nil)
+)
 
 // New returns an empty store.
 func New() *Store {
@@ -319,4 +325,49 @@ func cloneInfo(in *store.QueueInfo) *store.QueueInfo {
 		out.Subqueues[i] = sq
 	}
 	return &out
+}
+
+func compareKeys(a, b store.QueueKey) int {
+	return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name), cmp.Compare(a.Partition, b.Partition))
+}
+
+// ListQueues pages through queues in (Namespace, Name, Partition) order. The page token is
+// the last key returned, so queues created or deleted during a listing do not shift pages.
+func (s *Store) ListQueues(ctx context.Context, req *store.ListQueuesRequest) (*store.ListQueuesResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if req.PageSize <= 0 {
+		return nil, &store.InvalidArgumentError{Msg: fmt.Sprintf("ListQueues: PageSize %d must be positive", req.PageSize)}
+	}
+	var after *store.QueueKey
+	if len(req.PageToken) > 0 {
+		after = new(store.QueueKey)
+		if err := json.Unmarshal(req.PageToken, after); err != nil {
+			return nil, &store.InvalidArgumentError{Msg: "ListQueues: invalid page token"}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpListQueues); err != nil {
+		return nil, err
+	}
+	keys := make([]store.QueueKey, 0, len(s.queues))
+	for k := range s.queues {
+		if after == nil || compareKeys(k, *after) > 0 {
+			keys = append(keys, k)
+		}
+	}
+	slices.SortFunc(keys, compareKeys)
+	resp := &store.ListQueuesResponse{}
+	for i, k := range keys {
+		if i == req.PageSize {
+			tok, _ := json.Marshal(keys[i-1])
+			resp.NextPageToken = tok
+			break
+		}
+		q := s.queues[k]
+		resp.Queues = append(resp.Queues, store.ListedQueue{RangeID: q.rangeID, Info: cloneInfo(q.info)})
+	}
+	return resp, nil
 }

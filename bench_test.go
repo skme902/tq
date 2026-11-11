@@ -6,11 +6,15 @@ package taskqueue_test
 // first, so most tasks are handed over in memory and never touch the store.
 //
 //	go test -run '^$' -bench BenchmarkEngine -benchtime 5000x -count 5 .
+//
+// TQ_BENCH_METRICS=counting swaps the default no-op metrics handler for benchCountingMetrics, to
+// measure what emitting the per-queue metrics costs when a handler actually records them.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +22,7 @@ import (
 
 	taskqueue "github.com/skme902/tq"
 	"github.com/skme902/tq/internal/testdb"
+	"github.com/skme902/tq/metrics"
 	"github.com/skme902/tq/store"
 	"github.com/skme902/tq/store/sqlite"
 )
@@ -30,6 +35,30 @@ func benchKinds() []testdb.Kind {
 }
 
 var benchSeq atomic.Int64
+
+// benchCountingMetrics is a cheap recording handler: one atomic add per call plus a pass over the
+// tags, roughly what a Prometheus/OTel handler with pre-resolved series costs.
+type benchCountingMetrics struct{ calls, tags atomic.Int64 }
+
+func (c *benchCountingMetrics) record(tags []metrics.Tag) {
+	n := 0
+	for _, t := range tags {
+		n += len(t.Key) + len(t.Value)
+	}
+	c.calls.Add(1)
+	c.tags.Add(int64(n))
+}
+func (c *benchCountingMetrics) Counter(_ string, _ int64, tags ...metrics.Tag)       { c.record(tags) }
+func (c *benchCountingMetrics) Gauge(_ string, _ float64, tags ...metrics.Tag)       { c.record(tags) }
+func (c *benchCountingMetrics) Timer(_ string, _ time.Duration, tags ...metrics.Tag) { c.record(tags) }
+
+func benchMetrics() (metrics.Handler, *benchCountingMetrics) {
+	if os.Getenv("TQ_BENCH_METRICS") == "counting" {
+		c := &benchCountingMetrics{}
+		return c, c
+	}
+	return metrics.Noop, nil
+}
 
 // countingStore counts task rows written and read, to confirm which path a run exercised.
 type countingStore struct {
@@ -68,7 +97,8 @@ func BenchmarkEngine(b *testing.B) {
 				mode, producers := m.mode, m.producers
 				b.Run(fmt.Sprintf("%s-p%d", mode, producers), func(b *testing.B) {
 					st := &countingStore{Store: raw}
-					e, err := taskqueue.New(taskqueue.Options{Store: st})
+					mh, counting := benchMetrics()
+					e, err := taskqueue.New(taskqueue.Options{Store: st, Metrics: mh})
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -173,6 +203,9 @@ func BenchmarkEngine(b *testing.B) {
 						b.ReportMetric(float64(st.written.Load()-w0)/float64(c), "rows/commit")
 					}
 					b.ReportMetric(100*float64(syncMatched.Load())/float64(b.N), "sync%")
+					if counting != nil {
+						b.ReportMetric(float64(counting.calls.Load())/float64(b.N), "metric-calls/task")
+					}
 					b.ReportMetric(0, "ns/op") // wall time above is the real figure; ns/op includes the park sleep
 				})
 			}

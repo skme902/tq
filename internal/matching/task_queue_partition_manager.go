@@ -10,6 +10,8 @@ package matching
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
+	"time"
 
 	"github.com/skme902/tq/metrics"
 	"github.com/skme902/tq/store"
@@ -26,16 +28,23 @@ type taskQueuePartitionManagerImpl struct {
 	rateLimitManager *rateLimitManager
 
 	defaultQueue *physicalTaskQueueManagerImpl
+
+	// metricsCtx ends the periodic backlog-metrics emission (upstream initCtx).
+	metricsCtx    context.Context
+	metricsCancel context.CancelFunc
 }
 
 func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *taskQueueConfig) *taskQueuePartitionManagerImpl {
+	handler, breakdown := e.queueMetricsHandler(partition)
+	config.BreakdownMetricsByTaskQueue = breakdown
 	pm := &taskQueuePartitionManagerImpl{
 		engine:         e,
 		partition:      partition,
 		config:         config,
 		logger:         e.logger.With("queue", partition.String()),
-		metricsHandler: e.metricsHandler,
+		metricsHandler: handler,
 	}
+	pm.metricsCtx, pm.metricsCancel = context.WithCancel(context.Background())
 	pm.rateLimitManager = newRateLimitManager(e.configSource, partition, config, e.timeSource)
 	pm.defaultQueue = newPhysicalTaskQueueManager(pm, partition)
 	return pm
@@ -46,11 +55,60 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 	// initial user data load (upstream: userDataManager.Start -> onUserDataChanged)
 	pm.rateLimitManager.UserDataChanged()
 	pm.defaultQueue.Start()
+	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 {
+		go pm.emitLogicalBacklogMetrics(pm.metricsCtx)
+	}
 }
 
 func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
+	pm.metricsCancel()
 	pm.rateLimitManager.Stop()
 	pm.defaultQueue.Stop(unloadCause)
+	pm.emitZeroLogicalBacklog()
+}
+
+// emitLogicalBacklogMetrics is upstream's loop: every BacklogMetricsEmitInterval (±5% jitter,
+// upstream backoff.Jitter(interval, 0.05)) emit the live per-priority backlog stats.
+func (pm *taskQueuePartitionManagerImpl) emitLogicalBacklogMetrics(ctx context.Context) {
+	for {
+		interval := pm.config.BacklogMetricsEmitInterval
+		d := time.Duration(float64(interval) * (0.95 + 0.1*rand.Float64()))
+		ch, t := pm.engine.timeSource.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-ch:
+			pm.fetchAndEmitLogicalBacklogMetrics()
+		}
+	}
+}
+
+// fetchAndEmitLogicalBacklogMetrics is upstream's without version attribution: the backlog
+// count per task_priority and the backlog age (oldest across priorities) from the same stats
+// DescribeQueue returns.
+func (pm *taskQueuePartitionManagerImpl) fetchAndEmitLogicalBacklogMetrics() {
+	if !pm.config.BreakdownMetricsByTaskQueue || !pm.defaultQueue.backlogMgr.isInitialized() {
+		return
+	}
+	var age time.Duration
+	for pri, stats := range pm.defaultQueue.backlogMgr.BacklogStatsByPriority() {
+		pm.metricsHandler.Gauge(metrics.ApproximateBacklogCount, float64(stats.ApproximateBacklogCount), metrics.TaskPriorityTag(pri))
+		age = max(age, stats.ApproximateBacklogAge)
+	}
+	pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, age.Seconds())
+}
+
+// emitZeroLogicalBacklog is upstream emitZeroLogicalBacklogForQueue: zero the gauges on unload
+// so stale values do not persist.
+func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog() {
+	if !pm.config.BreakdownMetricsByTaskQueue || pm.config.BacklogMetricsEmitInterval <= 0 {
+		return
+	}
+	for pri := range pm.defaultQueue.backlogMgr.BacklogStatsByPriority() {
+		pm.metricsHandler.Gauge(metrics.ApproximateBacklogCount, 0, metrics.TaskPriorityTag(pri))
+	}
+	pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, 0)
 }
 
 // userDataChanged is called on QueueConfigWatcher notifications.

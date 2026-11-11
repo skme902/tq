@@ -35,6 +35,8 @@ type Delivery struct {
 	task   *internalTask
 	timer  clock.Timer
 
+	deliveredAt time.Time
+
 	mu       sync.Mutex
 	settled  bool
 	lostErr  error // returned by Ack/Nack/ExtendLease once settled
@@ -50,6 +52,7 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
 	}
+	now := e.timeSource.Now()
 	d := &Delivery{
 		Queue:       queue,
 		Task:        task.event.Data,
@@ -57,7 +60,8 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		engine:      e,
 		pqm:         pqm,
 		task:        task,
-		deadline:    e.timeSource.Now().Add(lease),
+		deliveredAt: now,
+		deadline:    now.Add(lease),
 	}
 	if !d.SyncMatched {
 		d.TaskID = task.event.ID
@@ -86,7 +90,31 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		// RecordTaskStarted succeeds).
 		task.finish(taskFinishResult{consumedToken: true})
 	}
+	emitDispatchLatency(pqm.metricsHandler, task, now)
 	return d, nil
+}
+
+// emitDispatchLatency is upstream's poll-time emission (matching.emitTaskDispatchLatencyAtPoll,
+// default true): task create time to the successful start, plus asyncmatch_latency for backlog
+// tasks (upstream emits that at RecordTaskStarted).
+func emitDispatchLatency(h metrics.Handler, task *internalTask, now time.Time) {
+	ct := task.event.Data.CreateTime
+	if ct.IsZero() || h == metrics.Noop {
+		return // zero: should not happen but for safety; Noop: skip building the tag slice
+	}
+	lat := now.Sub(ct)
+	source := metrics.SourceDBBacklog
+	if task.isSyncMatchTask() {
+		source = metrics.SourceHistory
+	}
+	h.Timer(metrics.TaskDispatchLatency, lat,
+		metrics.Tag{Key: metrics.TagSource, Value: source},
+		metrics.Tag{Key: metrics.TagForwarded, Value: "false"},
+		metrics.TaskPriorityTag(task.getPriority().PriorityKey),
+	)
+	if !task.isSyncMatchTask() {
+		h.Timer(metrics.AsyncMatchLatency, lat)
+	}
 }
 
 func (d *Delivery) arm(lease time.Duration) {
@@ -148,6 +176,9 @@ func (d *Delivery) Ack() error {
 	if !d.SyncMatched {
 		d.task.finish(taskFinishResult{consumedToken: true})
 	}
+	h := d.pqm.metricsHandler
+	h.Counter(metrics.DeliveryAcked, 1)
+	h.Timer(metrics.DeliveryAckLatency, d.engine.timeSource.Since(d.deliveredAt))
 	return nil
 }
 
@@ -158,6 +189,7 @@ func (d *Delivery) Nack() error {
 	}
 	d.stopTimer()
 	d.release()
+	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
 	d.redeliver(errNacked)
 	return nil
 }
@@ -174,6 +206,7 @@ func (d *Delivery) ExtendLease(dur time.Duration) error {
 	}
 	d.deadline = d.engine.timeSource.Now().Add(dur)
 	d.timer.Reset(dur)
+	d.pqm.metricsHandler.Counter(metrics.DeliveryLeaseExtended, 1)
 	return nil
 }
 
@@ -188,7 +221,7 @@ func (d *Delivery) expire() {
 	d.settled = true
 	d.lostErr = ErrLeaseLost
 	d.mu.Unlock()
-	d.engine.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
+	d.pqm.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
 	d.release()
 	go d.redeliver(errLeaseExpired) // not under the timer callback
 }
