@@ -217,10 +217,12 @@ http.Handle("/", health.Handler(engine, health.Options{Timeout: 2 * time.Second}
   schema is current (`SchemaVersion >= WantSchemaVersion`: the newest migration the build embeds).
   A schema *ahead* of the build counts as current on purpose: migrations are additive, so during a
   rolling deploy old binaries keep serving after a newer one migrated. There is no exact-match mode.
-  The store probe has its own 2s deadline even if the caller's context has none, and is skipped
+  The store probe uses the caller's deadline (for `/readyz`, `Options.Timeout`), or 2s if the
+  caller's context has none, and is skipped
   once the engine is draining or stopped (readiness is re-checked after the probe, so a drain that
   starts mid-probe still reports unready). On SQLite the probe uses the read pool, so a long write
-  does not make the engine unready; a broken writer shows up as `Degraded` queues instead.
+  does not make the engine unready; a writer that returns errors shows up as `Degraded` queues
+  instead. A write that hangs without returning is not detected by either.
   Stores opt in with `store.HealthChecker` (memstore, sqlite and postgres do); for another store
   only liveness and draining count.
 - `Degraded` lists loaded queues that saw a persistence error in the last minute

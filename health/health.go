@@ -24,7 +24,8 @@ type Checker interface {
 
 // Options configures Handler.
 type Options struct {
-	// Timeout bounds the store probe of /readyz (default 2s).
+	// Timeout bounds the store probe of /readyz (default 2s). It is passed to Engine.Health as
+	// the request deadline, so it may be longer or shorter than the engine's own 2s default.
 	Timeout time.Duration
 }
 

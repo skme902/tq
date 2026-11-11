@@ -79,7 +79,10 @@ type Store struct {
 	w, r *sql.DB
 }
 
-var _ store.Store = (*Store)(nil)
+var (
+	_ store.Store         = (*Store)(nil)
+	_ store.HealthChecker = (*Store)(nil)
+)
 
 // Open opens (creating if needed) the database file at path. In-memory databases are not
 // supported (the writer and reader pools must see the same database); use store/memstore.

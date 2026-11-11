@@ -55,6 +55,7 @@ var (
 	_ store.Store           = (*Store)(nil)
 	_ store.QueueLister     = (*Store)(nil)
 	_ store.DeadLetterStore = (*Store)(nil)
+	_ store.HealthChecker   = (*Store)(nil)
 )
 
 // New returns an empty store.
