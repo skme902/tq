@@ -35,6 +35,7 @@ const (
 	OpCountDeadTasks        = "CountDeadTasks"
 	OpDeleteTask            = "DeleteTask"
 	OpCheckHealth           = "CheckHealth"
+	OpDeleteQueueIfIdle     = "DeleteQueueIfIdle"
 )
 
 // Store is an in-memory store.Store. The zero value is not usable; call New.
@@ -55,6 +56,7 @@ var (
 	_ store.Store           = (*Store)(nil)
 	_ store.QueueLister     = (*Store)(nil)
 	_ store.DeadLetterStore = (*Store)(nil)
+	_ store.QueueSweeper    = (*Store)(nil)
 	_ store.HealthChecker   = (*Store)(nil)
 )
 
@@ -173,6 +175,49 @@ func (s *Store) DeleteQueue(ctx context.Context, req *store.DeleteQueueRequest) 
 	}
 	delete(s.queues, req.Key)
 	return nil
+}
+
+// DeleteQueueIfIdle implements store.QueueSweeper.
+func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfIdleRequest) (bool, error) {
+	if err := ctxErr(ctx); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.faultLocked(OpDeleteQueueIfIdle); err != nil {
+		return false, err
+	}
+	q, ok := s.queues[req.Key]
+	if !ok || q.rangeID != req.RangeID || len(q.dead) > 0 {
+		return false, nil
+	}
+	if !req.IdleBefore.IsZero() && (q.info == nil || !q.info.LastUpdateTime.Before(req.IdleBefore)) {
+		return false, nil
+	}
+	for sq, tree := range q.subqueues {
+		var ack store.Level
+		if q.info != nil && sq < len(q.info.Subqueues) {
+			ack = q.info.Subqueues[sq].FairAckLevel
+		}
+		live := false
+		// Ascend from the ack level itself (ack.ID+1 would overflow at MaxInt64) and skip a
+		// row exactly at it: live means strictly above, as in SQL (pass, task_id) > ack.
+		tree.Ascend(store.TaskInfo{Pass: ack.Pass, ID: ack.ID}, func(ti store.TaskInfo) bool {
+			if ti.Pass == ack.Pass && ti.ID == ack.ID {
+				return true
+			}
+			if !req.Now.IsZero() && ti.Data.ExpiryTime.Unix() > 0 && ti.Data.ExpiryTime.Before(req.Now) {
+				return true // expired: goes with the queue
+			}
+			live = true
+			return false
+		})
+		if live {
+			return false, nil
+		}
+	}
+	delete(s.queues, req.Key)
+	return true, nil
 }
 
 func (s *Store) CreateTasks(ctx context.Context, req *store.CreateTasksRequest) (*store.CreateTasksResponse, error) {

@@ -304,6 +304,36 @@ type DeadLetterStore interface {
 	CountDeadTasks(ctx context.Context, key QueueKey) (int64, error)
 }
 
+// DeleteQueueIfIdleRequest asks to delete a queue only if nobody took it over since it was
+// listed and it holds no work.
+type DeleteQueueIfIdleRequest struct {
+	Key QueueKey
+	// RangeID must equal the stored rangeID (the value ListQueues returned).
+	RangeID int64
+	// IdleBefore, if non-zero, also requires the stored QueueInfo.LastUpdateTime to be
+	// before it, checked in the same transaction (so an owner that wrote after the listing
+	// keeps its queue).
+	IdleBefore time.Time
+	// Now, if non-zero, makes a task above the ack level count as live only while it has not
+	// expired (ExpiryTime unset or not before Now, the reader's rule), so a queue holding only
+	// expired tasks is deleted with them. Zero: every row above the ack level is live.
+	Now time.Time
+}
+
+// QueueSweeper is implemented by stores that can delete idle queues (memstore, sqlite and
+// postgres do).
+type QueueSweeper interface {
+	// DeleteQueueIfIdle atomically deletes the queue row and its task rows if the stored
+	// rangeID equals req.RangeID, the row is idle per req.IdleBefore, no live task row lies
+	// above its subqueue's FairAckLevel (rows at or below it are already acked and only wait
+	// for GC; with req.Now set, an expired row is not live and is deleted with the queue), and
+	// the queue has no dead tasks. It reports whether it deleted the queue; a missing queue, a
+	// rangeID mismatch or live work return (false, nil). A task row that cannot be decoded
+	// while checking expiry returns an InvalidArgumentError naming it, and the queue is kept.
+	// The expiry check reads every row above the ack level inside the delete transaction.
+	DeleteQueueIfIdle(ctx context.Context, req *DeleteQueueIfIdleRequest) (bool, error)
+}
+
 // Less reports whether a < b lexicographically by (Pass, ID).
 func (a Level) Less(b Level) bool {
 	return a.Pass < b.Pass || a.Pass == b.Pass && a.ID < b.ID

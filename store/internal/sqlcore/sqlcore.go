@@ -65,6 +65,7 @@ var (
 	_ store.Store           = (*Store)(nil)
 	_ store.QueueLister     = (*Store)(nil)
 	_ store.DeadLetterStore = (*Store)(nil)
+	_ store.QueueSweeper    = (*Store)(nil)
 )
 
 type queries struct {
@@ -74,6 +75,7 @@ type queries struct {
 	listQueuesFirst, listQueuesAfter                                                   string
 	updateTask, deleteTask, insertDead, listDeadFirst, listDeadAfter, deleteDeadBefore string
 	countDead, deleteAllDead                                                           string
+	taskSubqueues, liveTaskExists, liveTaskRows, deadExists                            string
 }
 
 // New returns a Store that writes through w and reads through r (r may be nil to use w).
@@ -132,6 +134,10 @@ func buildQueries(d Dialect) queries {
 		deleteDeadBefore: `DELETE FROM tq_dead_tasks WHERE ` + queueKey + ` AND dead_time < ?`,
 		countDead:        `SELECT COUNT(*) FROM tq_dead_tasks WHERE ` + queueKey,
 		deleteAllDead:    `DELETE FROM tq_dead_tasks WHERE ` + queueKey,
+		taskSubqueues:    `SELECT DISTINCT subqueue FROM tq_tasks WHERE ` + queueKey,
+		liveTaskExists:   `SELECT 1 FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?) LIMIT 1`,
+		liveTaskRows:     `SELECT pass, task_id, data, data_encoding FROM tq_tasks WHERE ` + taskKey + ` AND (pass, task_id) > (?, ?) ORDER BY pass, task_id`,
+		deadExists:       `SELECT 1 FROM tq_dead_tasks WHERE ` + queueKey + ` LIMIT 1`,
 	}
 	if d.RowRef != "" {
 		q.rangeDelete = `DELETE FROM tq_tasks WHERE ` + taskKey + ` AND ` + d.RowRef + ` = ANY(ARRAY(` +
@@ -139,6 +145,7 @@ func buildQueries(d Dialect) queries {
 			` AND (pass, task_id) < (?, ?) ORDER BY pass, task_id LIMIT ?))`
 	}
 	if d.NumberedPlaceholders {
+		// TestNumberedQueriesHaveNoQuestionMarks fails if a query is missing here.
 		q.insertQueue = rebind(q.insertQueue, 0)
 		q.getQueue = rebind(q.getQueue, 0)
 		q.lockQueue = rebind(q.lockQueue, 0)
@@ -159,6 +166,10 @@ func buildQueries(d Dialect) queries {
 		q.deleteDeadBefore = rebind(q.deleteDeadBefore, 0)
 		q.countDead = rebind(q.countDead, 0)
 		q.deleteAllDead = rebind(q.deleteAllDead, 0)
+		q.taskSubqueues = rebind(q.taskSubqueues, 0)
+		q.liveTaskExists = rebind(q.liveTaskExists, 0)
+		q.liveTaskRows = rebind(q.liveTaskRows, 0)
+		q.deadExists = rebind(q.deadExists, 0)
 	}
 	return q
 }
@@ -396,6 +407,138 @@ func (s *Store) UpdateQueue(ctx context.Context, req *store.UpdateQueueRequest) 
 
 // DeleteQueue deletes the queue row and, unlike upstream (which leaves task rows to TTL /
 // the scavenger), all of its tasks, matching the store contract.
+// DeleteQueueIfIdle implements store.QueueSweeper in one transaction that holds the queue row
+// lock, so a concurrent fenced write (which takes the same lock) either commits first and is
+// seen as live work or fails its rangeID check afterwards.
+func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfIdleRequest) (bool, error) {
+	id, hash := queueIDAndHash(req.Key)
+	deleted := false
+	err := s.txExecute(ctx, "DeleteQueueIfIdle", func(tx *sql.Tx) error {
+		var rangeID int64
+		err := tx.QueryRowContext(ctx, s.q.lockQueue, int64(hash), id).Scan(&rangeID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return err
+		case rangeID != req.RangeID:
+			return nil
+		}
+		var one int
+		switch err := tx.QueryRowContext(ctx, s.q.deadExists, int64(hash), id).Scan(&one); {
+		case err == nil:
+			return nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		var (
+			data []byte
+			enc  string
+		)
+		if err := tx.QueryRowContext(ctx, s.q.getQueue, int64(hash), id).Scan(&rangeID, &data, &enc); err != nil {
+			return err
+		}
+		info, err := decodeInfo(data, enc)
+		if err != nil {
+			return err
+		}
+		if !req.IdleBefore.IsZero() && !info.LastUpdateTime.Before(req.IdleBefore) {
+			return nil
+		}
+		rows, err := tx.QueryContext(ctx, s.q.taskSubqueues, int64(hash), id)
+		if err != nil {
+			return err
+		}
+		var subqueues []int
+		for rows.Next() {
+			var sq int
+			if err := rows.Scan(&sq); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			subqueues = append(subqueues, sq)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, sq := range subqueues {
+			var ack store.Level
+			if sq < len(info.Subqueues) {
+				ack = info.Subqueues[sq].FairAckLevel
+			}
+			if !req.Now.IsZero() {
+				live, err := s.unexpiredTaskAbove(ctx, tx, int64(hash), id, sq, ack, req.Now)
+				if err != nil {
+					return err
+				}
+				if live {
+					return nil
+				}
+				continue
+			}
+			switch err := tx.QueryRowContext(ctx, s.q.liveTaskExists, int64(hash), id, sq, ack.Pass, ack.ID).Scan(&one); {
+			case err == nil:
+				return nil
+			case !errors.Is(err, sql.ErrNoRows):
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, s.q.deleteAllTasks, int64(hash), id); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, s.q.deleteQueue, int64(hash), id, req.RangeID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = n > 0
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
+}
+
+// unexpiredTaskAbove reports whether subqueue sq has a task above ack that has not expired at
+// now, scanning in level order and stopping at the first unexpired row. A row that cannot be
+// decoded is an InvalidArgumentError: the queue is kept and the sweep reports why.
+func (s *Store) unexpiredTaskAbove(ctx context.Context, tx *sql.Tx, hash int64, id []byte, sq int, ack store.Level, now time.Time) (bool, error) {
+	rows, err := tx.QueryContext(ctx, s.q.liveTaskRows, hash, id, sq, ack.Pass, ack.ID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			pass, taskID int64
+			data         []byte
+			enc          string
+			t            store.Task
+		)
+		if err := rows.Scan(&pass, &taskID, &data, &enc); err != nil {
+			return false, err
+		}
+		// A corrupt row keeps the queue, and says so instead of leaving it silently.
+		if enc != DataEncoding {
+			return false, &store.InvalidArgumentError{Msg: fmt.Sprintf("DeleteQueueIfIdle: task %d (pass %d): unsupported data_encoding %q", taskID, pass, enc)}
+		}
+		if err := json.Unmarshal(data, &t); err != nil {
+			return false, &store.InvalidArgumentError{Msg: fmt.Sprintf("DeleteQueueIfIdle: task %d (pass %d): decode: %v", taskID, pass, err)}
+		}
+		if !(t.ExpiryTime.Unix() > 0 && t.ExpiryTime.Before(now)) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 func (s *Store) DeleteQueue(ctx context.Context, req *store.DeleteQueueRequest) error {
 	id, hash := queueIDAndHash(req.Key)
 	return s.txExecute(ctx, "DeleteQueue", func(tx *sql.Tx) error {

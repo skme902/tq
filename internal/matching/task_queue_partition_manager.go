@@ -37,6 +37,8 @@ type taskQueuePartitionManagerImpl struct {
 	// maxAttempts is the effective QueueConfig.MaxAttempts / Config.MaxAttempts (0 =
 	// unlimited), refreshed on load and on every config notification.
 	maxAttempts atomic.Int32
+	// maxTaskAge is the effective QueueConfig.MaxTaskAge / Config.MaxTaskAge (0 = no cap).
+	maxTaskAge atomic.Int64
 }
 
 func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *taskQueueConfig) *taskQueuePartitionManagerImpl {
@@ -54,6 +56,8 @@ func newTaskQueuePartitionManager(e *Engine, partition store.QueueKey, config *t
 	pm.defaultQueue = newPhysicalTaskQueueManager(pm, partition)
 	// The engine default is the limit a negative QueueConfig override must not replace.
 	pm.maxAttempts.Store(config.MaxAttempts)
+	// Same for MaxTaskAge: a negative override on the first refresh keeps the engine default.
+	pm.maxTaskAge.Store(int64(max(config.MaxTaskAge, 0)))
 	return pm
 }
 
@@ -131,6 +135,25 @@ func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
 // the upstream ones). A negative MaxAttempts override is ignored: 0 already means unlimited, so
 // clamping a negative value would drop the queue's limit.
 func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
+	pm.refreshMaxAttempts()
+	age := pm.config.MaxTaskAge
+	if src := pm.engine.configSource; src != nil {
+		if v := src.QueueConfig(pm.partition).MaxTaskAge; v != nil {
+			if *v < 0 {
+				// Same as MaxAttempts: a negative override is ignored, not read as "off".
+				pm.logger.Warn("ignoring negative QueueConfig.MaxTaskAge; keeping the previous cap",
+					"max_task_age", *v, "cap", time.Duration(pm.maxTaskAge.Load()))
+				return
+			}
+			age = *v
+		}
+	}
+	pm.maxTaskAge.Store(int64(max(age, 0)))
+}
+
+// refreshMaxAttempts is split out so that an ignored negative MaxAttempts does not also skip
+// the MaxTaskAge refresh.
+func (pm *taskQueuePartitionManagerImpl) refreshMaxAttempts() {
 	n := pm.config.MaxAttempts
 	if src := pm.engine.configSource; src != nil {
 		if v := src.QueueConfig(pm.partition).MaxAttempts; v != nil {

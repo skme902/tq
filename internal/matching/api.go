@@ -6,6 +6,7 @@ package matching
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/skme902/tq/store"
 )
@@ -58,6 +59,9 @@ type (
 		// MaxAttempts overrides Config.MaxAttempts for this queue (library addition). nil means
 		// the Config value; 0 means unlimited.
 		MaxAttempts *int32
+		// MaxTaskAge overrides Config.MaxTaskAge for this queue (library addition). nil means
+		// the Config value; 0 means no cap.
+		MaxTaskAge *time.Duration
 	}
 
 	// QueueConfigSource replaces userDataManager for per-queue config. A loaded queue reads

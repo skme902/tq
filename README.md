@@ -301,6 +301,45 @@ d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was 
   `tasks_redriven`, `task_attempt_record_failures`. There is no dead-letter gauge: poll
   `DescribeQueue().DeadTasks`, which is a `COUNT` query.
 
+## Retention
+
+Queue rows are never deleted on their own (upstream relies on a persistence TTL that normal
+partitions do not have). Sweep idle ones from a routine or one elected process:
+
+```go
+res, err := engine.SweepIdleQueues(ctx, taskqueue.SweepOptions{
+	IdleFor:           7 * 24 * time.Hour, // at least taskqueue.MinSweepIdle (48h)
+	MaxDeletes:        1000,               // 0 = no cap
+	DeadTaskRetention: 14 * 24 * time.Hour, // optional: also delete older dead tasks
+})
+```
+
+- A queue is deleted only when it is not loaded on this Engine, its row was not written for
+  `IdleFor`, it has no unexpired task above its ack level (expired tasks are deleted with the
+  queue, so an abandoned queue of expired tasks is reclaimed), and it has no dead tasks. The
+  expiry check reads the rows above the ack level inside the delete transaction, so a huge
+  expired backlog holds SQLite's single writer while it runs. A queue whose task row cannot be
+  decoded is kept and listed in `SweepResult.Corrupt`. The check and the
+  delete are one store transaction conditioned on the listed rangeID and the idle time
+  (`store.QueueSweeper.DeleteQueueIfIdle`), so a queue another process loaded or wrote since
+  the listing is kept. The sweep never loads or takes over a queue.
+- `MinSweepIdle` is 48h. A loaded queue rewrites its row at least every 12h (plus one
+  `UpdateAckInterval`) even when idle, and 48h tolerates a missed rewrite, the same grace as
+  upstream's scavenger. A shorter window could delete a row under a quiet owner elsewhere, which
+  would then share rangeID 1 with whoever recreates the queue.
+- `DeadTaskRetention` deletes dead tasks older than it from **every listed queue**, loaded or
+  not, before the idle check, so it is also how dead letters age out of active queues. It is not
+  part of the queue delete transaction: a crash in between leaves the queue without those dead
+  tasks, which is the same end state the next sweep reaches.
+- A swept queue is recreated empty by its next AddTask or PollTask. A process that was loading
+  it at that instant may see one transient condition-failed error.
+- `Config.MaxTaskAge` (per queue: `QueueConfig.MaxTaskAge`, `MemoryQueueConfigSource.SetMaxTaskAge`)
+  caps each new task's `ExpiryTime` at AddTask time + the age; expired tasks are dropped like any
+  task past its expiry. It applies to tasks added after it is set. A redriven dead task gets a
+  fresh window from the redrive (an expiry already past is replaced). A negative per-queue value
+  is ignored with a warning (the previous cap stays). Default 0: no cap.
+- Metrics (engine-level): `queues_swept`, `dead_tasks_expired`.
+
 ## Task admin
 
 ```go

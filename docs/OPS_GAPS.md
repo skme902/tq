@@ -43,7 +43,7 @@ Reference points:
 | 5 | Pause and resume of a queue or a fairness key | P1 | M |
 | 6 | Shared, persisted runtime config with an audit trail | P1 | M–L |
 | 7 | Health and readiness checks — **done** (feat/ops-health) | P1 | S |
-| 8 | Retention and GC of idle queue rows and expired tasks | P1 | S–M |
+| 8 | Retention and GC of idle queue rows and expired tasks — **done** (feat/ops-retention) | P1 | S–M |
 | 9 | Dashboards and alert rules (Grafana JSON, Prometheus rules) | P1 | S |
 | 10 | Admin HTTP endpoint and CLI | P1 | M |
 | 11 | Multi-instance ownership visibility and force-unload | P1 | S–M |
@@ -256,7 +256,29 @@ lease flags were not built; see the status above.
     `condition_failed` storm).
   - Add an `http.Handler` with `/livez` and `/readyz` in an `admin` subpackage (10).
 
-## 8. Retention and GC — P1, S–M
+## 8. Retention and GC — P1, S–M — done
+
+**Status: implemented in feat/ops-retention** (README §Retention): `Engine.SweepIdleQueues(ctx, SweepOptions)`,
+`store.QueueSweeper.DeleteQueueIfIdle`, `Config.MaxTaskAge`/`QueueConfig.MaxTaskAge`, and dead-task retention via
+`SweepOptions.DeadTaskRetention`. Refinements over the design below:
+- "Empty" means no unexpired task row above each subqueue's ack level (rows at or below it only await GC, and
+  expired rows go with the queue), checked in the delete transaction. Unlike upstream's scavenger, which deletes
+  expired tasks in id order even when a later unexpired task keeps the queue, expired rows are removed only when
+  every task above the ack level has expired and the queue itself is deleted; a mixed backlog keeps its expired rows
+  until the reader and ack GC reach them. The expiry check reads every row above the ack level inside the delete
+  transaction (on SQLite, the single writer), so sweeping a queue with a very large expired backlog holds writes
+  for that long. The check uses the rows, not the approximate backlog count, which can stay stale after a crash.
+- The delete is also conditioned on `LastUpdateTime < now - IdleFor` in the same transaction, and `IdleFor` must be
+  at least 48h: a loaded queue rewrites its row only every 12h (48h tolerates a missed rewrite, as upstream's
+  scavenger does), and a deleted-then-recreated queue restarts at
+  rangeID 1, so a shorter window could leave a quiet owner and a new owner on the same rangeID.
+- Queues with dead tasks are kept; `DeadTaskRetention` ages those out first.
+- `MaxTaskAge` is applied at AddTask (as an `ExpiryTime` cap) instead of in the reader, so the upstream read path is
+  untouched; it covers tasks added after it is set.
+
+Original analysis (superseded by the status above and README §Retention; in particular `MaxTaskAge` is applied at AddTask
+and redrive, not by the reader):
+
 
 - **Today.**
   - Acked tasks are deleted by ack-level GC (`maybeGC`, batch deletes).

@@ -71,6 +71,9 @@ type (
 	RedriveOptions = matching.RedriveOptions
 	// NackOption configures Delivery.Nack.
 	NackOption = matching.NackOption
+	// SweepOptions configures Engine.SweepIdleQueues; SweepResult is what it did.
+	SweepOptions = matching.SweepOptions
+	SweepResult  = matching.SweepResult
 	// HealthReport is Engine.Health's result.
 	HealthReport = matching.HealthReport
 	// QueueProblem is one degraded queue in a HealthReport.
@@ -144,6 +147,9 @@ func Retryable(err error) error { return matching.Retryable(err) }
 
 // NackReason records why a consumer gave up on a task; it is kept if the Nack dead-letters it.
 func NackReason(reason string) NackOption { return matching.NackReason(reason) }
+
+// MinSweepIdle is the shortest SweepOptions.IdleFor accepted.
+const MinSweepIdle = matching.MinSweepIdle
 
 // Dead-letter reasons (DeadTask.Reason prefix, tasks_dead_lettered "reason" tag).
 const (

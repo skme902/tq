@@ -66,6 +66,9 @@ type Engine struct {
 	partitionsLock sync.RWMutex
 	partitions     map[store.QueueKey]*taskQueuePartitionManagerImpl
 	stopped        bool
+	// sweeping holds the queues SweepIdleQueues is deleting (guarded by partitionsLock); a load
+	// of one waits for its channel to close.
+	sweeping map[store.QueueKey]chan struct{}
 
 	// leases holds every outstanding Delivery (backlog and sync-matched). leasesClosed is set
 	// under leasesLock when Shutdown decides the drain is over and when Stop snapshots leases;
@@ -562,6 +565,20 @@ func (e *Engine) getTaskQueuePartitionManager(
 
 	// If it gets here, write lock and check again in case a task queue is created between the two locks
 	e.partitionsLock.Lock()
+	for {
+		ch, sweeping := e.sweeping[partition]
+		if !sweeping {
+			break
+		}
+		// SweepIdleQueues is deleting this queue's row: load it once that has finished.
+		e.partitionsLock.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		e.partitionsLock.Lock()
+	}
 	if e.stopped {
 		e.partitionsLock.Unlock()
 		return nil, ErrEngineStopped
@@ -637,6 +654,7 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 			return false, err
 		}
 		t := task
+		capExpiry(pm, &t, start, false)
 		matched, err := pm.AddTask(ctx, &t, nil)
 		if matched && err == nil {
 			// upstream handler.AddActivityTask: the whole call, for sync matches only
@@ -648,6 +666,21 @@ func (e *Engine) AddTask(ctx context.Context, queue store.QueueKey, task store.T
 			continue
 		}
 		return matched, err
+	}
+}
+
+// capExpiry applies Config/QueueConfig.MaxTaskAge (library addition): the task expires at most
+// max age after now (not CreateTime). For a redrive (fresh), an ExpiryTime already in the past
+// is replaced too, so a dead task that outlived its window gets a new one instead of being
+// dropped unseen by the reader.
+func capExpiry(pm *taskQueuePartitionManagerImpl, t *store.Task, now time.Time, fresh bool) {
+	age := time.Duration(pm.maxTaskAge.Load())
+	if age <= 0 {
+		return
+	}
+	limit := now.Add(age)
+	if t.ExpiryTime.IsZero() || limit.Before(t.ExpiryTime) || (fresh && !now.Before(t.ExpiryTime)) {
+		t.ExpiryTime = limit
 	}
 }
 
@@ -667,6 +700,7 @@ func (e *Engine) spoolTask(ctx context.Context, queue store.QueueKey, task store
 			return err
 		}
 		t := task
+		capExpiry(pm, &t, e.timeSource.Now(), true)
 		err = pm.spoolBacklog(&t)
 		// Same unload/conflict retries as AddTask. A waiting poller is not offered the task.
 		if err != nil && attempt < addTaskMaxAttempts && isShutdownOrConflict(err) && ctx.Err() == nil {
