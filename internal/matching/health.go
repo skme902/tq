@@ -47,16 +47,28 @@ type QueueProblem struct {
 // Live reports whether the engine is running (not stopped). It does not touch the store.
 func (e *Engine) Live() bool { return !e.isStopped() }
 
+// healthProbeTimeout bounds the store probe even when ctx has no deadline (a library caller
+// without the HTTP handler). A var so tests can shorten it.
+var healthProbeTimeout = 2 * time.Second
+
 // Health probes the engine and its store. It does not load or take over any queue; the store
-// probe (store.HealthChecker) is bounded by ctx. It emits engine_ready (0/1).
+// probe (store.HealthChecker) is bounded by ctx and by healthProbeTimeout. A stopped or
+// draining engine is not ready and is not probed, and liveness and draining are read again
+// after the probe, so a probe that overlaps the start of Shutdown never reports ready. A
+// store schema at or above the build's newest migration counts as current, so old builds stay
+// ready while a rolling deploy's new build migrates (migrations are additive). It emits
+// engine_ready (0/1).
 func (e *Engine) Health(ctx context.Context) HealthReport {
 	r := HealthReport{Live: !e.isStopped(), Draining: e.Draining()}
-	if hc, ok := e.store.(store.HealthChecker); ok {
+	if hc, ok := e.store.(store.HealthChecker); ok && r.Live && !r.Draining {
+		pctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
 		start := e.timeSource.Now()
-		h, err := hc.CheckHealth(ctx)
+		h, err := hc.CheckHealth(pctx)
+		cancel()
 		e.metricsHandler.Timer(metrics.StoreHealthLatency, e.timeSource.Since(start))
 		r.StoreErr = err
 		r.SchemaVersion, r.WantSchemaVersion = h.SchemaVersion, h.WantSchemaVersion
+		r.Live, r.Draining = !e.isStopped(), e.Draining()
 	}
 	r.Ready = r.Live && !r.Draining && r.StoreErr == nil && r.SchemaVersion >= r.WantSchemaVersion
 	now := e.timeSource.Now()
@@ -67,9 +79,16 @@ func (e *Engine) Health(ctx context.Context) HealthReport {
 	}
 	e.partitionsLock.RUnlock()
 	for _, pm := range pms {
-		if n := pm.defaultQueue.backlogMgr.lastStoreErr.Load(); n != nil && now.Sub(n.at) < HealthDegradedWindow {
-			r.Degraded = append(r.Degraded, QueueProblem{Queue: pm.partition, LastError: n.err, At: n.at})
+		bm := pm.defaultQueue.backlogMgr
+		n := bm.lastStoreErr.Load()
+		if n == nil {
+			continue
 		}
+		if now.Sub(n.at) >= HealthDegradedWindow {
+			bm.lastStoreErr.CompareAndSwap(n, nil) // expired: drop the note
+			continue
+		}
+		r.Degraded = append(r.Degraded, QueueProblem{Queue: pm.partition, LastError: n.err, At: n.at})
 	}
 	ready := 0.0
 	if r.Ready {

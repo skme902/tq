@@ -774,17 +774,16 @@ func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (b
 	return n > 0, err
 }
 
-// CheckHealth pings both pools and reads the applied schema version; want is the highest
-// embedded migration.
+// CheckHealth pings the read pool and reads the applied schema version; want is the highest
+// embedded migration. It deliberately never checks out the write pool: on sqlite that pool is
+// a single connection that every write holds until commit (up to the busy timeout), so a
+// probe on it would report unready while writes succeed, and would block writes while it ran.
+// A failing writer shows up as degraded queues in Engine.Health instead. On postgres the read
+// and write pools are the same pool.
 func (s *Store) CheckHealth(ctx context.Context, want int) (store.StoreHealth, error) {
 	h := store.StoreHealth{WantSchemaVersion: want}
-	if err := s.w.PingContext(ctx); err != nil {
+	if err := s.r.PingContext(ctx); err != nil {
 		return h, s.wrap("Ping", err)
-	}
-	if s.r != s.w {
-		if err := s.r.PingContext(ctx); err != nil {
-			return h, s.wrap("Ping", err)
-		}
 	}
 	var v sql.NullInt64
 	if err := s.r.QueryRowContext(ctx, `SELECT MAX(version) FROM tq_schema_version`).Scan(&v); err != nil {

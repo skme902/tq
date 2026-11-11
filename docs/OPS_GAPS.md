@@ -232,10 +232,16 @@ Original analysis (superseded by the status above):
 `store.HealthChecker`, and package `health` (`/livez`, `/readyz`). Refinements: the degraded list is "a store error
 in the last minute" per loaded queue (recorded where the backlog manager already classifies errors) rather than
 separate stuck/lease flags; the handler lives in its own `health` package now instead of waiting for the admin
-endpoint (10).
+endpoint (10). Review r1 tightened it: GET/HEAD only, `/livez` body is `{"live":bool}`, the probe has a 2s
+deadline and is skipped while draining, a schema at or above the build's newest migration is ready (rolling
+deploys), only persistence errors count as degraded, and the SQLite probe uses the read pool.
 
+### Original notes (superseded)
 
-- **Today.** There is no health API. Signals are spread over `LoadedQueues`, `fair_reader_stuck_detected`,
+The bullets below are the pre-implementation design. `Pinger`, the `admin` subpackage and the stuck-reader or
+lease flags were not built; see the status above.
+
+- **Today (before this work).** There was no health API. Signals are spread over `LoadedQueues`, `fair_reader_stuck_detected`,
   `lease_failures` and the store's own errors.
 - **Missing.**
   - liveness: the engine is not stopped
