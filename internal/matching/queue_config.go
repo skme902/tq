@@ -69,6 +69,7 @@ func (s *MemoryQueueConfigSource) QueueConfig(queue store.QueueKey) QueueConfig 
 	if r, ok := s.nsRates[queue.Namespace]; ok {
 		cfg.AdminNamespaceDispatchRate = &r
 	}
+	cfg.PausedFairnessKeys = slices.Clone(cfg.PausedFairnessKeys) // the caller may keep or modify it
 	return cfg
 }
 
@@ -178,7 +179,16 @@ func (s *MemoryQueueConfigSource) SetMaxTaskAge(queue store.QueueKey, d *time.Du
 // SetPaused pauses or resumes dispatch from the queue (QueueConfig.Paused). Like the other
 // setters it applies to one partition key.
 func (s *MemoryQueueConfigSource) SetPaused(queue store.QueueKey, paused bool) {
-	s.update(queue, func(cfg *QueueConfig) { cfg.Paused = paused })
+	s.mu.Lock()
+	cfg := s.cfgs[queue]
+	if cfg.Paused == paused {
+		s.mu.Unlock()
+		return // unchanged: no notification (it would reprocess every task in the matcher)
+	}
+	cfg.Paused = paused
+	s.cfgs[queue] = cfg
+	s.mu.Unlock()
+	s.notifyQueue(queue)
 }
 
 // SetFairnessKeyPaused pauses or resumes dispatch of one fairness key in the queue

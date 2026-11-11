@@ -81,8 +81,8 @@ type (
 
 	// QueueConfigWatcher is optionally implemented by a QueueConfigSource to push changes
 	// (replaces userDataManager's onUserDataChanged and dynamic config Subscribe). A loaded
-	// queue re-reads its QueueConfig and re-applies rate limits and fairness weight overrides
-	// on every onChange call (upstream's onUserDataChanged).
+	// queue re-reads its QueueConfig and re-applies rate limits, fairness weight overrides and
+	// pause on every onChange call (upstream's onUserDataChanged).
 	QueueConfigWatcher interface {
 		WatchQueueConfig(queue store.QueueKey, onChange func()) (cancel func())
 	}

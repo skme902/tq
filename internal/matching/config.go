@@ -129,7 +129,8 @@ type Config struct {
 	// loaded tasks of a paused fairness key) one subqueue reader keeps without counting them
 	// toward GetTasksBatchSize (library addition). Past it they count as loaded, so a backlog
 	// with more held tasks than this plus GetTasksBatchSize ahead of ready ones delays those
-	// ready ones too.
+	// ready ones too: until VisibleAt for delayed tasks, and until the key resumes for paused
+	// ones.
 	// Default 10000.
 	MaxDelayedInMemory int
 }

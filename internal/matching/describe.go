@@ -117,7 +117,7 @@ func (e *Engine) DescribeQueue(ctx context.Context, queue store.QueueKey) (*Queu
 		d.PausedFairnessKeys = slices.Sorted(maps.Keys(keys))
 	} else if e.configSource != nil {
 		cfg := e.configSource.QueueConfig(queue)
-		d.Paused, d.PausedFairnessKeys = cfg.Paused, slices.Clone(cfg.PausedFairnessKeys)
+		d.Paused, d.PausedFairnessKeys = cfg.Paused, slices.Sorted(slices.Values(cfg.PausedFairnessKeys))
 	}
 	if e.deadLetters != nil {
 		if d.DeadTasks, err = e.deadLetters.CountDeadTasks(ctx, queue); err != nil {

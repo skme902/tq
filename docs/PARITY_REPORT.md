@@ -367,7 +367,10 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     fields; `taskQueuePartitionManager` emits `queue_paused` after each refresh and zeroes it on unload; the fair
     reader does not count loaded tasks of paused keys toward its batch (up to `MaxDelayedInMemory`, shared with
     delayed tasks) and re-checks its read on a pause change. With nothing paused the scan body and the reader's
-    counting are upstream's.
+    counting are upstream's. Sync-match gating is unchanged: upstream's `isBacklogNegligible` uses the age of every
+    DB-backlog task in the matcher, dispatchable or not (a rate-limited key's tasks count), so a paused key's tasks
+    count too, and a paused key with a backlog older than `BacklogNegligibleAge` turns sync match off for the queue
+    (TestPausedKeyBacklogAgeGatesSyncMatchLikeUpstream).
 
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate

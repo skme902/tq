@@ -39,14 +39,47 @@ func (tr *fairTaskReader) pausedLoadedLocked(keys map[string]struct{}) int {
 	return n
 }
 
-// pauseChanged lets the readers load past paused-key tasks after a pause change.
+// addLoadedLocked changes loadedTasks by delta for task, and pausedLoaded when task belongs
+// to a key in countedKeys. It is the only place loadedTasks changes
+// (TestLoadedTasksChangedOnlyByHelper), which keeps pausedLoaded exact without a scan.
+func (tr *fairTaskReader) addLoadedLocked(task *internalTask, delta int) {
+	tr.loadedTasks += delta
+	if isPausedKeyTask(tr.countedKeys, task) {
+		tr.pausedLoaded += delta
+	}
+}
+
+// recountPausedLocked adopts the current paused keys and recounts pausedLoaded (once per
+// pause change; between changes addLoadedLocked keeps it exact).
+func (tr *fairTaskReader) recountPausedLocked() {
+	tr.countedKeys = tr.pausedKeys()
+	tr.pausedLoaded = tr.pausedLoadedLocked(tr.countedKeys)
+}
+
+// pauseChanged recounts each reader's paused-key tasks after a pause change and lets it load
+// past them. A config change that left the pause snapshot as it was does nothing.
 func (c *fairBacklogManagerImpl) pauseChanged() {
 	c.subqueueLock.Lock()
 	readers := append([]*fairTaskReader(nil), c.subqueues...)
 	c.subqueueLock.Unlock()
 	for _, r := range readers {
 		r.lock.Lock()
-		r.maybeReadTasksLocked()
+		if !sameKeySet(r.countedKeys, r.pausedKeys()) {
+			r.recountPausedLocked()
+			r.maybeReadTasksLocked()
+		}
 		r.lock.Unlock()
 	}
+}
+
+func sameKeySet(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
