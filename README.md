@@ -337,7 +337,10 @@ src.SetPaused(q, false)                   // resume: waiting pollers are matched
 
 ```go
 src, err := taskqueue.NewStoreQueueConfigSource(ctx, st, taskqueue.StoreQueueConfigSourceOptions{}) // st: memstore, sqlite or postgres
-defer src.Close()
+if err != nil {
+	return err
+}
+defer src.Close() // stops the poll goroutine; without Close it runs for the process lifetime
 opts.QueueConfigSource = src
 
 // Read-modify-write with an audit record; retried on a concurrent write by another process.
@@ -352,7 +355,7 @@ hist, _ := src.History(ctx, q, 20) // newest first: Version, Config, UpdatedBy, 
 - Every process on the same database sees the same config. A change applies to this process before
   `Update` returns and to other processes on their next poll (`PollInterval`, default 5s); loaded queues
   are notified through `QueueConfigWatcher` as with the memory source.
-- Each write is a new version (compare-and-set on the version, up to 10 retries) and a history row.
+- Each write is a new version (compare-and-set on the version, up to 10 attempts; `mutate` may run once per attempt, so it must depend only on the config it is given) and a history row.
   The whole `QueueConfig` is validated before it is written: the memory source's setter rules
   (rate limits, fairness weight overrides, paused fairness keys, MaxAttempts and MaxTaskAge
   non-negative), and in addition admin dispatch rates must be non-negative (the memory source's

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -167,13 +168,7 @@ func (s *StoreQueueConfigSource) Refresh(ctx context.Context) error {
 		}
 	}
 	for _, r := range newest {
-		cfg, err := decodeQueueConfig(r.Config)
-		if err != nil {
-			s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
-			s.opts.Logger.Error("ignoring undecodable queue config", "queue", r.Key.String(), "version", r.Version, "error", err)
-			continue
-		}
-		s.install(r.Key, r.Version, cfg)
+		s.install(r.Key, r.Version, s.resolve(ctx, r))
 	}
 	s.mu.Lock()
 	s.seq = max(s.seq, after)
@@ -192,18 +187,49 @@ func (s *StoreQueueConfigSource) loadCurrent(ctx context.Context) error {
 	var seq int64
 	for _, r := range recs {
 		seq = max(seq, r.Seq)
-		cfg, err := decodeQueueConfig(r.Config)
-		if err != nil {
-			s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
-			s.opts.Logger.Error("ignoring undecodable queue config", "queue", r.Key.String(), "version", r.Version, "error", err)
-			continue
-		}
-		s.install(r.Key, r.Version, cfg)
+		s.install(r.Key, r.Version, s.resolve(ctx, r))
 	}
 	s.mu.Lock()
 	s.seq = max(s.seq, seq)
 	s.mu.Unlock()
 	return nil
+}
+
+// resolve returns the config a stored version stands for. A version that does not decode or
+// fails validation (written around Update) stands for the newest earlier version of that
+// queue that passes both, or the default config if none does; it is installed at its own
+// version, so a stale page cannot bring back what it replaced (review config r2 P0, P2).
+func (s *StoreQueueConfigSource) resolve(ctx context.Context, r store.QueueConfigRecord) QueueConfig {
+	cfg, err := s.decodeValid(r.Config)
+	if err == nil {
+		return cfg
+	}
+	s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
+	s.opts.Logger.Error("unusable queue config version; using the newest earlier valid one",
+		"queue", r.Key.String(), "version", r.Version, "error", err)
+	hist, herr := s.st.QueueConfigHistory(ctx, r.Key, 100)
+	if herr != nil {
+		s.opts.Logger.Error("queue config history read failed", "queue", r.Key.String(), "error", herr)
+	}
+	for _, h := range hist { // newest first
+		if h.Version < r.Version {
+			if c, err := s.decodeValid(h.Config); err == nil {
+				return c
+			}
+		}
+	}
+	return QueueConfig{}
+}
+
+func (s *StoreQueueConfigSource) decodeValid(b []byte) (QueueConfig, error) {
+	cfg, err := decodeQueueConfig(b)
+	if err != nil {
+		return QueueConfig{}, err
+	}
+	if err := validateQueueConfig(cfg, s.mem.maxOverrides); err != nil {
+		return QueueConfig{}, err
+	}
+	return cfg, nil
 }
 
 // install caches cfg as the queue's config if version is newer than the cached one, then
@@ -217,10 +243,13 @@ func (s *StoreQueueConfigSource) install(key store.QueueKey, version int64, cfg 
 	}
 	s.version[key] = version
 	s.mem.mu.Lock()
+	same := reflect.DeepEqual(s.mem.cfgs[key], cfg)
 	s.mem.cfgs[key] = cfg
 	s.mem.mu.Unlock()
 	s.mu.Unlock()
-	s.mem.notifyQueue(key)
+	if !same { // an unchanged rewrite does not make loaded queues reprocess (review config r2 P1)
+		s.mem.notifyQueue(key)
+	}
 }
 
 // Update changes one queue's config: mutate gets a copy of the current stored value, and
@@ -240,13 +269,9 @@ func (s *StoreQueueConfigSource) Update(ctx context.Context, queue store.QueueKe
 		switch {
 		case err == nil:
 			curVersion = rec.Version
-			if cur, err = decodeQueueConfig(rec.Config); err != nil {
-				// Repairable through the API: mutate starts from defaults and the write
-				// replaces the bad blob (CAS on its version still applies).
-				s.opts.Logger.Warn("replacing undecodable queue config", "queue", queue.String(),
-					"version", rec.Version, "error", err)
-				cur = QueueConfig{}
-			}
+			// A bad current blob is replaced; mutate starts from what it stands for (the
+			// newest earlier valid version), the same config every process is serving.
+			cur = s.resolve(ctx, *rec)
 		case !store.IsNotFound(err):
 			return QueueConfig{}, err
 		}

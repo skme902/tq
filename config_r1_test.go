@@ -48,7 +48,10 @@ func TestRefreshSkipsSupersededVersions(t *testing.T) {
 	require.NoError(t, b.Refresh(ctx))
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, []bool{true}, seen, "one notification, at the newest version")
+	// The net change is none (paused, then paused again), so with r2's unchanged-config skip
+	// there is no notification at all, and never one at the superseded resume.
+	require.Empty(t, seen, "no notification: superseded resume skipped, newest equals cached")
+	require.True(t, b.QueueConfig(q).Paused)
 }
 
 // A watcher can call back into the source (here Refresh and QueueConfig) without deadlocking:
