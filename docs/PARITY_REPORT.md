@@ -304,29 +304,51 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     fairness, the limiter and fencing are unchanged.
 
 26. **Max attempts and dead letters (feat/ops-dlq).** Library-only: upstream matching acks a task once history
-    starts it, and history owns retries. `store.Task.Attempts` (in the task blob, no column) counts deliveries;
-    with `MaxAttempts > 0` each backlog delivery does one extra fenced `UpdateTask` before `PollTask` returns, and
-    a last failed attempt moves the row to `tq_dead_tasks` instead of `addTaskToMatcher`. The default (0) adds no
-    writes and keeps upstream's redelivery path. Fair order, the limiter, sync match vs backlog and fencing are
-    unchanged; a dead-lettered task is finished like an ack, so the ack level advances past it as usual.
+    starts it, and history owns retries. `store.Task.Attempts` (in the task blob, no column) counts a delivery
+    once `PollTask` has returned a `Delivery`. A `PollTask` that returns an error does not count. `Stop` during
+    the attempt write rolls that write back, best effort. Only a committed attempt write counts across restarts:
+    a non-fence write error still delivers the task, with the new count only in memory. `Starter.Start` runs
+    before the attempt write and is at-least-once if that write is fenced (`PollTask` then returns `ErrNoTasks`
+    and no delivery). With `MaxAttempts > 0` each backlog delivery does one extra fenced `UpdateTask` on the poll
+    path, before the lease timer is armed and before `PollTask` returns. A lost fence on that write is reported
+    as `ErrNoTasks` and does not deliver; the backlog row is unchanged. A last failed attempt inserts a row in
+    `tq_dead_tasks` and finishes the task like an ack (dead-lettering is an ack plus a dead insert). Ack-level GC
+    deletes the backlog row, the same as any other ack. A crash after the insert and before that ack level is
+    persisted leaves the task both live and dead (at-least-once duplicate). A sync-matched last attempt is spooled
+    and later dead-lettered as `attempts_exhausted`. A redrive during the window before that GC removes the
+    original backlog row can produce an at-least-once duplicate after a reload. `RedriveDeadTasks` is serialized
+    only within one engine process; redrives from several processes on one store are at-least-once. With
+    `MaxAttempts == 0` there are no extra writes and upstream's redelivery path is unchanged: fair order, the
+    limiter, sync match vs backlog and fencing match upstream. With `MaxAttempts > 0` the differences are an
+    extra fenced write on the poll path, a sync-matched last attempt spooled and later dead-lettered as
+    `attempts_exhausted`, and fence loss on the attempt write reported as `ErrNoTasks`. The ack level still
+    advances past a dead-lettered task as usual.
 
 27. **Task admin (feat/ops-admin).** `PeekTasks`, `DeleteTask` and `PurgeQueue` are library-only (upstream has
     `tdbg taskqueue list-tasks` but no delete or purge). The reader gains `adminDeleted` levels that a racing read
-    skips, and a deleted task is flagged so `addTaskToMatcher` does not re-add it. Purge moves the ack level to the
-    max written level, which is safe for later writes because the writer's pass base is the ack level and task IDs
-    only grow. One upstream race is fixed on the way: a task evicted between `priTaskMatcher.AddTask`'s
+    skips, and a deleted task is flagged so `addTaskToMatcher` does not re-add it. Purge waits for every ack-level
+    pin on a subqueue to drop (a writer between picking passes and committing, tasks held for a read, an admin
+    delete in flight), then, without releasing the reader lock, moves the ack level to the max written level.
+    `CreateFairTasks` raises that level before it commits, so a task written during the wait is purged too (as
+    with SQS PurgeQueue) and no row is left below the ack level. Later writes stay above it because the writer's
+    pass base is the ack level, read under the same lock, and task IDs only grow. One
+    upstream race is fixed on the way: a task evicted between `priTaskMatcher.AddTask`'s
     `setRemoveFunc` and `EnqueueTaskNoWait` was still queued (its remove ran while it was not queued yet), so a
     trimmed task could be delivered twice; `EnqueueTaskNoWait` now skips evicted tasks
     (`TestEvictedBeforeEnqueueIsNotQueued`). `setEvicted` tolerates a task that was never added.
 
 28. **Health (feat/ops-health).** `Engine.Live`, `Engine.Health` and the `health` HTTP package are library-only
     (upstream registers gRPC health in the service wrapper and flips it to NOT_SERVING before its drain sleep, which
-    `Shutdown` + `/readyz` mirror). The only engine change is that `signalIfFatal` records the last store error per
-    queue; it still decides fatality as upstream does.
+    `Shutdown` + `/readyz` mirror). tq has no NOT_SERVING sleep: `Shutdown` marks the engine draining and new polls
+    are refused in the same step readiness flips, and `Health` re-reads draining/stopped after its store probe so a
+    drain that starts mid-probe is never reported ready. The only engine change is that `signalIfFatal` records the
+    last persistence error per queue (not back-pressure, cancellation or shutdown errors); it still decides fatality
+    as upstream does.
 
 29. **Retention (feat/ops-retention).** `SweepIdleQueues` and `store.QueueSweeper.DeleteQueueIfIdle` are new (upstream
     deletes idle task queue rows only through Cassandra/SQL TTL and its scavenger). `Config.MaxTaskAge` /
-    `QueueConfig.MaxTaskAge` (default 0, off) caps a task's `ExpiryTime` in `AddTask`; the reader's expiry handling is
+    `QueueConfig.MaxTaskAge` (default 0, off) caps a task's `ExpiryTime` in `AddTask` and, from the redrive time, in
+    `spoolTask` (redrive); the reader's expiry handling is
     unchanged. sqlcore now has a test that every Postgres query is rebound (`TestNumberedQueriesHaveNoQuestionMarks`).
 
 30. **Delays and retry backoff (feat/ops-backoff).** `Task.VisibleAt`, `NackDelay`, `Config.RetryBackoff` and

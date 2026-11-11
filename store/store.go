@@ -51,7 +51,7 @@ type (
 		// ExpiryTime: zero means never expires.
 		ExpiryTime time.Time
 		// Attempts is the number of deliveries of this task that have started (set by the
-		// queue; AddTask ignores it). See Delivery.Attempt and Config.MaxAttempts.
+		// queue; AddTask ignores it). See Delivery.Task.Attempts and Config.MaxAttempts.
 		Attempts int32 `json:",omitzero"`
 		// VisibleAt, if in the future, keeps the task from being delivered before then (library
 		// addition: delayed enqueue and Nack backoff). Zero or past means deliverable now.
@@ -229,10 +229,11 @@ type UpdateTaskRequest struct {
 	Task     TaskInfo
 }
 
-// DeadLetterTaskRequest moves Task from the backlog (Subqueue, Task.Pass, Task.ID) to the
-// queue's dead-letter set in one atomic write, so a reload cannot read it back. A backlog row
-// that is already gone (deleted by ack-level GC) is not an error. Recording the same task ID
-// again overwrites the dead entry, so a retry does not duplicate it.
+// DeadLetterTaskRequest records Task in the queue's dead-letter set. It does not remove the
+// backlog row: the engine finishes the task like an ack, and ack-level GC deletes the row.
+// A crash after this write and before that ack level is persisted leaves the task both live
+// and dead (at-least-once). A backlog row that is already gone is not an error. Recording
+// the same task ID again overwrites the dead entry, so a retry does not duplicate it.
 type DeadLetterTaskRequest struct {
 	Key      QueueKey
 	RangeID  int64 // fence: *ConditionFailedError if the stored rangeID differs
@@ -316,16 +317,23 @@ type DeleteQueueIfIdleRequest struct {
 	// before it, checked in the same transaction (so an owner that wrote after the listing
 	// keeps its queue).
 	IdleBefore time.Time
+	// Now, if non-zero, makes a task above the ack level count as live only while it has not
+	// expired (ExpiryTime unset or not before Now, the reader's rule), so a queue holding only
+	// expired tasks is deleted with them. Zero: every row above the ack level is live.
+	Now time.Time
 }
 
 // QueueSweeper is implemented by stores that can delete idle queues (memstore, sqlite and
 // postgres do).
 type QueueSweeper interface {
 	// DeleteQueueIfIdle atomically deletes the queue row and its task rows if the stored
-	// rangeID equals req.RangeID, the row is idle per req.IdleBefore, no task row lies above its subqueue's FairAckLevel (rows at
-	// or below it are already acked and only wait for GC), and the queue has no dead tasks.
-	// It reports whether it deleted the queue; a missing queue, a rangeID mismatch or live
-	// work return (false, nil).
+	// rangeID equals req.RangeID, the row is idle per req.IdleBefore, no live task row lies
+	// above its subqueue's FairAckLevel (rows at or below it are already acked and only wait
+	// for GC; with req.Now set, an expired row is not live and is deleted with the queue), and
+	// the queue has no dead tasks. It reports whether it deleted the queue; a missing queue, a
+	// rangeID mismatch or live work return (false, nil). A task row that cannot be decoded
+	// while checking expiry returns an InvalidArgumentError naming it, and the queue is kept.
+	// The expiry check reads every row above the ack level inside the delete transaction.
 	DeleteQueueIfIdle(ctx context.Context, req *DeleteQueueIfIdleRequest) (bool, error)
 }
 

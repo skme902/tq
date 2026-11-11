@@ -97,8 +97,8 @@ func (c *fairBacklogManagerImpl) signalIfFatal(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Deviation (Engine.Health): remember the error for the degraded report.
-	if !errors.Is(err, context.Canceled) {
+	// Deviation (Engine.Health): remember persistence errors for the degraded report.
+	if isStoreProblem(err) {
 		c.lastStoreErr.Store(&storeErrNote{at: c.timeSource.Now(), err: err.Error()})
 	}
 	if store.IsConditionFailed(err) {
@@ -123,7 +123,25 @@ func (c *fairBacklogManagerImpl) isInitialized() bool {
 	}
 }
 
+// isStoreProblem reports whether err from a backlog operation is a persistence failure worth
+// reporting in Engine.Health. In-process conditions are not: a full writer channel
+// (ErrResourceExhausted, a throttle), the queue shutting down or closed, a caller cancel, or
+// a non-contiguous ID block.
+func isStoreProblem(err error) bool {
+	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, ErrResourceExhausted),
+		errors.Is(err, errShutdown),
+		errors.Is(err, errTaskQueueClosed),
+		errors.Is(err, errMatcherStopped),
+		errors.Is(err, errNonContiguousBlocks):
+		return false
+	}
+	return true
+}
+
 func (c *fairBacklogManagerImpl) Stop() {
+	c.lastStoreErr.Store(nil) // an unloaded queue is not reported degraded
 	// Maybe try to write one final update of ack level. Skip the update if we never
 	// initialized. Also skip if we're stopping due to lost ownership (the update will
 	// fail in that case). Ignore any errors. Don't bother with GC, the next reload will

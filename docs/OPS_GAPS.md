@@ -59,13 +59,30 @@ The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so b
 
 ## 1. Max attempts, poison tasks and a DLQ — P0, M–L — done
 
-**Status: implemented in feat/ops-dlq** (README §Dead letters). Refinements to the design below:
-`Attempts` lives in `store.Task` (the JSON blob, no column) and counts deliveries started, persisted with a
-fenced in-place `UpdateTask` on each backlog delivery when a limit is set, rather than a rewrite with a new ID
-(which would move the task in fair order). `Nack(NackReason(s))` records a string, not an error. `PurgeDeadTasks`
-takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count` gauge:
-`DescribeQueue().DeadTasks` reads the count.
+**Status: implemented in feat/ops-dlq** (README §Dead letters).
 
+What shipped:
+
+- `store.Task.Attempts` (in the task JSON, no column) counts deliveries started. `Delivery.Task.Attempts` is that
+  field. `AddTask` ignores a caller-supplied value and resets it to 0.
+- With `MaxAttempts > 0`, each backlog delivery does a fenced in-place `UpdateTask` (same id and pass, so fair
+  order does not move) before the lease timer is armed. A `ConditionFailed` on that write unloads the queue and
+  `PollTask` returns `ErrNoTasks` without a delivery; the backlog row is unchanged. Other write failures still
+  deliver the task.
+- `QueueConfig.MaxAttempts` overrides the engine default (`nil` = engine default, `0` = unlimited). A negative
+  override is ignored and the previous limit is kept.
+- Dead-lettering inserts into `tq_dead_tasks` and finishes the task like an ack. Ack-level GC deletes the backlog
+  row. A crash between the insert and the persisted ack level leaves the task both live and dead (at-least-once).
+- `Nack(NackReason(s))` records a string (`nack: s`), not an error. Reasons are `nack`, `lease_expired`, and
+  `attempts_exhausted`. A sync-matched last attempt is spooled and later dead-lettered as `attempts_exhausted`, so
+  that Nack reason is not kept.
+- `ListDeadTasks`, `DeleteDeadTasks`, `PurgeDeadTasks(queue, deadBefore)`, and `RedriveDeadTasks`. Redrive spools
+  onto the backlog (no sync match) and deletes dead rows only after that write commits. The count is rows
+  deleted. The call snapshots the highest dead task id and does not pick up tasks that die again during it.
+- Metrics: `tasks_dead_lettered{reason}`, `dead_letter_failures`, `tasks_redriven`, `task_attempt_record_failures`.
+  No `dlq_backlog_count` gauge: `DescribeQueue().DeadTasks` reads the count.
+
+### Original notes (superseded)
 
 - **Today.**
   - `Delivery.Nack`, lease expiry, and a Starter that returns a retryable error all redeliver the task. This is
@@ -102,6 +119,9 @@ takes a dead-before time; `DeleteDeadTasks` deletes by ID. No `dlq_backlog_count
 levels before deleting rows, so a failed delete never resurrects tasks (GC retries it). Fairness counters and TopK
 are not reset by a purge (they are approximate and age out).
 
+Original analysis (superseded by the status above). Two claims in it do not describe the implementation:
+there is no engine-level peek or delete (**superseded** — `PeekTasks`, `DeleteTask` and `PurgeQueue`), and
+purge resets TopK (**superseded** — a purge does not reset fairness counters or TopK).
 
 - **Today.**
   - `ListQueues` and `DescribeQueue` give counts and ages.
@@ -109,9 +129,11 @@ are not reset by a purge (they are approximate and age out).
   - `store.DeleteQueue` deletes a queue and all its tasks, but calling it under a loaded queue races the owner. No
     Engine method fences it.
   - There is no way to delete one bad task or purge a backlog without SQL.
+    **Superseded:** engine-level `PeekTasks`, `DeleteTask` and `PurgeQueue` (README §Task admin).
 - **Missing.** `PeekTasks` (read-only, paged, per subqueue/priority, optionally filtered by fairness key),
   `DeleteTask(queue, id)`, and `PurgeQueue(queue)`. Upstream has `tdbg taskqueue list-tasks`, SQS `PurgeQueue`,
   RabbitMQ get-messages and purge, and Asynq `Inspector.DeleteTask`.
+  **Superseded:** those engine methods exist.
 - **Design.**
   - **Peek.** It follows the same read-only path as `describeUnloaded`: `GetTasks` from the ack level with a page
     token of (subqueue, level). It never takes ownership, works on loaded and unloaded queues, and returns
@@ -121,7 +143,7 @@ are not reset by a purge (they are approximate and age out).
     - Delete: removes the task from the reader's loaded set if present, deletes the row conditioned on rangeID,
       and adjusts the backlog count.
     - Purge: `CompleteTasksLessThan(max level)` on every subqueue, sets the ack level to the max read level, and
-      resets the counts and TopK.
+      resets the counts and TopK. **Superseded:** purge does not reset the counts or TopK.
   - **Store.** Add `DeleteTask(queue, subqueue, level, rangeID)` to the store as a new optional interface with
     conformance tests.
   - **Leases.** In-flight leases on purged tasks become lost (`ErrLeaseLost` on Ack, harmless).
@@ -231,10 +253,16 @@ Original analysis (superseded by the status above):
 `store.HealthChecker`, and package `health` (`/livez`, `/readyz`). Refinements: the degraded list is "a store error
 in the last minute" per loaded queue (recorded where the backlog manager already classifies errors) rather than
 separate stuck/lease flags; the handler lives in its own `health` package now instead of waiting for the admin
-endpoint (10).
+endpoint (10). Review r1 tightened it: GET/HEAD only, `/livez` body is `{"live":bool}`, the probe has a 2s
+deadline and is skipped while draining, a schema at or above the build's newest migration is ready (rolling
+deploys), only persistence errors count as degraded, and the SQLite probe uses the read pool.
 
+### Original notes (superseded)
 
-- **Today.** There is no health API. Signals are spread over `LoadedQueues`, `fair_reader_stuck_detected`,
+The bullets below are the pre-implementation design. `Pinger`, the `admin` subpackage and the stuck-reader or
+lease flags were not built; see the status above.
+
+- **Today (before this work).** There was no health API. Signals are spread over `LoadedQueues`, `fair_reader_stuck_detected`,
   `lease_failures` and the store's own errors.
 - **Missing.**
   - liveness: the engine is not stopped
@@ -254,16 +282,23 @@ endpoint (10).
 **Status: implemented in feat/ops-retention** (README §Retention): `Engine.SweepIdleQueues(ctx, SweepOptions)`,
 `store.QueueSweeper.DeleteQueueIfIdle`, `Config.MaxTaskAge`/`QueueConfig.MaxTaskAge`, and dead-task retention via
 `SweepOptions.DeadTaskRetention`. Refinements over the design below:
-- "Empty" means no task row above each subqueue's ack level (rows at or below it only await GC), checked in the
-  delete transaction, rather than the approximate backlog count, which can stay stale after a crash.
+- "Empty" means no unexpired task row above each subqueue's ack level (rows at or below it only await GC, and
+  expired rows go with the queue), checked in the delete transaction. Unlike upstream's scavenger, which deletes
+  expired tasks in id order even when a later unexpired task keeps the queue, expired rows are removed only when
+  every task above the ack level has expired and the queue itself is deleted; a mixed backlog keeps its expired rows
+  until the reader and ack GC reach them. The expiry check reads every row above the ack level inside the delete
+  transaction (on SQLite, the single writer), so sweeping a queue with a very large expired backlog holds writes
+  for that long. The check uses the rows, not the approximate backlog count, which can stay stale after a crash.
 - The delete is also conditioned on `LastUpdateTime < now - IdleFor` in the same transaction, and `IdleFor` must be
-  at least 24h: a loaded queue rewrites its row only every 12h, and a deleted-then-recreated queue restarts at
+  at least 48h: a loaded queue rewrites its row only every 12h (48h tolerates a missed rewrite, as upstream's
+  scavenger does), and a deleted-then-recreated queue restarts at
   rangeID 1, so a shorter window could leave a quiet owner and a new owner on the same rangeID.
 - Queues with dead tasks are kept; `DeadTaskRetention` ages those out first.
 - `MaxTaskAge` is applied at AddTask (as an `ExpiryTime` cap) instead of in the reader, so the upstream read path is
   untouched; it covers tasks added after it is set.
 
-Original analysis (superseded by the status above):
+Original analysis (superseded by the status above and README §Retention; in particular `MaxTaskAge` is applied at AddTask
+and redrive, not by the reader):
 
 
 - **Today.**

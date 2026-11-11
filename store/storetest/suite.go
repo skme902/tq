@@ -61,7 +61,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"DeleteTask_One", testDeleteTaskOne},
 		{"DeleteTask_Fenced", testDeleteTaskFenced},
 		{"DeadLetter_RoundTrip", testDeadLetterRoundTrip},
-		{"DeadLetter_MovesFromBacklog", testDeadLetterMovesFromBacklog},
+		{"DeadLetter_KeepsBacklog", testDeadLetterKeepsBacklog},
 		{"DeadLetter_Fenced", testDeadLetterFenced},
 		{"DeadLetter_Paged", testDeadLetterPaged},
 		{"DeadLetter_Delete", testDeadLetterDelete},
@@ -72,6 +72,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"Sweep_LiveTasks", testSweepLiveTasks},
 		{"Sweep_UntrackedSubqueue", testSweepUntrackedSubqueue},
 		{"Sweep_DeadTasks", testSweepDeadTasks},
+		{"Sweep_LevelOrder", testSweepLevelOrder},
+		{"Sweep_ExpiredTasks", testSweepExpiredTasks},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

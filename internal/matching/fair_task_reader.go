@@ -67,6 +67,10 @@ type (
 		// that fetched the row before the delete committed must not load it. Pruned once the ack
 		// level passes them; nil until the first delete.
 		adminDeleted map[fairLevel]struct{}
+		// adminInFlight holds levels whose admin store delete is in flight (library addition).
+		// While it is non-empty the ack level is pinned, and a read that skips such a row keeps
+		// it here, so a failed delete can put the task back (REVIEW admin r1 F5).
+		adminInFlight map[fairLevel]*store.TaskInfo
 
 		// Hold tasks written while a read is pending so we make sure to account for them in
 		// our read level.
@@ -538,7 +542,11 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			continue
 		} else if _, deleted := tr.adminDeleted[level]; deleted {
 			// Deviation (task admin): deleted by Engine.DeleteTask; the backlog count was
-			// already adjusted there.
+			// already adjusted there. If the delete is still in flight, keep the row so a
+			// failed delete can merge it back.
+			if v, inFlight := tr.adminInFlight[level]; inFlight && v == nil {
+				tr.adminInFlight[level] = t
+			}
 			continue
 		} else if leased, ok := tr.leasedEvicted[level]; ok {
 			// Deviation (delivery leases): a leased task we trimmed earlier. Reinstate its entry
@@ -719,7 +727,7 @@ func (tr *fairTaskReader) getLoadedTasks() int {
 }
 
 func (tr *fairTaskReader) ackLevelPinnedLocked() bool {
-	return tr.ackLevelPinnedByWriter || len(tr.newlyWrittenTasks) > 0
+	return tr.ackLevelPinnedByWriter || len(tr.newlyWrittenTasks) > 0 || len(tr.adminInFlight) > 0
 }
 
 // call this whenever new tasks are acked or when ackLevelPinnedLocked() may turn from true to
