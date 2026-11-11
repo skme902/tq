@@ -119,6 +119,9 @@ What shipped:
 levels before deleting rows, so a failed delete never resurrects tasks (GC retries it). Fairness counters and TopK
 are not reset by a purge (they are approximate and age out).
 
+Original analysis (superseded by the status above). Two claims in it do not describe the implementation:
+there is no engine-level peek or delete (**superseded** — `PeekTasks`, `DeleteTask` and `PurgeQueue`), and
+purge resets TopK (**superseded** — a purge does not reset fairness counters or TopK).
 
 - **Today.**
   - `ListQueues` and `DescribeQueue` give counts and ages.
@@ -126,9 +129,11 @@ are not reset by a purge (they are approximate and age out).
   - `store.DeleteQueue` deletes a queue and all its tasks, but calling it under a loaded queue races the owner. No
     Engine method fences it.
   - There is no way to delete one bad task or purge a backlog without SQL.
+    **Superseded:** engine-level `PeekTasks`, `DeleteTask` and `PurgeQueue` (README §Task admin).
 - **Missing.** `PeekTasks` (read-only, paged, per subqueue/priority, optionally filtered by fairness key),
   `DeleteTask(queue, id)`, and `PurgeQueue(queue)`. Upstream has `tdbg taskqueue list-tasks`, SQS `PurgeQueue`,
   RabbitMQ get-messages and purge, and Asynq `Inspector.DeleteTask`.
+  **Superseded:** those engine methods exist.
 - **Design.**
   - **Peek.** It follows the same read-only path as `describeUnloaded`: `GetTasks` from the ack level with a page
     token of (subqueue, level). It never takes ownership, works on loaded and unloaded queues, and returns
@@ -138,7 +143,7 @@ are not reset by a purge (they are approximate and age out).
     - Delete: removes the task from the reader's loaded set if present, deletes the row conditioned on rangeID,
       and adjusts the backlog count.
     - Purge: `CompleteTasksLessThan(max level)` on every subqueue, sets the ack level to the max read level, and
-      resets the counts and TopK.
+      resets the counts and TopK. **Superseded:** purge does not reset the counts or TopK.
   - **Store.** Add `DeleteTask(queue, subqueue, level, rangeID)` to the store as a new optional interface with
     conformance tests.
   - **Leases.** In-flight leases on purged tasks become lost (`ErrLeaseLost` on Ack, harmless).

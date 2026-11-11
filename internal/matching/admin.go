@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/skme902/tq/metrics"
 	"github.com/skme902/tq/store"
@@ -36,7 +37,9 @@ type PeekOptions struct {
 	// Priority, if non-zero, returns only tasks of that priority key.
 	Priority int32
 	// FairnessKey, if non-empty, returns only tasks with that fairness key. The filter is
-	// applied while scanning, so a page may be short (even empty) with a NextPageToken.
+	// applied while scanning. Only rows that miss the key count against the scan budget
+	// (peekMaxScanFactor per returned slot), so a page may be short (even empty) with a
+	// NextPageToken. Acked rows and dead-letter skips do not count.
 	FairnessKey string
 }
 
@@ -61,14 +64,36 @@ type peekToken struct {
 const (
 	peekDefaultPageSize = 100
 	peekMaxPageSize     = 1000
-	peekMaxScanFactor   = 10 // rows scanned per returned slot when filtering
+	// peekMaxScanFactor is how many FairnessKey misses PeekTasks will scan per returned
+	// slot. Acked rows and dead-letter skips are not charged: they are not candidates.
+	peekMaxScanFactor = 10
 )
+
+// peekMarshal encodes a PeekTasks page token. Tests replace it to force a marshal error.
+var (
+	peekMarshalMu sync.Mutex
+	peekMarshal   = json.Marshal
+)
+
+// SetPeekMarshalForTest replaces page-token JSON encoding. A nil fn restores json.Marshal.
+// Tests only.
+func SetPeekMarshalForTest(fn func(any) ([]byte, error)) {
+	if fn == nil {
+		fn = json.Marshal
+	}
+	peekMarshalMu.Lock()
+	peekMarshal = fn
+	peekMarshalMu.Unlock()
+}
 
 // PeekTasks pages a queue's unacked backlog tasks in (subqueue, fair level) order: the order
 // each priority level dispatches in. It reads the store only, so it neither loads the queue
 // nor takes it over; on a queue loaded here it skips tasks acked but not yet deleted and sets
-// Leased. Tasks still being written are not seen. It returns *store.NotFoundError for a queue
-// that was never persisted.
+// Leased. On a queue this engine does not own (no reader), rows whose IDs are in the
+// dead-letter set are skipped too, when the store implements store.DeadLetterStore: the IDs
+// just read are matched against that set in batches. Those skips, and acked rows, do not
+// count against the FairnessKey scan budget. Tasks still being written are not seen. It
+// returns *store.NotFoundError for a queue that was never persisted.
 func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekOptions) ([]PeekedTask, []byte, error) {
 	if e.isStopped() {
 		return nil, nil, ErrEngineStopped
@@ -112,7 +137,7 @@ func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekO
 				want = min(budget, peekMaxPageSize)
 			}
 			if want <= 0 || budget <= 0 {
-				return out, e.peekNext(sq, from), nil
+				return e.peekDone(out, sq, from)
 			}
 			res, err := e.store.GetTasks(ctx, &store.GetTasksRequest{
 				Key: queue, Subqueue: sq, InclusiveMin: from.toStore(), PageSize: want,
@@ -120,18 +145,28 @@ func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekO
 			if err != nil {
 				return nil, nil, err
 			}
+			// No reader means this engine has not loaded the subqueue, so it cannot see
+			// in-memory acks. A dead-lettered task stuck behind a lease is still a backlog
+			// row until ack-level GC; skip it when its ID is in the dead-letter set.
+			var dead map[int64]struct{}
+			if tr == nil {
+				dead, err = e.peekDeadIDs(ctx, queue, res.Tasks)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
 			for _, t := range res.Tasks {
 				level := fairLevelFromAllocatedTask(&t)
 				from = level.inc()
-				budget--
-				if opts.FairnessKey != "" && t.Data.Priority.FairnessKey != opts.FairnessKey {
-					if budget <= 0 {
-						return out, e.peekNext(sq, from), nil
-					}
+				leased, acked := tr.peekState(level)
+				if _, deadRow := dead[t.ID]; acked || deadRow {
 					continue
 				}
-				leased, acked := tr.peekState(level)
-				if acked {
+				if opts.FairnessKey != "" && t.Data.Priority.FairnessKey != opts.FairnessKey {
+					budget--
+					if budget <= 0 {
+						return e.peekDone(out, sq, from)
+					}
 					continue
 				}
 				out = append(out, PeekedTask{
@@ -141,7 +176,7 @@ func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekO
 					Leased:   leased,
 				})
 				if len(out) == pageSize {
-					return out, e.peekNext(sq, from), nil
+					return e.peekDone(out, sq, from)
 				}
 			}
 			if len(res.Tasks) < want {
@@ -152,9 +187,63 @@ func (e *Engine) PeekTasks(ctx context.Context, queue store.QueueKey, opts PeekO
 	return out, nil, nil
 }
 
-func (e *Engine) peekNext(sq int, from fairLevel) []byte {
-	b, _ := json.Marshal(peekToken{Subqueue: sq, Pass: from.pass, ID: from.id})
-	return b
+func (e *Engine) peekDone(out []PeekedTask, sq int, from fairLevel) ([]PeekedTask, []byte, error) {
+	tok, err := e.peekNext(sq, from)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, tok, nil
+}
+
+func (e *Engine) peekNext(sq int, from fairLevel) ([]byte, error) {
+	peekMarshalMu.Lock()
+	fn := peekMarshal
+	peekMarshalMu.Unlock()
+	return fn(peekToken{Subqueue: sq, Pass: from.pass, ID: from.id})
+}
+
+// peekDeadIDs returns which of tasks' IDs are in the queue's dead-letter set.
+// The store has no ID lookup, so this pages ListDeadTasks (task ID order) and stops once
+// every wanted ID is found or the page passes the highest wanted ID. A store that does
+// not implement store.DeadLetterStore has none.
+func (e *Engine) peekDeadIDs(ctx context.Context, queue store.QueueKey, tasks []store.TaskInfo) (map[int64]struct{}, error) {
+	if e.deadLetters == nil || len(tasks) == 0 {
+		return nil, nil
+	}
+	want := make(map[int64]struct{}, len(tasks))
+	var maxID int64
+	for _, t := range tasks {
+		want[t.ID] = struct{}{}
+		if t.ID > maxID {
+			maxID = t.ID
+		}
+	}
+	found := make(map[int64]struct{})
+	var token []byte
+	pageSize := max(len(tasks), 128)
+	pageSize = min(pageSize, peekMaxPageSize)
+	for {
+		resp, err := e.deadLetters.ListDeadTasks(ctx, &store.ListDeadTasksRequest{
+			Key: queue, PageSize: pageSize, PageToken: token,
+		})
+		if err != nil {
+			return nil, err
+		}
+		past := false
+		for _, d := range resp.Tasks {
+			if d.Task.ID > maxID {
+				past = true
+				break
+			}
+			if _, ok := want[d.Task.ID]; ok {
+				found[d.Task.ID] = struct{}{}
+			}
+		}
+		if past || len(found) == len(want) || len(resp.NextPageToken) == 0 {
+			return found, nil
+		}
+		token = resp.NextPageToken
+	}
 }
 
 // loadedReaders returns the readers of a queue loaded on this Engine (nil otherwise), by
@@ -231,6 +320,8 @@ func (e *Engine) adminQueue(ctx context.Context, queue store.QueueKey) (*physica
 // this Engine (taking it over from another owner, like AddTask). A loaded task is removed from
 // memory and the matcher; a leased one has its lease ended (Ack and Nack return ErrLeaseLost).
 // A poll that matched the task an instant before the delete still delivers it once.
+// An already dead-lettered task returns false: the dead-letter copy is left in place
+// (PurgeDeadTasks removes it).
 func (e *Engine) DeleteTask(ctx context.Context, queue store.QueueKey, ref TaskRef) (bool, error) {
 	tas, ok := e.store.(store.TaskAdminStore)
 	if !ok {
@@ -272,8 +363,10 @@ func (e *Engine) DeleteTask(ctx context.Context, queue store.QueueKey, ref TaskR
 // while it runs may or may not be purged. A write that already pinned the ack level is kept:
 // its passes were chosen before the purge watermark moved, and a lagging fairness key can land
 // below the previous max. Tasks added after PurgeQueue returns are kept. Leases on purged tasks
-// end (Ack and Nack return ErrLeaseLost). Dead tasks are kept (PurgeDeadTasks); sync-matched
-// leases are not in the backlog and are not affected.
+// end (Ack and Nack return ErrLeaseLost). The count is rows removed, so it can include a
+// dead-lettered backlog row that ack-level GC has not deleted yet. Dead-letter copies are
+// kept (DeadTasks is unchanged; PurgeDeadTasks removes them). Sync-matched leases are not in
+// the backlog and are not affected.
 func (e *Engine) PurgeQueue(ctx context.Context, queue store.QueueKey) (int, error) {
 	pqm, err := e.adminQueue(ctx, queue)
 	if err != nil {

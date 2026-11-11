@@ -282,22 +282,32 @@ n, _ := e.PurgeQueue(ctx, queue)               // the whole backlog
 ```
 
 - `PeekTasks` pages the unacked backlog in dispatch order within each priority (subqueue by
-  subqueue). Filters: `Priority`, `FairnessKey` (applied while scanning, so a page can be short
-  with a `NextPageToken`). It reads the store only: it never loads the queue, takes it over or
-  bumps its rangeID. On the owning engine it also hides tasks acked but not yet deleted and sets
-  `Leased`.
+  subqueue). Filters: `Priority`, `FairnessKey` (applied while scanning). A `FairnessKey` filter
+  stops after 10 non-matching rows per returned slot, so a page can be short and still carry a
+  `NextPageToken`. Rows skipped because they are already acked, or because they are in the
+  dead-letter set, do not count against that budget. It reads the store only: it never loads the
+  queue, takes it over or bumps its rangeID. On the owning engine it also hides tasks acked but
+  not yet deleted and sets `Leased`. On any other engine, when the store implements
+  `store.DeadLetterStore`, it hides backlog rows whose IDs are in the dead-letter set (a batch
+  lookup of the IDs just read). That includes a dead-lettered task still sitting behind a lease,
+  whose ack level has not moved and whose backlog row ack-level GC has not deleted.
 - `DeleteTask` and `PurgeQueue` change the backlog, so they run on the owner: they load the queue
   on the calling engine, taking it over from another owner like `AddTask` does (the old owner's
   next fenced write fails and it unloads). A queue that was never persisted gives
   `*store.NotFoundError` and is not created.
 - `DeleteTask` takes the task out of memory and the matcher and deletes its row under the rangeID
   fence. A lease on it ends: `Ack`/`Nack` return `ErrLeaseLost` and nothing is redelivered. A poll
-  that matched the task an instant before the delete still delivers it once. Needs a store that
-  implements `store.TaskAdminStore` (memstore, sqlite and postgres do).
+  that matched the task an instant before the delete still delivers it once. `DeleteTask` returns
+  false for an already dead-lettered task and never touches the dead-letter copy (use
+  `PurgeDeadTasks`). Needs a store that implements `store.TaskAdminStore` (memstore, sqlite and
+  postgres do).
 - `PurgeQueue` moves every subqueue's ack level to its highest written task, persists it, then
-  deletes the rows, and returns the count. Leases on purged tasks end like above. Tasks added
-  while it runs may or may not be purged; tasks added after it returns are kept. Dead tasks
-  (`PurgeDeadTasks`) and sync-matched leases are not touched.
+  deletes the rows. It returns how many rows that delete removed. The count can include
+  dead-lettered backlog rows that ack-level GC has not removed yet, so it can be higher than
+  `DescribeQueue`'s `ApproximateBacklogCount`. `DeadTasks` is unchanged; the dead-letter copies
+  stay until `PurgeDeadTasks`. Leases on purged tasks end like above. Tasks added while it runs
+  may or may not be purged; tasks added after it returns are kept. Sync-matched leases are not
+  in the backlog and are not affected.
 - Metrics, queue-tagged: `tasks_admin_deleted`, `queue_purges`.
 
 ## Observability
