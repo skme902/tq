@@ -19,7 +19,8 @@ var (
 	// ErrEngineStopped is returned after Stop, including by Delivery methods on leases Stop ended.
 	ErrEngineStopped = errors.New("engine stopped")
 	// ErrEngineDraining is returned by PollTask while Engine.Shutdown drains, including to
-	// polls that were already waiting when the drain started.
+	// polls that were already waiting when the drain started, unless the caller's own ctx
+	// was already done (those keep returning ErrNoTasks).
 	ErrEngineDraining = errors.New("engine draining")
 	// ErrLeaseLost is returned by Ack/Nack/Extend after the delivery lease expired or was settled.
 	ErrLeaseLost = errors.New("delivery lease lost")
