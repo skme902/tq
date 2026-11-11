@@ -156,6 +156,53 @@ Dispatch from the matcher is paced by upstream's GCRA-style limiter. A limit of 
 - `Engine.RateLimit(queue)` reports the effective rate (× read partitions) and its source (API, Worker, System).
   Throttled matches increment the `tasks_rate_limited` metric.
 
+## Graceful shutdown
+
+`Engine.Stop` ends every lease at once: backlog tasks are redelivered after the next load and
+sync-matched tasks are spooled, but every in-flight task runs twice. `Stop` waits for an `Ack`,
+`Nack` or lease expiry already in progress to finish its write before it unloads; a concurrent
+`Stop` or `Shutdown` returns only once the first `Stop` has finished.
+`Engine.Shutdown(ctx)` drains first:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := e.Shutdown(ctx); err != nil {
+	log.Printf("stopped with leases outstanding: %v", err) // ctx's error
+}
+```
+
+- From the moment it is called, new `PollTask` calls return `ErrEngineDraining`, and so do polls
+  that were waiting with no match. A poll that had already matched a task (for example inside
+  `Starter`) can still return a `Delivery`; the drain waits for it. With no waiting pollers, `AddTask` cannot sync-match, so new tasks go to the
+  backlog.
+- `AddTask`, `Ack`, `Nack` and `ExtendLease` keep working. A nacked or expired backlog lease goes
+  back to the backlog. A nacked or expired sync-matched lease is spooled to the backlog.
+- It waits until every outstanding lease is settled and every poll that already passed the
+  draining check has returned, then calls `Stop` and returns nil. If `ctx` ends first it returns
+  that error, and `Stop` ends whatever is still outstanding. If `ctx` is done but the drain has
+  finished (no leases left), it returns nil. Concurrent callers share one result: the caller that
+  invokes `Stop` records nil or its own `ctx` error, and every other waiter returns that same
+  error once the engine has stopped. A caller whose own `ctx` ends first is the one that stops.
+  `Shutdown` after a direct `Stop` returns nil. The result is sticky: a later `Shutdown`, even
+  with a fresh `ctx`, returns the first result. `Engine.Draining()` reports whether a drain has
+  started, and stays true after it has stopped the engine.
+- What a drain guarantees: no acknowledged task is lost. A clean drain hands out no lease it
+  then abandons. When `ctx` ends first, a poll still inside `Starter` gets `ErrEngineStopped`
+  instead of a lease and its sync-matched task goes back to `AddTask`, which spools it or, if the
+  engine has already unloaded, returns an error to the producer. The same holds for an `AddTask`
+  whose sync match failed in `Starter` during a clean drain. Producers must treat an `AddTask`
+  error as "not enqueued" and retry (on another engine during shutdown).
+- Delivery stays at-least-once: a task can still be delivered again after a drain. Two known
+  cases: an `Ack` of a backlog lease the reader had trimmed from memory is kept in memory only
+  until the ack level passes it, so it is redelivered after the next load; and an `AddTask`
+  whose spool write commits while the queue unloads can report an error (upstream's writer
+  behaviour), so a producer retry writes a second copy.
+- Metrics (no queue tags): `engine_draining` (1 while draining, 0 after),
+  `engine_drain_leases_remaining` (outstanding leases plus in-flight polls, sampled under the
+  lease lock when Shutdown decides; 0 when the drain finishes), `engine_drain_duration`. The lease gauge and the duration
+  are emitted once, by the call that stops the engine.
+
 ## Observability
 
 ### Metrics

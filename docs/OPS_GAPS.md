@@ -38,7 +38,7 @@ Reference points:
 |---|---|---|---|
 | 1 | Max attempts, poison tasks and a DLQ (with redrive) | P0 | M–L |
 | 2 | Task admin: peek and browse, delete one task, purge a queue | P0 | M |
-| 3 | Graceful drain on shutdown (finish in-flight leases before Stop) | P0 | S |
+| 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
 | 4 | Retry backoff and delayed visibility on Nack | P1 | M |
 | 5 | Pause and resume of a queue or a fairness key | P1 | M |
 | 6 | Shared, persisted runtime config with an audit trail | P1 | M–L |
@@ -112,7 +112,14 @@ The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so b
     conformance tests.
   - **Leases.** In-flight leases on purged tasks become lost (`ErrLeaseLost` on Ack, harmless).
 
-## 3. Graceful drain on shutdown — P0, S
+## 3. Graceful drain on shutdown — P0, S — done
+
+**Status: implemented in feat/ops-drain** as `Engine.Shutdown(ctx)` / `Engine.Draining()` / `ErrEngineDraining`
+(README §Graceful shutdown). Refinement: there is no separate `Drain` that leaves the engine running; Shutdown
+drains then stops. Readiness is not part of this item: a readiness check (item 7) should report not-ready while
+`Draining()` is true.
+
+Original analysis (superseded by the status above):
 
 - **Today.**
   - `Engine.Stop` ends every lease immediately with `ErrEngineStopped`. It re-spools sync-matched tasks and leaves

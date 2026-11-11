@@ -5,6 +5,9 @@
 // (stride scheduling per fairness key within each priority level) and upstream's rate
 // limiting (whole-queue and per-fairness-key next-ready-time limiters).
 //
+// Stop ends an engine immediately. Shutdown(ctx) drains outstanding leases and in-flight
+// polls, then stops; if ctx ends first it stops anyway and returns ctx's error.
+//
 // See README.md for usage and docs/UPSTREAM_MAP.md for the upstream mapping.
 //
 // The package name is taskqueue while the module path ends in tq; import it as
@@ -18,7 +21,7 @@ import (
 )
 
 type (
-	// Engine owns the loaded queues. Create with New, release with Stop.
+	// Engine owns the loaded queues. Create with New; release with Stop, or Shutdown(ctx) to drain first.
 	Engine = matching.Engine
 	// Options configures an Engine.
 	Options = matching.Options
@@ -91,6 +94,8 @@ var (
 	ErrResourceExhausted = matching.ErrResourceExhausted
 	// ErrEngineStopped is returned after Stop, including by Delivery methods on leases Stop ended.
 	ErrEngineStopped = matching.ErrEngineStopped
+	// ErrEngineDraining is returned by Engine.PollTask while Engine.Shutdown drains.
+	ErrEngineDraining = matching.ErrEngineDraining
 	// ErrLeaseLost is returned by Delivery methods after the lease expired or was settled.
 	ErrLeaseLost = matching.ErrLeaseLost
 	// ErrDropTask may be returned (wrapped) by a Starter to drop a task.

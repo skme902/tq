@@ -37,17 +37,20 @@ type Delivery struct {
 
 	deliveredAt time.Time
 
+	// released is closed by release, after the settling side effect.
+	released chan struct{}
+
 	mu       sync.Mutex
 	settled  bool
 	lostErr  error // returned by Ack/Nack/ExtendLease once settled
 	deadline time.Time
 }
 
-// newDelivery leases a matched task to a poller. It fails with ErrEngineStopped once Stop has
-// snapshotted the leases. A refused sync-matched task is finished with that error, so the
-// partition manager spools it (or AddTask reports the error) instead of handing out an
-// in-memory-only task that Stop would never re-spool (REVIEW M1); a refused backlog task is
-// returned to its reader.
+// newDelivery leases a matched task to a poller. It fails with ErrEngineStopped once leasing is
+// closed: Shutdown has decided the drain is over, or Stop has snapshotted the leases. A refused
+// sync-matched task is finished with that error, so the partition manager spools it (or AddTask
+// reports the error) instead of handing out an in-memory-only task that Stop would never
+// re-spool (REVIEW M1); a refused backlog task is returned to its reader.
 func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerImpl, queue store.QueueKey, lease time.Duration) (*Delivery, error) {
 	if lease <= 0 {
 		lease = e.config.DeliveryLeaseDuration
@@ -62,6 +65,7 @@ func (e *Engine) newDelivery(task *internalTask, pqm *physicalTaskQueueManagerIm
 		task:        task,
 		deliveredAt: now,
 		deadline:    now.Add(lease),
+		released:    make(chan struct{}),
 	}
 	if !d.SyncMatched {
 		d.TaskID = task.event.ID
@@ -159,38 +163,44 @@ func (d *Delivery) stopTimer() {
 
 func (d *Delivery) release() {
 	d.pqm.outstandingLeases.Add(-1)
-	d.engine.leasesLock.Lock()
-	delete(d.engine.leases, d)
-	d.engine.leasesLock.Unlock()
+	e := d.engine
+	e.leasesLock.Lock()
+	delete(e.leases, d)
+	e.maybeWakeDrainLocked()
+	e.leasesLock.Unlock()
 	d.pqm.MarkAlive()
+	close(d.released)
 }
 
 // Ack completes the task. It returns ErrLeaseLost if the lease already expired or was settled,
 // or ErrEngineStopped if Stop ended the lease (the task is then redelivered after a reload).
+// The backlog finish runs before release so a waiting Shutdown cannot Stop until the ack is
+// recorded; a sync-matched task was finished in newDelivery.
 func (d *Delivery) Ack() error {
 	if !d.settle() {
 		return d.lost()
 	}
 	d.stopTimer()
-	d.release()
 	if !d.SyncMatched {
 		d.task.finish(taskFinishResult{consumedToken: true})
 	}
 	h := d.pqm.metricsHandler
 	h.Counter(metrics.DeliveryAcked, 1)
 	h.Timer(metrics.DeliveryAckLatency, d.engine.timeSource.Since(d.deliveredAt))
+	d.release()
 	return nil
 }
 
-// Nack releases the task for immediate redelivery.
+// Nack releases the task for immediate redelivery. Redeliver (backlog back to the matcher,
+// sync-matched spooled) runs before release so Shutdown cannot Stop in between.
 func (d *Delivery) Nack() error {
 	if !d.settle() {
 		return d.lost()
 	}
 	d.stopTimer()
-	d.release()
-	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
 	d.redeliver(errNacked)
+	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
+	d.release()
 	return nil
 }
 
@@ -222,8 +232,12 @@ func (d *Delivery) expire() {
 	d.lostErr = ErrLeaseLost
 	d.mu.Unlock()
 	d.pqm.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
-	d.release()
-	go d.redeliver(errLeaseExpired) // not under the timer callback
+	// Not under the timer callback. Redeliver before release so a waiting Shutdown cannot
+	// Stop until the task is back on the backlog (or spooled, for a sync match).
+	go func() {
+		d.redeliver(errLeaseExpired)
+		d.release()
+	}()
 }
 
 func (d *Delivery) redeliver(err error) {
