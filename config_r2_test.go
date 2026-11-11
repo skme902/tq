@@ -66,3 +66,40 @@ func TestUnchangedRewriteDoesNotNotify(t *testing.T) {
 	require.EqualValues(t, 1, na.Load())
 	require.EqualValues(t, 1, nb.Load())
 }
+
+// Close called from a watcher that the poll goroutine is running returns instead of waiting
+// for that goroutine (review config r2 P1).
+func TestCloseFromPollerWatcher(t *testing.T) {
+	st := memstore.New()
+	ctx := context.Background()
+	a := manualStoreSource(t, st)
+	b, err := taskqueue.NewStoreQueueConfigSource(ctx, st, taskqueue.StoreQueueConfigSourceOptions{PollInterval: 10 * time.Millisecond})
+	require.NoError(t, err)
+	closed := make(chan struct{})
+	b.WatchQueueConfig(q, func() { b.Close(); close(closed) })
+	_, err = a.Update(ctx, q, taskqueue.ConfigChange{Identity: "a"}, pause(true))
+	require.NoError(t, err)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close from the poller's watcher deadlocked")
+	}
+	b.Close() // idempotent, and the poller has stopped or is stopping
+}
+
+// A panicking watcher does not kill the poll goroutine: later changes still arrive.
+func TestPanickingWatcherKeepsPolling(t *testing.T) {
+	st := memstore.New()
+	ctx := context.Background()
+	a := manualStoreSource(t, st)
+	b, err := taskqueue.NewStoreQueueConfigSource(ctx, st, taskqueue.StoreQueueConfigSourceOptions{PollInterval: 10 * time.Millisecond})
+	require.NoError(t, err)
+	t.Cleanup(b.Close)
+	b.WatchQueueConfig(q, func() { panic("watcher bug") })
+	_, err = a.Update(ctx, q, taskqueue.ConfigChange{Identity: "a"}, pause(true))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return b.QueueConfig(q).Paused }, 5*time.Second, 5*time.Millisecond)
+	_, err = a.Update(ctx, q, taskqueue.ConfigChange{Identity: "a"}, pause(false))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !b.QueueConfig(q).Paused }, 5*time.Second, 5*time.Millisecond)
+}

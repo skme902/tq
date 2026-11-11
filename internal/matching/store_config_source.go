@@ -67,7 +67,11 @@ type StoreQueueConfigSource struct {
 	version map[store.QueueKey]int64
 	seq     int64
 	cancel  context.CancelFunc
-	done    chan struct{}
+
+	pollMu       sync.Mutex // guards the two fields below; pollCond signals their changes
+	pollCond     *sync.Cond
+	pollStopped  bool // the poll goroutine has returned
+	pollNotifies bool // the poll goroutine is running watcher callbacks
 }
 
 // NewStoreQueueConfigSource loads every stored config (it fails if the store does) and
@@ -96,8 +100,8 @@ func NewStoreQueueConfigSource(ctx context.Context, st store.QueueConfigStore, o
 		st: st, opts: opts,
 		mem:     NewMemoryQueueConfigSource(opts.MaxFairnessOverrides),
 		version: make(map[store.QueueKey]int64),
-		done:    make(chan struct{}),
 	}
+	s.pollCond = sync.NewCond(&s.pollMu)
 	if err := s.loadCurrent(ctx); err != nil {
 		return nil, err
 	}
@@ -108,13 +112,28 @@ func NewStoreQueueConfigSource(ctx context.Context, st store.QueueConfigStore, o
 }
 
 // Close stops polling. The cache keeps serving the last values.
+//
+// Close may be called from a watcher callback (review config r2 P1): while the poll goroutine
+// is running callbacks, Close returns once polling is cancelled instead of waiting for the poll
+// goroutine, which then exits after the callbacks return.
 func (s *StoreQueueConfigSource) Close() {
 	s.cancel()
-	<-s.done
+	s.pollMu.Lock()
+	for !s.pollStopped && !s.pollNotifies {
+		s.pollCond.Wait()
+	}
+	s.pollMu.Unlock()
+}
+
+func (s *StoreQueueConfigSource) setPollState(f func()) {
+	s.pollMu.Lock()
+	f()
+	s.pollMu.Unlock()
+	s.pollCond.Broadcast()
 }
 
 func (s *StoreQueueConfigSource) poll(ctx context.Context) {
-	defer close(s.done)
+	defer s.setPollState(func() { s.pollStopped = true })
 	for {
 		ch, timer := s.opts.TimeSource.NewTimer(s.opts.PollInterval)
 		select {
@@ -123,7 +142,7 @@ func (s *StoreQueueConfigSource) poll(ctx context.Context) {
 			return
 		case <-ch:
 		}
-		if err := s.Refresh(ctx); err != nil && ctx.Err() == nil {
+		if err := s.refresh(ctx, true); err != nil && ctx.Err() == nil {
 			s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
 			s.opts.Logger.Warn("queue config refresh failed", "error", err)
 		}
@@ -147,6 +166,10 @@ func (s *StoreQueueConfigSource) WatchQueueConfig(queue store.QueueKey, onChange
 // pause) never reaches the matcher. A newest version that does not decode is logged and
 // skipped; older rows of that queue are not replayed instead.
 func (s *StoreQueueConfigSource) Refresh(ctx context.Context) error {
+	return s.refresh(ctx, false)
+}
+
+func (s *StoreQueueConfigSource) refresh(ctx context.Context, onPoller bool) error {
 	const page = 500
 	s.mu.Lock()
 	after := s.seq
@@ -167,12 +190,22 @@ func (s *StoreQueueConfigSource) Refresh(ctx context.Context) error {
 			break
 		}
 	}
+	var changed []store.QueueKey
 	for _, r := range newest {
-		s.install(r.Key, r.Version, s.resolve(ctx, r))
+		if s.install(r.Key, r.Version, s.resolve(ctx, r)) {
+			changed = append(changed, r.Key)
+		}
 	}
 	s.mu.Lock()
-	s.seq = max(s.seq, after)
+	s.seq = max(s.seq, after) // before the callbacks: a stuck callback does not hold back the feed
 	s.mu.Unlock()
+	if onPoller && len(changed) > 0 {
+		s.setPollState(func() { s.pollNotifies = true })
+		defer s.setPollState(func() { s.pollNotifies = false })
+	}
+	for _, k := range changed {
+		s.notify(k)
+	}
 	return nil
 }
 
@@ -187,7 +220,7 @@ func (s *StoreQueueConfigSource) loadCurrent(ctx context.Context) error {
 	var seq int64
 	for _, r := range recs {
 		seq = max(seq, r.Seq)
-		s.install(r.Key, r.Version, s.resolve(ctx, r))
+		s.install(r.Key, r.Version, s.resolve(ctx, r)) // no watchers yet
 	}
 	s.mu.Lock()
 	s.seq = max(s.seq, seq)
@@ -232,14 +265,14 @@ func (s *StoreQueueConfigSource) decodeValid(b []byte) (QueueConfig, error) {
 	return cfg, nil
 }
 
-// install caches cfg as the queue's config if version is newer than the cached one, then
-// notifies watchers with no lock of this source held: a watcher may call back into the source
-// (QueueConfig, Update, Refresh), and one queue's notification does not block other queues.
-func (s *StoreQueueConfigSource) install(key store.QueueKey, version int64, cfg QueueConfig) {
+// install caches cfg as the queue's config if version is newer than the cached one, and
+// reports whether the cached config changed; the caller then notifies (notify), with no lock
+// of this source held, so one queue's notification does not block other queues.
+func (s *StoreQueueConfigSource) install(key store.QueueKey, version int64, cfg QueueConfig) (changed bool) {
 	s.mu.Lock()
 	if version <= s.version[key] {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.version[key] = version
 	s.mem.mu.Lock()
@@ -247,9 +280,20 @@ func (s *StoreQueueConfigSource) install(key store.QueueKey, version int64, cfg 
 	s.mem.cfgs[key] = cfg
 	s.mem.mu.Unlock()
 	s.mu.Unlock()
-	if !same { // an unchanged rewrite does not make loaded queues reprocess (review config r2 P1)
-		s.mem.notifyQueue(key)
-	}
+	return !same // an unchanged rewrite does not make loaded queues reprocess (review config r2 P1)
+}
+
+// notify runs the queue's watchers with no lock of this source held: a watcher may call back
+// into the source (QueueConfig, Update, Refresh, Close). A panicking watcher is logged and
+// counted as a refresh failure instead of killing the poll goroutine.
+func (s *StoreQueueConfigSource) notify(key store.QueueKey) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.opts.Metrics.Counter(metrics.QueueConfigRefreshFailures, 1)
+			s.opts.Logger.Error("queue config watcher panicked", "queue", key.String(), "panic", p)
+		}
+	}()
+	s.mem.notifyQueue(key)
 }
 
 // Update changes one queue's config: mutate gets a copy of the current stored value, and
@@ -309,7 +353,9 @@ func (s *StoreQueueConfigSource) Update(ctx context.Context, queue store.QueueKe
 		if err != nil {
 			return QueueConfig{}, err
 		}
-		s.install(queue, out.Version, cached) // the feed position stays: it may hold others' writes
+		if s.install(queue, out.Version, cached) { // the feed position stays: it may hold others' writes
+			s.notify(queue)
+		}
 		return decodeQueueConfig(blob)
 	}
 	return QueueConfig{}, lastErr
