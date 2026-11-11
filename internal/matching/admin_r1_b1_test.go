@@ -131,6 +131,129 @@ func TestAckDuringDeleteKeepsBacklogCount(t *testing.T) {
 	require.Equal(t, int64(1), backlogCount(t, e))
 }
 
+// deleteReadGate fails the first DeleteTask after a backlog read has observed the
+// adminDeleted mark, and holds the first GetTasks until that delete has started.
+type deleteReadGate struct {
+	*memstore.Store
+	getOnce       sync.Once
+	delOnce       sync.Once
+	getEntered    chan struct{}
+	deleteStarted chan struct{}
+	releaseDelete chan struct{}
+	getReturned   chan struct{}
+}
+
+func (g *deleteReadGate) GetTasks(ctx context.Context, req *store.GetTasksRequest) (*store.GetTasksResponse, error) {
+	block := false
+	g.getOnce.Do(func() { block = true })
+	if block {
+		close(g.getEntered)
+		select {
+		case <-g.deleteStarted:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		res, err := g.Store.GetTasks(ctx, req)
+		close(g.getReturned)
+		return res, err
+	}
+	return g.Store.GetTasks(ctx, req)
+}
+
+func (g *deleteReadGate) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (bool, error) {
+	block := false
+	g.delOnce.Do(func() { block = true })
+	if block {
+		close(g.deleteStarted)
+		select {
+		case <-g.releaseDelete:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+		return false, &store.TransientError{Err: errors.New("injected delete failure")}
+	}
+	return g.Store.DeleteTask(ctx, req)
+}
+
+// A failed DeleteTask must not swallow a task a concurrent read already fetched.
+func TestDeleteFailureStillDeliversTask(t *testing.T) {
+	inner := memstore.New()
+	e1 := newR2Engine(t, inner, nil, nil, nil)
+	for _, p := range []string{"low", "high"} {
+		_, err := e1.AddTask(context.Background(), portQueue, store.Task{Payload: []byte(p)})
+		require.NoError(t, err)
+	}
+	e1.Stop()
+	rows := backlogRows(t, inner)
+	require.Len(t, rows, 2)
+	low := rows[0]
+	high := fairLevel{pass: rows[1].Pass, id: rows[1].ID}
+
+	g := &deleteReadGate{
+		Store:         inner,
+		getEntered:    make(chan struct{}),
+		deleteStarted: make(chan struct{}),
+		releaseDelete: make(chan struct{}),
+		getReturned:   make(chan struct{}),
+	}
+	t.Cleanup(func() { closeOnce(g.releaseDelete) })
+	e := newR2Engine(t, g, nil, nil, nil)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := e.DeleteTask(context.Background(), portQueue, TaskRef{Subqueue: 0, Pass: low.Pass, ID: low.ID})
+		errCh <- err
+	}()
+	select {
+	case <-g.getEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("backlog read did not start")
+	}
+	select {
+	case <-g.deleteStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("delete did not start")
+	}
+	// The read fetched both rows and its merge now holds the reader lock while it waits for
+	// the db lock that the in-flight delete holds. Release the delete only then, so the merge
+	// sees the adminDeleted mark, skips "low" and moves readLevel past it.
+	select {
+	case <-g.getReturned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("backlog read did not return")
+	}
+	tr := subqueueReader(t, e)
+	require.Eventually(t, func() bool {
+		if tr.lock.TryLock() {
+			tr.lock.Unlock()
+			return false
+		}
+		return true
+	}, 3*time.Second, time.Millisecond, "merge should hold the reader lock")
+	closeOnce(g.releaseDelete)
+	readLevel, _ := tr.getLevels()
+	require.False(t, readLevel.less(high), "read should have moved past the task it skipped")
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("DeleteTask did not return")
+	}
+	// The rewound read reloads the task the failed delete skipped: both are delivered
+	// without a restart.
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		d, err := e.PollTask(pctx, portQueue, PollOptions{})
+		pcancel()
+		require.NoError(t, err, "poll %d, got %v", i, got)
+		got[string(d.Task.Payload)] = true
+		require.NoError(t, d.Ack())
+	}
+	require.Equal(t, map[string]bool{"low": true, "high": true}, got)
+}
+
 type createGate struct {
 	*memstore.Store
 	mu      sync.Mutex

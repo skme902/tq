@@ -36,6 +36,10 @@ func (tr *fairTaskReader) adminDeleteTask(ctx context.Context, tas store.TaskAdm
 		tr.adminDeleted = make(map[fairLevel]struct{})
 	}
 	tr.adminDeleted[level] = struct{}{}
+	if tr.adminInFlight == nil {
+		tr.adminInFlight = make(map[fairLevel]*store.TaskInfo)
+	}
+	tr.adminInFlight[level] = nil // pins the ack level until the delete returns
 	tr.lock.Unlock()
 
 	db := tr.backlogMgr.db
@@ -44,12 +48,29 @@ func (tr *fairTaskReader) adminDeleteTask(ctx context.Context, tas store.TaskAdm
 		testHookAfterAdminStoreDelete()
 	}
 	tr.lock.Lock()
-	defer tr.lock.Unlock()
+	skipped := tr.adminInFlight[level]
+	delete(tr.adminInFlight, level)
 	if err != nil {
 		delete(tr.adminDeleted, level)
+		// A read that ran during the delete skipped this row and may have moved past it.
+		// The row is still in the store: merge it back now. The ack level was pinned
+		// while the delete ran, so it cannot have moved past the row.
+		var restored []*internalTask
+		if skipped != nil {
+			restored = tr.mergeTasksLocked([]*store.TaskInfo{skipped}, mergeWrite)
+		}
+		tr.advanceAckLevelLocked()
+		tr.maybeReadTasksLocked()
+		tr.lock.Unlock()
+		for _, task := range restored {
+			tr.addTaskToMatcher(task)
+		}
 		tr.backlogMgr.signalIfFatal(err)
 		return false, nil, err
 	}
+	defer tr.lock.Unlock()
+	// The ack level was pinned during the delete; let it advance once we are done.
+	defer tr.advanceAckLevelLocked()
 	var leased *internalTask
 	inMemory := false
 	// The task may have been acked while the store delete ran. The completion
