@@ -7,6 +7,7 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"sync"
@@ -54,6 +55,10 @@ type (
 		// skipFinalUpdate controls behavior on Stop: if it's false, we try to write one final
 		// update before unloading
 		skipFinalUpdate atomic.Bool
+
+		// lastStoreErr is the most recent store error seen by signalIfFatal (library
+		// addition, for Engine.Health); nil if none.
+		lastStoreErr atomic.Pointer[storeErrNote]
 	}
 )
 
@@ -91,6 +96,10 @@ func newFairBacklogManager(
 func (c *fairBacklogManagerImpl) signalIfFatal(err error) bool {
 	if err == nil {
 		return false
+	}
+	// Deviation (Engine.Health): remember the error for the degraded report.
+	if !errors.Is(err, context.Canceled) {
+		c.lastStoreErr.Store(&storeErrNote{at: c.timeSource.Now(), err: err.Error()})
 	}
 	if store.IsConditionFailed(err) {
 		c.metricsHandler.Counter(metrics.ConditionFailedErrors, 1)

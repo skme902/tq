@@ -759,3 +759,32 @@ func (s *Store) DeleteTask(ctx context.Context, req *store.DeleteTaskRequest) (b
 	})
 	return n > 0, err
 }
+
+// CheckHealth pings both pools and reads the applied schema version; want is the highest
+// embedded migration.
+func (s *Store) CheckHealth(ctx context.Context, want int) (store.StoreHealth, error) {
+	h := store.StoreHealth{WantSchemaVersion: want}
+	if err := s.w.PingContext(ctx); err != nil {
+		return h, s.wrap("Ping", err)
+	}
+	if s.r != s.w {
+		if err := s.r.PingContext(ctx); err != nil {
+			return h, s.wrap("Ping", err)
+		}
+	}
+	var v sql.NullInt64
+	if err := s.r.QueryRowContext(ctx, `SELECT MAX(version) FROM tq_schema_version`).Scan(&v); err != nil {
+		return h, s.wrap("SchemaVersion", err)
+	}
+	h.SchemaVersion = int(v.Int64)
+	return h, nil
+}
+
+// LatestMigration returns the highest version in ms (0 if empty).
+func LatestMigration(ms []Migration) int {
+	n := 0
+	for _, m := range ms {
+		n = max(n, m.Version)
+	}
+	return n
+}

@@ -123,6 +123,16 @@ func Migrate(ctx context.Context, db *sql.DB) ([]int, error) {
 	return sqlcore.Migrate(ctx, db, dialect, ms)
 }
 
+// CheckHealth implements store.HealthChecker: a ping of the pool(s) and the applied schema
+// version against the newest embedded migration.
+func (s *Store) CheckHealth(ctx context.Context) (store.StoreHealth, error) {
+	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
+	if err != nil {
+		return store.StoreHealth{}, err
+	}
+	return s.Store.CheckHealth(ctx, sqlcore.LatestMigration(ms))
+}
+
 // DB returns the underlying pool.
 func (s *Store) DB() *sql.DB { return s.db }
 

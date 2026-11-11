@@ -274,3 +274,26 @@ func TestMigrateUpgradeKeepsData(t *testing.T) {
 		run(t, st.DB(), sqlcore.Dialect{Name: "postgres", NumberedPlaceholders: true}, postgres.Migrations(), st)
 	})
 }
+
+// CheckHealth reports the applied schema against the embedded one: behind before Migrate,
+// current after, and an error once the pool is closed.
+func TestCheckHealthSchemaVersion(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(ctx, t.TempDir()+"/h.db", sqlite.Options{})
+	require.NoError(t, err)
+	ms, err := sqlcore.LoadMigrations(sqlite.Migrations(), ".")
+	require.NoError(t, err)
+	_, err = sqlcore.Migrate(ctx, st.WriteDB(), sqlcore.Dialect{Name: "sqlite"}, ms[:1])
+	require.NoError(t, err)
+	h, err := st.CheckHealth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, h.SchemaVersion)
+	require.Equal(t, len(ms), h.WantSchemaVersion)
+	require.NoError(t, st.Migrate(ctx))
+	h, err = st.CheckHealth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, h.WantSchemaVersion, h.SchemaVersion)
+	require.NoError(t, st.Close())
+	_, err = st.CheckHealth(ctx)
+	require.Error(t, err)
+}

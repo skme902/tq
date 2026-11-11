@@ -180,6 +180,26 @@ if err := e.Shutdown(ctx); err != nil {
 - Metrics (no queue tags): `engine_draining` (1 while draining, 0 after),
   `engine_drain_leases_remaining` (leases `Stop` had to end), `engine_drain_duration`.
 
+## Health
+
+```go
+http.Handle("/", health.Handler(engine, health.Options{Timeout: 2 * time.Second}))
+// GET /livez  -> 200 while the engine is not stopped (never touches the store)
+// GET /readyz -> 200 when Engine.Health(ctx).Ready, else 503; JSON body
+```
+
+- `Engine.Live()` is false once the engine is stopped.
+- `Engine.Health(ctx)` reports `Ready` = live, not draining, the store answered a ping, and its
+  schema is current (`SchemaVersion >= WantSchemaVersion`: the newest migration the build embeds).
+  Stores opt in with `store.HealthChecker` (memstore, sqlite and postgres do); for another store
+  only liveness and draining count.
+- `Degraded` lists loaded queues that saw a store error in the last minute
+  (`HealthDegradedWindow`), with the error. It does not make the engine unready.
+- `Health` never loads or takes over a queue. Metrics: `engine_ready` (0/1, set on each call),
+  `store_health_latency`.
+- During `Shutdown` readiness turns false first, so a load balancer stops routing before leases
+  drain.
+
 ## Dead letters
 
 By default a task that is nacked or whose lease expires is redelivered forever. Set a limit to

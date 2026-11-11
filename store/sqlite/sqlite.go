@@ -186,6 +186,16 @@ func isBusy(err error) bool {
 
 // Migrate applies pending embedded migrations in one BEGIN IMMEDIATE transaction (which
 // serialises concurrent migrators). Safe to call on every start-up.
+// CheckHealth implements store.HealthChecker: a ping of the pool(s) and the applied schema
+// version against the newest embedded migration.
+func (s *Store) CheckHealth(ctx context.Context) (store.StoreHealth, error) {
+	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
+	if err != nil {
+		return store.StoreHealth{}, err
+	}
+	return s.Store.CheckHealth(ctx, sqlcore.LatestMigration(ms))
+}
+
 func (s *Store) Migrate(ctx context.Context) error {
 	ms, err := sqlcore.LoadMigrations(migrationsFS, "migrations")
 	if err != nil {
