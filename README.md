@@ -186,7 +186,7 @@ omits every queue.
 | `physical_approximate_backlog_count`, `physical_approximate_backlog_age_seconds` | gauge | `task_priority` (count) | at each ack-level sync; unprefixed names if the interval is negative |
 | `task_write_latency`, `task_write_throttle` | timer, counter | | backlog writes |
 | `tasks_rate_limited` | counter | | match throttled by the rate limiter |
-| `tasks_dropped` | counter | `reason` | task dropped (expired, Starter, …) |
+| `tasks_dropped` | counter | `reason` (`expired_read`, `expired_memory`, `invalid`, `starter`) | task dropped |
 | `task_rewrites`, `task_retry_transient`, `task_completed_missing`, `condition_failed_errors`, `lease_requests`, `lease_failures`, `fair_reader_stuck_detected` | counter | | backlog internals |
 | `task_queue_started`, `task_queue_stopped` | counter | `cause` (stopped) | queue load / unload |
 

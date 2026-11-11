@@ -64,8 +64,8 @@ The top eight are 1–8. Items 2, 5, 10 and 16 share one admin API surface, so b
     `redeliver` → `task.finish(err)` for backlog tasks, or a re-spool for sync tasks.
   - Nothing counts attempts: `store.Task` has `Payload`, `Priority`, `CreateTime` and `ExpiryTime` only.
   - A task that always fails, or that crashes its consumer, is delivered forever and blocks its fairness key's share.
-  - The only exits are `ExpiryTime` (dropped with `tasks_dropped{reason=expired}`) and `Starter` returning
-    `ErrDropTask`, which drops the task (`tasks_dropped{reason=...}`) without keeping it anywhere.
+  - The only exits are `ExpiryTime` (dropped with `tasks_dropped{reason=expired_read|expired_memory}`) and `Starter` returning
+    `ErrDropTask`, which drops the task (`tasks_dropped{reason=starter}`) without keeping it anywhere.
   - Upstream has no task-level attempt count either, because history owns retries. That is why it is missing here.
 - **Missing.**
   - An attempt counter.
