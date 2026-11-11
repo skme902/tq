@@ -49,6 +49,9 @@ func (tr *fairTaskReader) adminDeleteTask(ctx context.Context, tas store.TaskAdm
 			e.task.leased = false
 			tr.leasedTasks--
 			leased = e.task
+		} else if e.task.delayed {
+			tr.undelayLocked(e.task)
+			e.task.adminRemove()
 		} else {
 			tr.loadedTasks--
 			e.task.adminRemove() // out of the matcher (a poll that already took it still delivers it)
@@ -95,6 +98,9 @@ func (tr *fairTaskReader) adminPurge() (leased []*internalTask, exclusiveMax fai
 			o.task.leased = false
 			tr.leasedTasks--
 			leased = append(leased, o.task)
+		} else if o.task.delayed {
+			tr.undelayLocked(o.task)
+			o.task.adminRemove()
 		} else {
 			tr.loadedTasks--
 			o.task.adminRemove()
@@ -127,7 +133,7 @@ func (tr *fairTaskReader) adminPurge() (leased []*internalTask, exclusiveMax fai
 	}
 	// What is left in memory is above the purge point; anything else above it is unknown
 	// (written concurrently), and the next read to the end corrects the count.
-	tr.backlogMgr.db.updateFairAckLevel(tr.subqueue, tr.ackLevel, 0, int64(tr.loadedTasks+tr.leasedTasks), tr.backlogAge.oldestTime())
+	tr.backlogMgr.db.updateFairAckLevel(tr.subqueue, tr.ackLevel, 0, int64(tr.loadedTasks+tr.leasedTasks+tr.delayedTasks), tr.backlogAge.oldestTime())
 	tr.maybeReadTasksLocked()
 	return leased, tr.ackLevel.inc()
 }

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/skme902/tq/clock"
 	"github.com/skme902/tq/store"
 )
 
@@ -82,6 +83,13 @@ type (
 		// leased is true while a backlog task is held under a delivery lease and tracked by the
 		// reader as leased rather than loaded. Guarded by the owning fairTaskReader's lock.
 		leased bool
+		// delayed is true while a loaded backlog task waits for its visibility time (library
+		// addition) and is tracked as delayed rather than loaded. Guarded like leased.
+		delayed    bool
+		delayTimer clock.Timer
+		// redeliverAt (unix nanos, 0 = none) is set by a delayed Nack or expiry before the task
+		// is finished back to its reader, which then delays it instead of re-matching it.
+		redeliverAt atomic.Int64
 	}
 
 	// taskResponse is used to report the result of either a match with a local poller,

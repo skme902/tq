@@ -193,7 +193,17 @@ func (d *Delivery) Ack() error {
 type NackOption func(*nackOptions)
 
 type nackOptions struct {
-	reason string
+	reason   string
+	delay    time.Duration
+	hasDelay bool
+}
+
+// NackDelay redelivers the task no earlier than d from now instead of immediately (or after
+// Config.RetryBackoff); NackDelay(0) redelivers immediately even with a backoff configured.
+// For a backlog task the delay is written to its row (Task.VisibleAt). A sync-matched task is
+// spooled with that VisibleAt. It does not apply when this Nack dead-letters the task.
+func NackDelay(d time.Duration) NackOption {
+	return func(o *nackOptions) { o.delay, o.hasDelay = max(d, 0), true }
 }
 
 // NackReason records why the consumer gave up on the task. It is kept only if this Nack
@@ -215,7 +225,11 @@ func (d *Delivery) Nack(opts ...NackOption) error {
 	d.stopTimer()
 	d.release()
 	d.pqm.metricsHandler.Counter(metrics.DeliveryNacked, 1)
-	d.redeliver(errNacked, DeadReasonNack, o.reason)
+	delay := d.engine.config.RetryBackoff.delay(d.Task.Attempts)
+	if o.hasDelay {
+		delay = o.delay
+	}
+	d.redeliver(errNacked, DeadReasonNack, o.reason, delay)
 	return nil
 }
 
@@ -248,21 +262,28 @@ func (d *Delivery) expire() {
 	d.mu.Unlock()
 	d.pqm.metricsHandler.Counter(metrics.DeliveryLeaseExpired, 1)
 	d.release()
-	go d.redeliver(errLeaseExpired, DeadReasonLeaseExpired, "") // not under the timer callback
+	go d.redeliver(errLeaseExpired, DeadReasonLeaseExpired, "", d.engine.config.RetryBackoff.delay(d.Task.Attempts)) // not under the timer callback
 }
 
 // redeliver returns a failed delivery's task to the queue, or dead-letters a backlog task that
 // used its last attempt. A sync-matched task has no backlog row to move: it is spooled with its
 // attempt count and dead-lettered when next matched (reason attempts_exhausted).
-func (d *Delivery) redeliver(err error, reason, detail string) {
+func (d *Delivery) redeliver(err error, reason, detail string, delay time.Duration) {
+	var visibleAt time.Time
+	if delay > 0 {
+		visibleAt = d.engine.timeSource.Now().Add(delay)
+	}
 	if d.SyncMatched {
-		d.engine.respoolSyncTaskLocked(d, false)
+		d.engine.respoolSyncTask(d, false, visibleAt)
 		return
 	}
 	if max := d.pqm.maxAttempts(); max > 0 && d.Task.Attempts >= max {
 		if d.engine.deadLetter(d.pqm, d.task, reason, detail, true) {
 			return
 		}
+	}
+	if !visibleAt.IsZero() {
+		d.engine.delayRedelivery(d.pqm, d.task, visibleAt)
 	}
 	d.task.finish(taskFinishResult{err: err, consumedToken: true})
 }

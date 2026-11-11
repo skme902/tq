@@ -116,12 +116,27 @@ type Config struct {
 	// by AddTask, so it covers tasks added after it is set; expired tasks are then dropped
 	// like any task past its ExpiryTime. 0, the default, adds no cap.
 	MaxTaskAge time.Duration
+
+	// RetryBackoff, if Initial is positive, delays redelivery of a nacked or expired backlog
+	// task by an exponential backoff on its attempt count (library addition). A Nack with
+	// NackDelay overrides it. The zero value, the default, redelivers immediately as before.
+	// The delay is written to the task row (VisibleAt) when the store implements
+	// store.DeadLetterStore, so it survives a reload; otherwise it applies in memory only.
+	RetryBackoff RetryBackoff
+
+	// MaxDelayedInMemory is how many delayed tasks (Task.VisibleAt in the future) one
+	// subqueue reader holds without counting them toward GetTasksBatchSize (library
+	// addition). Past it they count as loaded, so a backlog with more delayed tasks than
+	// this plus GetTasksBatchSize ahead of ready ones delays those ready ones too.
+	// Default 10000.
+	MaxDelayedInMemory int
 }
 
 // DefaultConfig returns upstream defaults.
 func DefaultConfig() Config {
 	return Config{
 		LongPollExpirationInterval:      time.Minute,
+		MaxDelayedInMemory:              10000,
 		MaxTaskQueueIdleTime:            5 * time.Minute,
 		GetTasksBatchSize:               1000,
 		GetTasksReloadAt:                100,
@@ -166,6 +181,7 @@ func (c Config) WithDefaults() Config {
 	setD(&c.MaxTaskQueueIdleTime, d.MaxTaskQueueIdleTime)
 	setI(&c.GetTasksBatchSize, d.GetTasksBatchSize)
 	setI(&c.GetTasksReloadAt, d.GetTasksReloadAt)
+	setI(&c.MaxDelayedInMemory, d.MaxDelayedInMemory)
 	setD(&c.UpdateAckInterval, d.UpdateAckInterval)
 	setD(&c.MetadataUpdateOnAppendInterval, d.MetadataUpdateOnAppendInterval)
 	setI(&c.OutstandingTaskAppendsThreshold, d.OutstandingTaskAppendsThreshold)
@@ -201,6 +217,9 @@ func (c Config) WithDefaults() Config {
 func (c Config) validate() error {
 	if c.GetTasksBatchSize < 1 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("GetTasksBatchSize must be positive, got %d", c.GetTasksBatchSize)}
+	}
+	if b := c.RetryBackoff; b.Initial < 0 || b.Max < 0 || (b.Multiplier != 0 && b.Multiplier < 1) {
+		return &store.InvalidArgumentError{Msg: fmt.Sprintf("RetryBackoff needs non-negative durations and Multiplier 0 or >= 1, got %+v", b)}
 	}
 	if c.MaxTaskAge < 0 {
 		return &store.InvalidArgumentError{Msg: fmt.Sprintf("MaxTaskAge must be non-negative, got %v", c.MaxTaskAge)}

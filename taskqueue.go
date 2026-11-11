@@ -12,6 +12,8 @@
 package taskqueue
 
 import (
+	"time"
+
 	"github.com/skme902/tq/internal/counter"
 	"github.com/skme902/tq/internal/matching"
 	"github.com/skme902/tq/store"
@@ -68,6 +70,9 @@ type (
 	RedriveOptions = matching.RedriveOptions
 	// NackOption configures Delivery.Nack.
 	NackOption = matching.NackOption
+	// RetryBackoff is Config.RetryBackoff: an exponential delay before redelivering a
+	// nacked or expired backlog task.
+	RetryBackoff = matching.RetryBackoff
 	// SweepOptions configures Engine.SweepIdleQueues; SweepResult is what it did.
 	SweepOptions = matching.SweepOptions
 	SweepResult  = matching.SweepResult
@@ -141,6 +146,9 @@ func NewMemoryQueueConfigSource(maxOverrides int) *MemoryQueueConfigSource {
 
 // Retryable marks a Starter error as transient (redeliver instead of re-spool).
 func Retryable(err error) error { return matching.Retryable(err) }
+
+// NackDelay redelivers the task no earlier than d from now (see Delivery.Nack).
+func NackDelay(d time.Duration) NackOption { return matching.NackDelay(d) }
 
 // NackReason records why a consumer gave up on a task; it is kept if the Nack dead-letters it.
 func NackReason(reason string) NackOption { return matching.NackReason(reason) }

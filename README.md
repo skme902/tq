@@ -241,6 +241,36 @@ d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was 
   `tasks_redriven`, `task_attempt_record_failures`. There is no dead-letter gauge: poll
   `DescribeQueue().DeadTasks`, which is a `COUNT` query.
 
+## Delays and retry backoff
+
+```go
+// Delayed enqueue: not delivered before VisibleAt (never sync-matched).
+engine.AddTask(ctx, q, taskqueue.Task{Payload: p, VisibleAt: time.Now().Add(time.Hour)})
+
+// Redeliver a failed task after a delay instead of immediately.
+d.Nack(taskqueue.NackDelay(30 * time.Second))
+
+// Or for every Nack and lease expiry: min(Initial * Multiplier^(attempt-1), Max).
+cfg.RetryBackoff = taskqueue.RetryBackoff{Initial: time.Second, Max: 5 * time.Minute} // Multiplier 0 = 2
+```
+
+- Defaults are unchanged: no `VisibleAt`, no `RetryBackoff`, so redelivery is immediate.
+  `NackDelay(0)` forces an immediate redelivery when a backoff is set.
+- A backlog task's delay is written to its row (`Task.VisibleAt`, part of the task data, so no
+  migration) with a fenced update before the task is released, so it survives a restart. That
+  needs a store implementing `store.DeadLetterStore` (memstore, sqlite, postgres); otherwise the
+  delay applies in memory only. A failed write is counted in `delay_persist_failures`.
+- A sync-matched task that is nacked or expires with a delay is spooled with `VisibleAt`.
+- The delay is skipped when the Nack or expiry dead-letters the task (`MaxAttempts`).
+- A delayed task keeps its place in fairness order (its pass): when it becomes visible it can
+  be delivered ahead of newer tasks of the same key.
+- Delayed tasks are held in memory by the queue's reader, each on a timer (the injected clock).
+  Up to `Config.MaxDelayedInMemory` (default 10000) per subqueue do not count toward
+  `GetTasksBatchSize`, so they do not hold back ready tasks behind them. Past that they count as
+  loaded, and a longer run of delayed tasks delays the ready tasks behind it until the delayed
+  ones become visible. Use a separate queue for large numbers of scheduled tasks.
+- Metric: `tasks_delayed` (per queue).
+
 ## Retention
 
 Queue rows are never deleted on their own (upstream relies on a persistence TTL that normal

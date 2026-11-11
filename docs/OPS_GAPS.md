@@ -39,7 +39,7 @@ Reference points:
 | 1 | Max attempts, poison tasks and a DLQ (with redrive) — **done** (feat/ops-dlq) | P0 | M–L |
 | 2 | Task admin: peek and browse, delete one task, purge a queue — **done** (feat/ops-admin) | P0 | M |
 | 3 | Graceful drain on shutdown (finish in-flight leases before Stop) — **done** (feat/ops-drain) | P0 | S |
-| 4 | Retry backoff and delayed visibility on Nack | P1 | M |
+| 4 | Retry backoff and delayed visibility on Nack — **done** (feat/ops-backoff) | P1 | M |
 | 5 | Pause and resume of a queue or a fairness key | P1 | M |
 | 6 | Shared, persisted runtime config with an audit trail | P1 | M–L |
 | 7 | Health and readiness checks — **done** (feat/ops-health) | P1 | S |
@@ -151,7 +151,19 @@ drains then stops. Readiness is wired in with item 7.
   - Wait on `len(e.leases)==0` or `ctx.Done()`, then call the existing Stop.
   - Add a metric `engine_draining` gauge and a log line with the counts that remain.
 
-## 4. Retry backoff and delayed visibility — P1, M
+## 4. Retry backoff and delayed visibility — P1, M — done
+
+**Status: implemented in feat/ops-backoff** (README §Delays and retry backoff): `Task.VisibleAt`, `NackDelay(d)`,
+`Config.RetryBackoff`, `Config.MaxDelayedInMemory`. Refinements over the design below:
+- No separate timer wheel: each delayed task has one timer on the injected clock (same as leases).
+- "Does not count as loaded" is bounded by `MaxDelayedInMemory` (default 10000) so memory stays bounded; past it,
+  delayed tasks count as loaded and can hold back ready tasks behind them (one read cursor per subqueue). This is
+  documented; a delay-heavy workload should use its own queue.
+- The retry policy is engine-wide (`Config.RetryBackoff`), not yet per queue (it can move to `QueueConfig` with 6).
+- The Nack rewrite reuses the fenced `UpdateTask` from 1; with a store without it the delay is in memory only.
+
+Original analysis (superseded by the status above):
+
 
 - **Today.**
   - A Nacked or expired backlog task is matchable again immediately.

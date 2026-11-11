@@ -46,6 +46,7 @@ type (
 		outstandingTasks *btree.BTreeG[outstandingTask] // level-ordered outstanding tasks and acks
 		loadedTasks      int                            // == number of loaded (unacked, unleased) entries in outstandingTasks
 		leasedTasks      int                            // == number of leased entries in outstandingTasks
+		delayedTasks     int                            // == number of delayed entries in outstandingTasks (library addition)
 		readLevel        fairLevel                      // == highest level in outstandingTasks, or if empty, the level we should read next
 		ackLevel         fairLevel                      // inclusive: task exactly at ackLevel _has_ been acked
 		atEnd            bool                           // whether we believe outstandingTasks represents the entire queue right now
@@ -198,6 +199,14 @@ func (tr *fairTaskReader) completeTask(task *internalTask, res taskResponse) {
 	// The lease (if any) is over: count the task as loaded again while it is re-matched or
 	// re-spooled.
 	tr.unleaseLocked(task)
+	// Deviation (delayed redelivery): a Nack with a delay or a retry backoff waits for its
+	// visibility time instead of going straight back to the matcher.
+	if at := task.redeliverAt.Swap(0); at != 0 && isTransientMatchError(err) {
+		if tr.delayLocked(task, time.Unix(0, at)) {
+			tr.lock.Unlock()
+			return
+		}
+	}
 	tr.lock.Unlock()
 
 	// We can handle some transient errors by just putting the task back in the matcher to
@@ -233,6 +242,8 @@ func (tr *fairTaskReader) completeTaskLocked(task *internalTask) {
 		task.leased = false
 		tr.leasedTasks--
 		softAssert(tr.logger, tr.leasedTasks >= 0, "leasedTasks went negative")
+	} else if task.delayed {
+		tr.undelayLocked(task)
 	} else {
 		tr.loadedTasks--
 		softAssert(tr.logger, tr.loadedTasks >= 0, "loadedTasks went negative")
@@ -291,7 +302,7 @@ func (tr *fairTaskReader) shouldReadMoreLocked() bool {
 	if tr.atEnd {
 		// If we have the whole backlog in memory, we don't need to read anything.
 		return false
-	} else if tr.loadedTasks > tr.backlogMgr.config.GetTasksReloadAt {
+	} else if tr.effectiveLoadedLocked() > tr.backlogMgr.config.GetTasksReloadAt {
 		// Too many loaded already. We'll get called again when loadedTasks drops.
 		return false
 	}
@@ -305,7 +316,7 @@ func (tr *fairTaskReader) readTasksImpl() {
 		if lastErr != nil || !tr.shouldReadMoreLocked() {
 			break // with lock still held
 		}
-		readLevel, loadedTasks := tr.readLevel, tr.loadedTasks
+		readLevel, loadedTasks := tr.readLevel, tr.effectiveLoadedLocked()
 		tr.lock.Unlock()
 
 		lastErr = tr.readTaskBatch(readLevel, loadedTasks)
@@ -478,7 +489,8 @@ func (tr *fairTaskReader) mergeTasks(tasks []*store.TaskInfo, mode mergeMode) {
 	//
 	// The bug that led to this is fixed, but we'll leave this check defensively in case other
 	// bugs produce the same state.
-	if mode == mergeWrite && !tr.atEnd && tr.loadedTasks == 0 && !tr.readPending && tr.backoffTimer == nil {
+	// Deviation (delay): delayed tasks also end the stall, when their timers fire.
+	if mode == mergeWrite && !tr.atEnd && tr.loadedTasks == 0 && tr.delayedTasks == 0 && !tr.readPending && tr.backoffTimer == nil {
 		softAssert(tr.logger, false, "fair reader stuck")
 		tr.backlogMgr.metricsHandler.Counter(metrics.FairReaderStuckDetected, 1)
 		tr.maybeReadTasksLocked()
@@ -548,6 +560,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			task.event.leaseFunc = tr.leaseTask
 			task.event.subqueue = tr.subqueue
 			tr.backlogMgr.setPriority(task)
+			task.delayed = t.Data.VisibleAt.After(tr.backlogMgr.timeSource.Now()) // Deviation (delay)
 			merged.SetHint(outstandingTask{level: level, task: task}, &hint)
 			created = append(created, task)
 		}
@@ -557,12 +570,19 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 	// levels don't occupy a memory slot, so they don't count toward the limit. If we never exceed
 	// batchSize, cut stays at maxFairLevel, meaning nothing is trimmed.
 	cut := outstandingTask{level: maxFairLevel}
-	loaded := 0
+	loaded, delayed := 0, 0
 	merged.Scan(func(o outstandingTask) bool {
 		if o.acked() || o.task.leased {
 			// Leased tasks don't count either: their slot is held by the lease holder.
 			return true
-		} else if loaded++; loaded > batchSize {
+		} else if o.task.delayed {
+			// Deviation (delay): up to maxDelayedInMemory delayed tasks don't count, so they
+			// don't block reading the ready tasks behind them.
+			if delayed++; delayed <= tr.maxDelayedInMemory() {
+				return true
+			}
+		}
+		if loaded++; loaded > batchSize {
 			cut = o
 			return false
 		}
@@ -588,8 +608,14 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			merged.DeleteHint(outstandingTask{level: level}, &hint)
 			return true
 		}
-		tr.loadedTasks++
 		tr.backlogAge.record(task.event.Data.CreateTime, 1)
+		if task.delayed {
+			// Deviation (delay): held until VisibleAt, not matched now.
+			tr.delayedTasks++
+			tr.armDelayLocked(task, task.event.Data.VisibleAt)
+			return true
+		}
+		tr.loadedTasks++
 		return false
 	})
 
@@ -605,6 +631,11 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 			o.task.leased = false
 			tr.leasedTasks--
 			tr.leasedEvicted[o.level] = o.task
+		} else if o.task != nil && o.task.delayed {
+			// Deviation (delay): a delayed task we're dropping; a re-read delays it again.
+			tr.backlogAge.record(o.task.event.Data.CreateTime, -1)
+			tr.undelayLocked(o.task)
+			o.task.setEvicted()
 		} else if o.task != nil {
 			// A loaded task we're dropping from memory. It may already have been matched and
 			// removed (then setEvicted is a no-op); otherwise it's removed from the matcher.
@@ -619,7 +650,7 @@ func (tr *fairTaskReader) mergeTasksLocked(tasks []*store.TaskInfo, mode mergeMo
 		}
 		return true
 	})
-	softAssert(tr.logger, tr.loadedTasks >= 0 && tr.leasedTasks >= 0, "loadedTasks or leasedTasks went negative")
+	softAssert(tr.logger, tr.loadedTasks >= 0 && tr.leasedTasks >= 0 && tr.delayedTasks >= 0, "loadedTasks, leasedTasks or delayedTasks went negative")
 	// Trim the evicted-ack cache to max size by dropping the highest levels.
 	for tr.evictedAcks.Len() > evictedAcksCacheSize {
 		tr.evictedAcks.PopMax()
@@ -759,7 +790,7 @@ func (tr *fairTaskReader) getLevels() (readLevel, ackLevel fairLevel) {
 func (tr *fairTaskReader) knownCountLocked() int64 {
 	if tr.atEnd {
 		// Leased tasks are still in the backlog until they are acked.
-		return int64(tr.loadedTasks + tr.leasedTasks)
+		return int64(tr.loadedTasks + tr.leasedTasks + tr.delayedTasks)
 	}
 	return -1
 }

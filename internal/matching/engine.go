@@ -552,6 +552,12 @@ func (e *Engine) isStopped() bool {
 }
 
 func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
+	e.respoolSyncTask(d, shuttingDown, time.Time{})
+}
+
+// respoolSyncTask spools a sync-matched task whose lease ended; a non-zero visibleAt delays
+// it (library addition, see delay.go).
+func (e *Engine) respoolSyncTask(d *Delivery, shuttingDown bool, visibleAt time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	op := func(ctx context.Context) error {
@@ -565,6 +571,9 @@ func (e *Engine) respoolSyncTaskLocked(d *Delivery, shuttingDown bool) {
 			pm = p.defaultQueue
 		}
 		t := d.Task
+		if !visibleAt.IsZero() {
+			t.VisibleAt = visibleAt
+		}
 		return pm.SpoolTask(&t)
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, persistenceOperationRetryPolicy, func(err error) bool {
