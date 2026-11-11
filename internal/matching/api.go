@@ -62,6 +62,12 @@ type (
 		// MaxTaskAge overrides Config.MaxTaskAge for this queue (library addition). nil means
 		// the Config value; 0 means no cap.
 		MaxTaskAge *time.Duration
+		// Paused stops dispatch from this queue (library addition): AddTask still accepts
+		// tasks (they are spooled, never sync-matched) and polls wait as if it were empty.
+		Paused bool
+		// PausedFairnessKeys stops dispatch of tasks with these fairness keys only; other
+		// keys are dispatched as usual (library addition).
+		PausedFairnessKeys []string
 	}
 
 	// QueueConfigSource replaces userDataManager for per-queue config. A loaded queue reads

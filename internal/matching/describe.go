@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"time"
 
@@ -69,6 +70,9 @@ type QueueDescription struct {
 	// QueueConfigSource and admin rates; a worker rate is unknown until a poll.
 	EffectiveRateLimit float64
 	RateLimitSource    RateLimitSource
+	// Paused and PausedFairnessKeys are the queue's QueueConfig pause settings.
+	Paused             bool
+	PausedFairnessKeys []string
 
 	// WaitingPollers is the number of polls parked in the matcher.
 	WaitingPollers int
@@ -103,6 +107,10 @@ func (e *Engine) DescribeQueue(ctx context.Context, queue store.QueueKey) (*Queu
 		d = e.describeLoaded(pm)
 	} else if d, err = e.describeUnloaded(ctx, queue); err != nil {
 		return nil, err
+	}
+	if e.configSource != nil {
+		cfg := e.configSource.QueueConfig(queue)
+		d.Paused, d.PausedFairnessKeys = cfg.Paused, slices.Clone(cfg.PausedFairnessKeys)
 	}
 	if e.deadLetters != nil {
 		if d.DeadTasks, err = e.deadLetters.CountDeadTasks(ctx, queue); err != nil {

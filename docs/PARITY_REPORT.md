@@ -331,6 +331,12 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     carrying a redelivery time instead of re-matching it; the "fair reader stuck" check also requires no delayed
     tasks. Upstream's fairness order, limiter, sync match and fencing are unchanged.
 
+31. **Pause (feat/ops-pause).** `QueueConfig.Paused` / `PausedFairnessKeys` (library additions; upstream has no
+    task-queue pause in v1.32.1 matching). The only change in ported code is at the top of `matcherData.findMatch`:
+    a paused queue returns no match, and tasks of a paused key are skipped in the scan (poll forwarders are not).
+    Both read lock-free state cached by the rate limit manager on config changes, which already reprocess all tasks.
+    With nothing paused the scan is upstream's.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).

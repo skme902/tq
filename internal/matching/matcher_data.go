@@ -443,6 +443,13 @@ func (d *matcherData) findMatch(allowForwarding bool, now int64) (matchedTask *i
 	// don't arm the rate-limit timer in cases where the full scan would have found nothing.
 	// TODO: reaching into the rate limiter's state like this breaks its encapsulation;
 	// refactor the rate limit logic so findMatch doesn't need to know about it.
+	// Deviation (pause, library addition): a paused queue matches nothing; resuming
+	// reprocesses all tasks (UserDataChanged), which rematches.
+	paused, pausedKeys := d.rateLimitManager.pauseState()
+	if paused {
+		return nil, nil, 0
+	}
+
 	wholeQueueReady, perKeyLimited := d.rateLimitManager.rateLimitState()
 	if !perKeyLimited && d.tasks.Len() > 0 && d.pollers.Len() > 0 {
 		if delay := wholeQueueReady.delay(now); delay > 0 {
@@ -455,6 +462,11 @@ func (d *matcherData) findMatch(allowForwarding bool, now int64) (matchedTask *i
 		// "priority backlog poll forwarders".
 		if !allowForwarding && task.pollForwarderType == parentPollForwarder {
 			return true
+		}
+		if pausedKeys != nil && !task.isPollForwarder() {
+			if _, p := pausedKeys[task.getPriority().FairnessKey]; p {
+				return true // Deviation (pause): this fairness key is paused
+			}
 		}
 
 		var matched *waitingPoller

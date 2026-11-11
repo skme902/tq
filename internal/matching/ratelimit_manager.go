@@ -19,6 +19,7 @@ package matching
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skme902/tq/clock"
@@ -88,8 +89,13 @@ type (
 		perKeyLimit     simpleLimiterParams
 		perKeyReady     *cache.LRU[string, simpleLimiter]
 		perKeyOverrides fairnessWeightOverrides // TODO(fairness): get this from config
-		cancels         []func()
-		stopped         bool // set by Stop; guarded by mu
+
+		// Deviation (pause, library addition): QueueConfig.Paused / PausedFairnessKeys,
+		// read lock-free by findMatch. pausedKeys is nil when no key is paused.
+		paused     atomic.Bool
+		pausedKeys atomic.Pointer[map[string]struct{}]
+		cancels    []func()
+		stopped    bool // set by Stop; guarded by mu
 	}
 )
 
@@ -163,7 +169,9 @@ func (r *rateLimitManager) Start(onChange func()) {
 	defer r.mu.Unlock()
 
 	// Overall system rate limit will be the min of the two configs that are partition wise times the number of partitons.
-	r.adminNsRate, r.adminTqRate = r.adminRates(r.queueConfig())
+	cfg := r.queueConfig()
+	r.adminNsRate, r.adminTqRate = r.adminRates(cfg)
+	r.setPause(cfg)
 	// Defaulting to 1 partition if misconfigured (upstream does this in setNumReadPartitions).
 	r.numReadPartitions = max(r.config.NumReadPartitions, 1)
 	if w, ok := r.configSource.(QueueConfigWatcher); ok && onChange != nil && !r.stopped {
@@ -284,6 +292,29 @@ func (r *rateLimitManager) trySetRPSFromUserDataLocked() {
 		r.fairnessKeyRateLimitDefault = &val
 	}
 	r.perKeyOverrides = config.FairnessWeightOverrides
+	r.setPause(config)
+}
+
+// setPause caches the queue's pause settings (library addition).
+func (r *rateLimitManager) setPause(cfg QueueConfig) {
+	r.paused.Store(cfg.Paused)
+	if len(cfg.PausedFairnessKeys) == 0 {
+		r.pausedKeys.Store(nil)
+		return
+	}
+	m := make(map[string]struct{}, len(cfg.PausedFairnessKeys))
+	for _, k := range cfg.PausedFairnessKeys {
+		m[k] = struct{}{}
+	}
+	r.pausedKeys.Store(&m)
+}
+
+// pauseState reports whether the queue is paused and the paused fairness keys (nil if none).
+func (r *rateLimitManager) pauseState() (bool, map[string]struct{}) {
+	if p := r.pausedKeys.Load(); p != nil {
+		return r.paused.Load(), *p
+	}
+	return r.paused.Load(), nil
 }
 
 // UpdateSimpleRateLimit updates the overall queue rate limits for the simpleRateLimiter implementation

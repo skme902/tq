@@ -11,6 +11,7 @@ package matching
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -172,6 +173,28 @@ func (s *MemoryQueueConfigSource) SetMaxTaskAge(queue store.QueueKey, d *time.Du
 	}
 	s.update(queue, func(cfg *QueueConfig) { cfg.MaxTaskAge = clonePtr(d) })
 	return nil
+}
+
+// SetPaused pauses or resumes dispatch from the queue (QueueConfig.Paused). Like the other
+// setters it applies to one partition key.
+func (s *MemoryQueueConfigSource) SetPaused(queue store.QueueKey, paused bool) {
+	s.update(queue, func(cfg *QueueConfig) { cfg.Paused = paused })
+}
+
+// SetFairnessKeyPaused pauses or resumes dispatch of one fairness key in the queue
+// (QueueConfig.PausedFairnessKeys).
+func (s *MemoryQueueConfigSource) SetFairnessKeyPaused(queue store.QueueKey, key string, paused bool) {
+	s.update(queue, func(cfg *QueueConfig) {
+		keys := slices.DeleteFunc(slices.Clone(cfg.PausedFairnessKeys), func(k string) bool { return k == key })
+		if paused {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		if len(keys) == 0 {
+			keys = nil
+		}
+		cfg.PausedFairnessKeys = keys
+	})
 }
 
 // SetAdminNamespaceDispatchRate overrides Config.AdminNamespaceToPartitionDispatchRate for

@@ -144,6 +144,11 @@ func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
 		}
 	}
 	pm.maxTaskAge.Store(int64(max(age, 0)))
+	paused := 0.0
+	if src := pm.engine.configSource; src != nil && src.QueueConfig(pm.partition).Paused {
+		paused = 1
+	}
+	pm.metricsHandler.Gauge(metrics.QueuePaused, paused)
 }
 
 // GetRateLimitManager returns the partition's rate limit manager.
