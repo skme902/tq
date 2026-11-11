@@ -269,6 +269,28 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     maximum interval (10 s for add-error retries, review L1) and ThrottleRetryContext rules (review L2) match upstream.
 23. **API (review L8).** `DefaultCounterParams` is a function that returns a copy instead of a mutable package variable.
 
+24. **Observability (feat/observability).** Metric names, the `namespace`/`taskqueue`/`partition` tags, `task_priority` on
+    `approximate_backlog_count` and `task_dispatch_latency`, `source`/`forwarded` on dispatch latency, the periodic logical
+    backlog emitter (1m ± 5%) with `physical_*` gauges at ack-level sync, zeroing on unload, and the task_tracker (5 s buckets,
+    30 s window) follow upstream. Differences:
+    - No `task_type`, `operation`, `worker_version`/build-ID or `service_name` tags; there is one task type and no versioning.
+    - `partition` is always the partition ID (we have no `breakdownByPartition` switch; there is only partition 0 today).
+    - Upstream's boolean `breakdownByTaskQueue` becomes `Config.MetricsQueueTagLimit`: the first N (namespace, name) pairs
+      per engine get a real tag, the rest `__omitted__` and no per-queue gauges. Negative means all omitted.
+    - `Config.BacklogMetricsEmitInterval` < 0 disables the periodic emitter (upstream uses 0); `SyncState` then emits the
+      unprefixed names, as upstream does at 0.
+    - `delivery_acked`, `delivery_nacked`, `delivery_lease_extended`, `delivery_ack_latency` and `delivery_lease_expired` are
+      library-only (upstream has no leases). `delivery_lease_expired` and `tasks_rate_limited` now carry the queue tags.
+    - `task_dispatch_latency`/`asyncmatch_latency` are emitted when the delivery is created, which is upstream's
+      `emitTaskDispatchLatencyAtPoll=true` default point.
+    - `syncmatch_latency` times `Engine.AddTask`, including our internal unload/range-conflict retries (item 13).
+    - `pending_polls` is emitted whatever the breakdown setting, as upstream.
+    - `Engine.DescribeQueue` returns upstream's enhanced stats for one physical queue (no partition fan-out). For a queue that
+      is not loaded it reads the store without taking ownership; upstream always loads the partition. The unloaded backlog
+      age is the oldest of the first 100 tasks per subqueue, so it is approximate.
+    - `Engine.ListQueues` pages `store.QueueLister` (optional interface). memstore orders by (namespace, name, partition);
+      the SQL stores order by (range_hash, task_queue_id) like upstream `ListTaskQueue`.
+
 Review items that now match upstream and so need no entry: priority keys above `PriorityLevels` are clamped by
 `clipPriority` and only negative keys are rejected (L3); the writer reads fairness weight overrides through the rate
 limit manager (L4).
@@ -302,12 +324,12 @@ No other mismatch was found. Every scenario was run 3 times on 2 of our stores.
   - queries, Nexus tasks
   - sticky queues
   - poller-scaling hints, hooks
-  - DescribeTaskQueue and its stats
+  - the DescribeTaskQueue RPC surface (reachability, versioning info, partition fan-out); `Engine.DescribeQueue` covers the enhanced stats (§3 item 24)
   - multi-cluster (standby) and replication of user data
   - history integration (RecordTaskStarted, task validation against mutable state)
   - classic→fair backlog migration and draining
   - ConcurrentRequestLimiter
-  - task_tracker metrics
+  - `task_lag_per_tl` and the per-build-ID/version metric breakdowns
 
 ## 6. Ported tests (slice 6 and earlier)
 
@@ -319,7 +341,7 @@ No other mismatch was found. Every scenario was run 3 times on 2 of our stores.
 | physical_task_queue_manager_test.go | 4 | TestReaderSignaling, TestReaderBacklogAge, TestLegacyDescribeTaskQueue (classic or describe); TestAddTaskStandby (multi-cluster); TestPollScaling* (not implemented); TestDrainCompletionNoReloadDraining (migration) |
 | matching_engine_test.go | 3 → `engine_port_test.go` TestPort* (from TestAddConsumeWorkflowTasksNoDBErrors, …DBErrors, TestConcurrentAddWorkflowTasksNoDBErrors) | the rest need versioning, user data, Nexus, history, deployment, sticky queues or queries. TestAddThenConsumeActivities is skipped upstream under the new matcher |
 | tests/priority_fairness_test.go | 2 adapted (PrioritySuite.TestActivity_Basic, FairnessSuite.Test_Activity_Basic) | TestSubqueue_Migration and the Migration_* tests (migration), TestStickyInteraction_SinglePartition (sticky), TestUpdateWorkflowExecutionOptions_InvalidatesPendingTask (history) |
-| task_tracker_test.go TestAddTasksRate | – | we have no task_tracker |
+| task_tracker_test.go TestAddTasksRate | 1/1 (`internal/matching/task_tracker_test.go`, fake clock) | – |
 | liveness, fair_level, fairness_util, ratelimit_manager, counter, cache | ported in slices 2–4 | – |
 
 ## 7. Remaining risks
