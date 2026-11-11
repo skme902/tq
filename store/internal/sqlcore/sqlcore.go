@@ -477,10 +477,15 @@ func (s *Store) DeleteQueueIfIdle(ctx context.Context, req *store.DeleteQueueIfI
 		if _, err := tx.ExecContext(ctx, s.q.deleteAllTasks, int64(hash), id); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, s.q.deleteQueue, int64(hash), id, req.RangeID); err != nil {
+		res, err := tx.ExecContext(ctx, s.q.deleteQueue, int64(hash), id, req.RangeID)
+		if err != nil {
 			return err
 		}
-		deleted = true
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = n > 0
 		return nil
 	})
 	if err != nil {

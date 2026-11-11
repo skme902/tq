@@ -308,7 +308,7 @@ partitions do not have). Sweep idle ones from a routine or one elected process:
 
 ```go
 res, err := engine.SweepIdleQueues(ctx, taskqueue.SweepOptions{
-	IdleFor:           7 * 24 * time.Hour, // at least taskqueue.MinSweepIdle (24h)
+	IdleFor:           7 * 24 * time.Hour, // at least taskqueue.MinSweepIdle (48h)
 	MaxDeletes:        1000,               // 0 = no cap
 	DeadTaskRetention: 14 * 24 * time.Hour, // optional: also delete older dead tasks
 })
@@ -319,13 +319,21 @@ res, err := engine.SweepIdleQueues(ctx, taskqueue.SweepOptions{
   delete are one store transaction conditioned on the listed rangeID and the idle time
   (`store.QueueSweeper.DeleteQueueIfIdle`), so a queue another process loaded or wrote since
   the listing is kept. The sweep never loads or takes over a queue.
-- `MinSweepIdle` is 24h because a loaded queue rewrites its row at least every 12h even when
-  idle. A shorter window could delete a row under a quiet owner elsewhere.
+- `MinSweepIdle` is 48h. A loaded queue rewrites its row at least every 12h (plus one
+  `UpdateAckInterval`) even when idle, and 48h tolerates a missed rewrite, the same grace as
+  upstream's scavenger. A shorter window could delete a row under a quiet owner elsewhere, which
+  would then share rangeID 1 with whoever recreates the queue.
+- `DeadTaskRetention` deletes dead tasks older than it from **every listed queue**, loaded or
+  not, before the idle check, so it is also how dead letters age out of active queues. It is not
+  part of the queue delete transaction: a crash in between leaves the queue without those dead
+  tasks, which is the same end state the next sweep reaches.
 - A swept queue is recreated empty by its next AddTask or PollTask. A process that was loading
   it at that instant may see one transient condition-failed error.
 - `Config.MaxTaskAge` (per queue: `QueueConfig.MaxTaskAge`, `MemoryQueueConfigSource.SetMaxTaskAge`)
   caps each new task's `ExpiryTime` at AddTask time + the age; expired tasks are dropped like any
-  task past its expiry. It applies to tasks added after it is set. Default 0: no cap.
+  task past its expiry. It applies to tasks added after it is set. A redriven dead task gets a
+  fresh window from the redrive (an expiry already past is replaced). A negative per-queue value
+  is ignored with a warning (the previous cap stays). Default 0: no cap.
 - Metrics (engine-level): `queues_swept`, `dead_tasks_expired`.
 
 ## Task admin

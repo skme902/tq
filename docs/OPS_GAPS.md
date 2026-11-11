@@ -264,13 +264,15 @@ lease flags were not built; see the status above.
 - "Empty" means no task row above each subqueue's ack level (rows at or below it only await GC), checked in the
   delete transaction, rather than the approximate backlog count, which can stay stale after a crash.
 - The delete is also conditioned on `LastUpdateTime < now - IdleFor` in the same transaction, and `IdleFor` must be
-  at least 24h: a loaded queue rewrites its row only every 12h, and a deleted-then-recreated queue restarts at
+  at least 48h: a loaded queue rewrites its row only every 12h (48h tolerates a missed rewrite, as upstream's
+  scavenger does), and a deleted-then-recreated queue restarts at
   rangeID 1, so a shorter window could leave a quiet owner and a new owner on the same rangeID.
 - Queues with dead tasks are kept; `DeadTaskRetention` ages those out first.
 - `MaxTaskAge` is applied at AddTask (as an `ExpiryTime` cap) instead of in the reader, so the upstream read path is
   untouched; it covers tasks added after it is set.
 
-Original analysis (superseded by the status above):
+Original analysis (superseded by the status above and README §Retention; in particular `MaxTaskAge` is applied at AddTask
+and redrive, not by the reader):
 
 
 - **Today.**

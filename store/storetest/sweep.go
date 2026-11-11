@@ -3,6 +3,7 @@ package storetest
 // Conformance cases for store.QueueSweeper (new; no upstream counterpart).
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -93,4 +94,19 @@ func testSweepDeadTasks(_ *testing.T, s *suite) {
 	n, err := dl.CountDeadTasks(s.ctx, s.key)
 	s.NoError(err)
 	s.EqualValues(1, n)
+}
+
+// Liveness compares (pass, id) strictly above the ack level: a higher pass with a lower id is
+// live, and a row exactly at an ack level of MaxInt64 is not (review retention r1: the memstore
+// pivot ack.ID+1 overflowed).
+func testSweepLevelOrder(_ *testing.T, s *suite) {
+	d := s.sweeper()
+	rangeID := randRangeID()
+	info := s.createQueue(rangeID)
+	s.setAckLevel(rangeID, info, 0, store.Level{Pass: 1, ID: 9})
+	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{s.randomTask(1, 2)}, nil))
+	s.False(s.deleteIfIdle(d, rangeID), "(2,1) is above (1,9)")
+	s.setAckLevel(rangeID, info, 0, store.Level{Pass: 2, ID: math.MaxInt64})
+	s.NoError(s.createTasks(rangeID, info, []store.TaskInfo{s.randomTask(math.MaxInt64, 2)}, nil))
+	s.True(s.deleteIfIdle(d, rangeID), "every row is at or below the ack level")
 }

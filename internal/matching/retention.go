@@ -14,10 +14,12 @@ import (
 )
 
 // MinSweepIdle is the shortest SweepOptions.IdleFor accepted. A loaded queue rewrites its row
-// at least every 12h even when nothing changes (half the upstream persistence TTL), so a row
-// untouched for 24h has no live owner anywhere. A shorter window could delete the row under a
-// quiet owner that would then share rangeID 1 with whoever recreates the queue.
-const MinSweepIdle = 24 * time.Hour
+// at least every 12h (plus one UpdateAckInterval) even when nothing changes: SyncState's
+// heartbeat is half its 24h default TTL, since normal partitions have persistence TTL 0. 48h
+// tolerates a missed heartbeat (DB errors, clock skew), the same grace as upstream's task
+// queue scavenger. A shorter window could delete the row under a quiet owner that would then
+// share rangeID 1 with whoever recreates the queue.
+const MinSweepIdle = 48 * time.Hour
 
 // SweepOptions configures SweepIdleQueues.
 type SweepOptions struct {
