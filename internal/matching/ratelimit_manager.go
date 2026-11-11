@@ -92,10 +92,9 @@ type (
 
 		// Deviation (pause, library addition): QueueConfig.Paused / PausedFairnessKeys,
 		// read lock-free by findMatch. pausedKeys is nil when no key is paused.
-		paused     atomic.Bool
-		pausedKeys atomic.Pointer[map[string]struct{}]
-		cancels    []func()
-		stopped    bool // set by Stop; guarded by mu
+		pause   atomic.Pointer[pauseSnapshot]
+		cancels []func()
+		stopped bool // set by Stop; guarded by mu
 	}
 )
 
@@ -295,26 +294,32 @@ func (r *rateLimitManager) trySetRPSFromUserDataLocked() {
 	r.setPause(config)
 }
 
-// setPause caches the queue's pause settings (library addition).
-func (r *rateLimitManager) setPause(cfg QueueConfig) {
-	r.paused.Store(cfg.Paused)
-	if len(cfg.PausedFairnessKeys) == 0 {
-		r.pausedKeys.Store(nil)
-		return
-	}
-	m := make(map[string]struct{}, len(cfg.PausedFairnessKeys))
-	for _, k := range cfg.PausedFairnessKeys {
-		m[k] = struct{}{}
-	}
-	r.pausedKeys.Store(&m)
+// pauseSnapshot is one immutable QueueConfig pause setting. It is published as a single
+// pointer, so a reader never sees the queue flag of one update with the key set of another.
+type pauseSnapshot struct {
+	paused bool
+	keys   map[string]struct{} // nil when no key is paused
 }
 
-// pauseState reports whether the queue is paused and the paused fairness keys (nil if none).
-func (r *rateLimitManager) pauseState() (bool, map[string]struct{}) {
-	if p := r.pausedKeys.Load(); p != nil {
-		return r.paused.Load(), *p
+// setPause caches the queue's pause settings (library addition).
+func (r *rateLimitManager) setPause(cfg QueueConfig) {
+	p := &pauseSnapshot{paused: cfg.Paused}
+	if len(cfg.PausedFairnessKeys) > 0 {
+		p.keys = make(map[string]struct{}, len(cfg.PausedFairnessKeys))
+		for _, k := range cfg.PausedFairnessKeys {
+			p.keys[k] = struct{}{}
+		}
 	}
-	return r.paused.Load(), nil
+	r.pause.Store(p)
+}
+
+// pauseState reports whether the queue is paused and the paused fairness keys (nil if none),
+// from one snapshot.
+func (r *rateLimitManager) pauseState() (bool, map[string]struct{}) {
+	if p := r.pause.Load(); p != nil {
+		return p.paused, p.keys
+	}
+	return false, nil
 }
 
 // UpdateSimpleRateLimit updates the overall queue rate limits for the simpleRateLimiter implementation

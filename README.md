@@ -308,7 +308,7 @@ d.Nack(taskqueue.NackReason("bad payload"))        // dead-lettered if this was 
 ```go
 src := taskqueue.NewMemoryQueueConfigSource(0) // Options.QueueConfigSource
 src.SetPaused(q, true)                    // nothing is dispatched from q
-src.SetFairnessKeyPaused(q, "tenant-7", true) // only this key is held back
+err := src.SetFairnessKeyPaused(q, "tenant-7", true) // only this key is held back
 src.SetPaused(q, false)                   // resume: waiting pollers are matched at once
 ```
 
@@ -316,8 +316,12 @@ src.SetPaused(q, false)                   // resume: waiting pollers are matched
   as if the queue were empty. Leases already handed out are unaffected.
 - A paused fairness key is skipped by the matcher; other keys keep their fairness order.
 - Pause is part of `QueueConfig` (`Paused`, `PausedFairnessKeys`), so any `QueueConfigSource`
-  can provide it. It applies per partition key, like the other `QueueConfig` settings.
-- `DescribeQueue` reports `Paused` and `PausedFairnessKeys`; gauge `queue_paused` (per queue).
+  can provide it. It applies per partition key, like the other `QueueConfig` settings. Like
+  rate limits, a loaded queue picks up a change only through `QueueConfigWatcher` (see Rate
+  limits); `MemoryQueueConfigSource` notifies. `SetFairnessKeyPaused` takes the same keys as
+  fairness weight overrides (non-empty, at most 64 bytes), at most the override limit of them.
+- `DescribeQueue` reports `Paused` and `PausedFairnessKeys` (for a loaded queue, the state
+  dispatch uses); gauge `queue_paused` (per queue, 0 once the queue unloads).
 
 ## Delays and retry backoff
 

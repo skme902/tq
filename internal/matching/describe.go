@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"time"
@@ -108,7 +109,13 @@ func (e *Engine) DescribeQueue(ctx context.Context, queue store.QueueKey) (*Queu
 	} else if d, err = e.describeUnloaded(ctx, queue); err != nil {
 		return nil, err
 	}
-	if e.configSource != nil {
+	if d.Loaded {
+		// What dispatch uses: the rate limit manager's cache, refreshed on load and on
+		// QueueConfigWatcher notifications (like EffectiveRateLimit).
+		var keys map[string]struct{}
+		d.Paused, keys = pm.rateLimitManager.pauseState()
+		d.PausedFairnessKeys = slices.Sorted(maps.Keys(keys))
+	} else if e.configSource != nil {
 		cfg := e.configSource.QueueConfig(queue)
 		d.Paused, d.PausedFairnessKeys = cfg.Paused, slices.Clone(cfg.PausedFairnessKeys)
 	}

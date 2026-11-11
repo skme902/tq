@@ -182,19 +182,39 @@ func (s *MemoryQueueConfigSource) SetPaused(queue store.QueueKey, paused bool) {
 }
 
 // SetFairnessKeyPaused pauses or resumes dispatch of one fairness key in the queue
-// (QueueConfig.PausedFairnessKeys).
-func (s *MemoryQueueConfigSource) SetFairnessKeyPaused(queue store.QueueKey, key string, paused bool) {
-	s.update(queue, func(cfg *QueueConfig) {
-		keys := slices.DeleteFunc(slices.Clone(cfg.PausedFairnessKeys), func(k string) bool { return k == key })
-		if paused {
-			keys = append(keys, key)
+// (QueueConfig.PausedFairnessKeys). The key must be non-empty and at most 64 bytes, like a
+// fairness weight override key, and at most the override limit (default 1000) keys can be
+// paused per queue. A call that does not change the set does not notify watchers.
+func (s *MemoryQueueConfigSource) SetFairnessKeyPaused(queue store.QueueKey, key string, paused bool) error {
+	if key == "" {
+		return &store.InvalidArgumentError{Msg: "paused fairness key must not be empty"}
+	}
+	if len(key) > fairnessKeyMaxLength {
+		return &store.InvalidArgumentError{Msg: "fairness key length exceeds limit"}
+	}
+	s.mu.Lock()
+	cfg := s.cfgs[queue]
+	if slices.Contains(cfg.PausedFairnessKeys, key) == paused {
+		s.mu.Unlock()
+		return nil // unchanged
+	}
+	keys := slices.DeleteFunc(slices.Clone(cfg.PausedFairnessKeys), func(k string) bool { return k == key })
+	if paused {
+		if len(keys) >= s.maxOverrides {
+			s.mu.Unlock()
+			return &store.InvalidArgumentError{Msg: fmt.Sprintf("too many paused fairness keys: maximum %d", s.maxOverrides)}
 		}
-		slices.Sort(keys)
-		if len(keys) == 0 {
-			keys = nil
-		}
-		cfg.PausedFairnessKeys = keys
-	})
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	if len(keys) == 0 {
+		keys = nil
+	}
+	cfg.PausedFairnessKeys = keys
+	s.cfgs[queue] = cfg
+	s.mu.Unlock()
+	s.notifyQueue(queue)
+	return nil
 }
 
 // SetAdminNamespaceDispatchRate overrides Config.AdminNamespaceToPartitionDispatchRate for

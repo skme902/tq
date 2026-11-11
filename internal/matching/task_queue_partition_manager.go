@@ -66,6 +66,7 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 	pm.rateLimitManager.Start(pm.userDataChanged)
 	// initial user data load (upstream: userDataManager.Start -> onUserDataChanged)
 	pm.rateLimitManager.UserDataChanged()
+	pm.emitPausedGauge()
 	pm.defaultQueue.Start()
 	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 {
 		go pm.emitLogicalBacklogMetrics(pm.metricsCtx)
@@ -75,6 +76,7 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
 	pm.metricsCancel()
 	pm.rateLimitManager.Stop()
+	pm.metricsHandler.Gauge(metrics.QueuePaused, 0) // an unloaded queue does not report paused
 	pm.defaultQueue.Stop(unloadCause)
 	pm.emitZeroLogicalBacklog()
 }
@@ -128,6 +130,7 @@ func (pm *taskQueuePartitionManagerImpl) userDataChanged() {
 	pm.refreshQueueConfig()
 	// Update rateLimits if any change is userData.
 	pm.rateLimitManager.UserDataChanged()
+	pm.emitPausedGauge()
 	pm.defaultQueue.UserDataChanged()
 }
 
@@ -149,8 +152,13 @@ func (pm *taskQueuePartitionManagerImpl) refreshQueueConfig() {
 		}
 	}
 	pm.maxTaskAge.Store(int64(max(age, 0)))
+}
+
+// emitPausedGauge sets queue_paused from the cached pause state (what dispatch uses), after
+// each refresh of that cache, independent of refreshQueueConfig's early return.
+func (pm *taskQueuePartitionManagerImpl) emitPausedGauge() {
 	paused := 0.0
-	if src := pm.engine.configSource; src != nil && src.QueueConfig(pm.partition).Paused {
+	if p, _ := pm.rateLimitManager.pauseState(); p {
 		paused = 1
 	}
 	pm.metricsHandler.Gauge(metrics.QueuePaused, paused)
