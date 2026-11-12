@@ -1,0 +1,103 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 21 * * *' # 02:47 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flaky:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tqtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TQ_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/tqtest?sslmode=disable
+      FLAKY_COUNT: "30"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Flaky tests
+        run: scripts/ci/flaky.sh
+
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            parity/go.sum
+      - name: Clone upstream Temporal v1.32.1
+        run: git clone --depth 1 --branch v1.32.1 https://github.com/temporalio/temporal "$RUNNER_TEMP/temporal"
+      - name: Parity probes
+        env:
+          UPSTREAM_DIR: ${{ runner.temp }}/temporal
+          OUT_DIR: ${{ runner.temp }}/tq-parity
+        run: scripts/ci/parity.sh
+      - name: Upload probes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-probes
+          path: |
+            ${{ runner.temp }}/tq-parity/probes.md
+            ${{ runner.temp }}/tq-parity/run_probes.log
+          if-no-files-found: ignore
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tqtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TQ_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/tqtest?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Bench smoke
+        env:
+          OUT_DIR: ${{ runner.temp }}/tq-bench
+        run: scripts/ci/bench-smoke.sh
+      - name: Upload bench output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke
+          path: ${{ runner.temp }}/tq-bench/bench.txt
+          if-no-files-found: ignore

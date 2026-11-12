@@ -72,7 +72,26 @@ func addConsumeAllTasksNonConcurrently(t *testing.T, ts *testStore, taskCount in
 	require.NoError(t, pqm.WaitUntilInitialized(ctx))
 	cancel()
 	// Relaxed for fairBacklogManager as upstream: it can reset backlog count on read.
-	require.InDelta(t, taskCount, totalApproximateBacklogCount(pqm.backlogMgr), 2)
+	// Not upstream: wait for it. An injected CreateTasks condition failure unloads the queue, and
+	// the reloaded one starts from the last persisted (stale) count until its reader's first
+	// GetTasks (which may itself be retrying injected faults) resets it; WaitUntilInitialized
+	// does not wait for that read, so under load an immediate check races it.
+	// No writes happen while waiting, so the queue is not unloaded again. Read the loaded
+	// partition directly: getTaskQueuePartitionManager would unload it on an init timeout.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		e.partitionsLock.RLock()
+		pm := e.partitions[portQueue]
+		e.partitionsLock.RUnlock()
+		if !assert.NotNil(c, pm, "queue not loaded") {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		if !assert.NoError(c, pm.defaultQueue.WaitUntilInitialized(ctx)) {
+			return
+		}
+		assert.InDelta(c, taskCount, totalApproximateBacklogCount(pm.defaultQueue.backlogMgr), 2)
+	}, 10*time.Second, 10*time.Millisecond)
 
 	for range taskCount {
 		portPollTask(t, e)
