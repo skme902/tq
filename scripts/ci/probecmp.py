@@ -2,8 +2,11 @@
 """probecmp.py BASE NEW: compare the deterministic cells of parity/results/probes.md files.
 
 Rows compared (timing cells masked):
-  | ours/... |   delivery rows: name, run, script and the four order/fairness scores, and complete
-  | probe-... |  system-limit rows: trace, delivered, complete
+  | ours/... |   14-cell delivery rows: cells 0-6 (impl, run, added, add errors, delivered, lost,
+                dup) and cell 12 (complete); latency cells are masked. Other
+                | ours/ rows (order and mean-score tables) are compared in full.
+  | probe-... |  system-limit rows: trace, delivered, complete (drain time, first-1s count and
+                rate are wall-clock and not compared)
 Config-change lag rows (| lag-... |) are timing only and are not compared.
 Exits 1 on any mismatch or row-count difference."""
 import sys

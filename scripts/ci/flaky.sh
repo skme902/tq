@@ -4,6 +4,10 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 count="${FLAKY_COUNT:-30}"
+if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+  echo "flaky.sh: FLAKY_COUNT must be a positive integer, got $count" >&2
+  exit 2
+fi
 list="scripts/ci/flaky-tests.txt"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -38,7 +42,8 @@ while IFS=$'\t' read -r pkg regex; do
 import json, sys
 path, name, count, rc = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 runs = fails = 0
-shown = 0
+out = {}  # test -> output lines of its current run
+failed = []
 for line in open(path):
     line = line.strip()
     if not line.startswith("{"):
@@ -51,16 +56,19 @@ for line in open(path):
     if test != name and not test.startswith(name + "/"):
         continue
     act = ev.get("Action")
-    if test == name and act == "pass":
+    if act == "run" and test == name:
+        out.clear()
+    elif act == "output":
+        out.setdefault(test, []).append(ev.get("Output", ""))
+    elif test == name and act == "pass":
         runs += 1
     elif test == name and act in ("fail", "skip"):  # a skipped run proves nothing
         runs += 1
         fails += 1
-    elif act == "output" and "--- FAIL:" in ev.get("Output", "") and shown < 30:
-        sys.stderr.write(ev["Output"])
-        if not ev["Output"].endswith("\n"):
-            sys.stderr.write("\n")
-        shown += 1
+        failed.append("".join(l for t in sorted(out) for l in out[t]))
+for i, text in enumerate(failed[:3]):  # the reason for the first few failures, tail-capped
+    lines = text.splitlines()[-80:]
+    sys.stderr.write(f"--- failure {i + 1} of {len(failed)} ({name}):\n" + "\n".join(lines) + "\n")
 if runs == 0:
     # Missing test, or the package failed before the test ran.
     fails = count

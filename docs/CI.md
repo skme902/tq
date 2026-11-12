@@ -63,7 +63,7 @@ The script prints whether Postgres tests are enabled, runs the race tests, then 
 
 ### Flaky list
 
-`scripts/ci/flaky-tests.txt` lines are `<package> <TestName>` (an exact top-level test name; patterns are rejected), with `#` comments. A skipped run counts as a failure, and each `go test` gets `-timeout ${FLAKY_TIMEOUT:-15m}`. Nightly runs each one with `-race` and `-count` (default 30):
+`scripts/ci/flaky-tests.txt` lines are `<package> <TestName>` (an exact top-level test name; patterns are rejected), with `#` comments. A skipped top-level run counts as a failure (a skipped subtest does not: several tests skip the memstore case by design, so nightly sets `TQ_TEST_POSTGRES_DSN`); failing runs print their test output, and each `go test` gets `-timeout ${FLAKY_TIMEOUT:-15m}`. Nightly runs each one with `-race` and `-count` (default 30):
 
 ```bash
 FLAKY_COUNT=30 scripts/ci/flaky.sh
@@ -75,7 +75,7 @@ PR CI still runs the full `go test` suite, including every test named in the fla
 
 ### Parity
 
-Parity compares the deterministic cells of a fresh `parity/results/probes.md` with the committed file. It needs a clone of [temporalio/temporal](https://github.com/temporalio/temporal) at v1.32.1, commit `af08a5e5`. The script checks `git rev-parse HEAD` and refuses any other commit. It restores the committed `probes.md` before it exits. `scripts/ci/probecmp.py` compares the deterministic cells only: for `| ours/` delivery rows the name, run, script, the four scores and `complete`; for `| probe-` system-limit rows the delivered count and `complete`. Timing cells and the config-change lag table are not compared. A mismatch (`probe rows N M mismatches K` with `K > 0`) fails the script.
+Parity compares the deterministic cells of a fresh `parity/results/probes.md` with the committed file. It needs a clone of [temporalio/temporal](https://github.com/temporalio/temporal) at v1.32.1, commit `af08a5e5`. The script checks `git rev-parse HEAD` and refuses any other commit. It restores the committed `probes.md` before it exits. `scripts/ci/probecmp.py` compares the deterministic cells only: for 14-cell `| ours/` delivery rows the identity and count cells (added, add errors, delivered, lost, dup) and `complete`; other `| ours/` rows (order and mean-score tables) in full; for `| probe-` system-limit rows the delivered count and `complete`. Latency cells, the system-limit first-1s count and rate, and the config-change lag table are wall-clock and not compared, so a rate cap that stops applying is not caught here. A mismatch (`probe rows N M mismatches K` with `K > 0`) fails the script.
 
 ```bash
 # Clone yourself:

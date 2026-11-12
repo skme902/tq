@@ -7,3 +7,4 @@
 ./internal/matching TestAckDuringDeleteKeepsBacklogCount # admin_r1_b1_test.go
 . TestPurgeQueue # admin_test.go
 . TestPeekTasks # admin_test.go
+. TestDeadLetterAdminOwnership # deadletter_test.go: sqlite redrive polled "a" not "b" once in a full-suite run (0/60 isolated)

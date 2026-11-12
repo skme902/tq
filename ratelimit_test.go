@@ -143,6 +143,20 @@ func (h *rlHarness) run(d time.Duration) {
 	time.Sleep(20 * time.Millisecond)
 }
 
+// runUntil steps the fake clock like run until want deliveries are recorded or d of fake
+// time has passed, then settles.
+func (h *rlHarness) runUntil(want int, d time.Duration) {
+	end := h.ts.Now().Add(d)
+	for h.total() < want && h.ts.Now().Before(end) {
+		h.ts.Advance(time.Millisecond)
+		for range 4 {
+			runtime.Gosched()
+		}
+		time.Sleep(20 * time.Microsecond)
+	}
+	h.settle(want)
+}
+
 // settle waits in real time, without moving the fake clock, until want deliveries are recorded
 // or 300ms pass, so assertions about a single fake instant do not depend on scheduler speed.
 func (h *rlHarness) settle(want int) {
@@ -329,11 +343,11 @@ func TestRateLimitZeroAndTinyRate(t *testing.T) {
 			require.NoError(t, h.src.SetQueueRateLimit(q, f32p(10)))
 			// SetQueueRateLimit clips the ready time synchronously at the frozen fake now; the
 			// 10th task is then due exactly 2s later. The matcher re-arms its rate-limit timer
-			// with a relative delay, so a clock step between its Now() snapshot and the arm makes
-			// that deadline land just past 2s. Give it slack (only 10 tasks exist, so extra time
-			// cannot over-deliver), then let the last delivery be recorded.
-			h.run(2*time.Second + 500*time.Millisecond)
-			h.settle(10)
+			// with a relative delay, so clock steps between its Now() snapshot and the arm push
+			// that deadline past 2s by however long the arming goroutine was descheduled. Keep
+			// stepping the clock until all 10 arrive (only 10 exist, so this cannot
+			// over-deliver), bounded at 2s of extra fake time.
+			h.runUntil(10, 4*time.Second)
 			require.Equal(t, 10, h.total())
 		})
 	}
