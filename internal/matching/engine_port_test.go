@@ -76,9 +76,17 @@ func addConsumeAllTasksNonConcurrently(t *testing.T, ts *testStore, taskCount in
 	// the reloaded one starts from the last persisted (stale) count until its reader's first
 	// GetTasks (which may itself be retrying injected faults) resets it; WaitUntilInitialized
 	// does not wait for that read, so under load an immediate check races it.
+	// No writes happen while waiting, so the queue is not unloaded again: look it up without
+	// creating, with a bounded context, and report errors to c so the wait keeps retrying.
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		assert.InDelta(c, taskCount, totalApproximateBacklogCount(portPQM(t, e).backlogMgr), 2)
-	}, 10*time.Second, time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		pm, err := e.getTaskQueuePartitionManager(ctx, portQueue, false)
+		if !assert.NoError(c, err) || !assert.NotNil(c, pm, "queue not loaded") {
+			return
+		}
+		assert.InDelta(c, taskCount, totalApproximateBacklogCount(pm.defaultQueue.backlogMgr), 2)
+	}, 10*time.Second, 10*time.Millisecond)
 
 	for range taskCount {
 		portPollTask(t, e)

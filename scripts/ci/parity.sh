@@ -52,4 +52,4 @@ if [[ "$rc" -ne 0 ]]; then
   exit "$rc"
 fi
 
-python3 scripts/ci/probecmp.py raw "$committed" "$out_dir/probes.md"
+python3 scripts/ci/probecmp.py "$committed" "$out_dir/probes.md"

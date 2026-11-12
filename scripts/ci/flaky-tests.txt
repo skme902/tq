@@ -1,4 +1,4 @@
-# Tests repeated by scripts/ci/flaky.sh. Format: <package> <TestRegex> # note
+# Tests repeated by scripts/ci/flaky.sh. Format: <package> <TestName> # note (exact top-level name)
 # A test stays listed until it passes nightly repeatedly.
 # Listing does not remove it from PR CI.
 

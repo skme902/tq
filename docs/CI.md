@@ -8,7 +8,7 @@ Workflows live in `.github/workflows/`. Local entry points are `scripts/ci/`.
 
 | Job | What it does |
 |---|---|
-| `lint` | `scripts/ci/lint.sh`: `gofmt -l` on tracked `*.go` files, `go vet ./...`, `staticcheck ./...` |
+| `lint` | `scripts/ci/lint.sh`: `gofmt -l` on every tracked `*.go` file (both modules); `go vet ./...` and `staticcheck ./...` in the root module only (`parity/` is vetted by `test.sh`, not staticchecked) |
 | `test` | Postgres 17, then `scripts/ci/test.sh`: `go test -race -count=1 ./...`, then `go vet` and `go build` in the `parity/` module. |
 
 The test job sets `TQ_TEST_POSTGRES_DSN` so Postgres tests run, and `CI_REQUIRE_POSTGRES=1` so the job fails if that DSN is missing. SQLite and memstore tests always run. On failure the job uploads the `go test -json` log as the `go-test-json` artifact.
@@ -23,7 +23,7 @@ The test job sets `TQ_TEST_POSTGRES_DSN` so Postgres tests run, and `CI_REQUIRE_
 |---|---|
 | `flaky` | `scripts/ci/flaky.sh` with `FLAKY_COUNT=30` and Postgres 17. Any failure fails the job. |
 | `parity` | Clones `temporalio/temporal` v1.32.1 into `$RUNNER_TEMP/temporal` and runs `scripts/ci/parity.sh`. Uploads `probes.md` and the probe log. |
-| `bench` | `scripts/ci/bench-smoke.sh`. Uploads `bench.txt`. No thresholds. |
+| `bench` | Postgres 17, then `scripts/ci/bench-smoke.sh`. Uploads `bench.txt`. No thresholds. |
 
 ## Running checks locally
 
@@ -63,7 +63,7 @@ The script prints whether Postgres tests are enabled, runs the race tests, then 
 
 ### Flaky list
 
-`scripts/ci/flaky-tests.txt` lines are `<package> <TestRegex>`, with `#` comments. Nightly runs each one with `-race` and `-count` (default 30):
+`scripts/ci/flaky-tests.txt` lines are `<package> <TestName>` (an exact top-level test name; patterns are rejected), with `#` comments. A skipped run counts as a failure, and each `go test` gets `-timeout ${FLAKY_TIMEOUT:-15m}`. Nightly runs each one with `-race` and `-count` (default 30):
 
 ```bash
 FLAKY_COUNT=30 scripts/ci/flaky.sh
@@ -75,7 +75,7 @@ PR CI still runs the full `go test` suite, including every test named in the fla
 
 ### Parity
 
-Parity compares a fresh `parity/results/probes.md` with the committed file. It needs a clone of [temporalio/temporal](https://github.com/temporalio/temporal) at v1.32.1, commit `af08a5e5`. The script checks `git rev-parse HEAD` and refuses any other commit. It restores the committed `probes.md` before it exits. A mismatch (`probe ours rows N M mismatches K` with `K > 0`) fails the script.
+Parity compares the deterministic cells of a fresh `parity/results/probes.md` with the committed file. It needs a clone of [temporalio/temporal](https://github.com/temporalio/temporal) at v1.32.1, commit `af08a5e5`. The script checks `git rev-parse HEAD` and refuses any other commit. It restores the committed `probes.md` before it exits. `scripts/ci/probecmp.py` compares the deterministic cells only: for `| ours/` delivery rows the name, run, script, the four scores and `complete`; for `| probe-` system-limit rows the delivered count and `complete`. Timing cells and the config-change lag table are not compared. A mismatch (`probe rows N M mismatches K` with `K > 0`) fails the script.
 
 ```bash
 # Clone yourself:

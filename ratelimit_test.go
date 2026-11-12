@@ -143,16 +143,6 @@ func (h *rlHarness) run(d time.Duration) {
 	time.Sleep(20 * time.Millisecond)
 }
 
-// waitRate waits in real time, without moving the fake clock, until the engine reports rps as
-// the queue's effective rate (the limiter clip happens under the same lock).
-func (h *rlHarness) waitRate(rps float64) {
-	h.t.Helper()
-	require.Eventually(h.t, func() bool {
-		got, _, ok := h.e.RateLimit(q)
-		return ok && got == rps
-	}, 5*time.Second, time.Millisecond, "rate %v not applied", rps)
-}
-
 // settle waits in real time, without moving the fake clock, until want deliveries are recorded
 // or 300ms pass, so assertions about a single fake instant do not depend on scheduler speed.
 func (h *rlHarness) settle(want int) {
@@ -337,12 +327,12 @@ func TestRateLimitZeroAndTinyRate(t *testing.T) {
 			require.Zero(t, h.total())
 			// raising the rate wakes the stalled matcher (ready time clipped, tasks reprocessed)
 			require.NoError(t, h.src.SetQueueRateLimit(q, f32p(10)))
-			// The clip anchors the ready time at the fake now when the async config change lands,
-			// and the 10th task is due exactly 2s after that. Wait (clock frozen) until the new
-			// rate is applied so the clock cannot move before the clip, then let the last
-			// delivery be recorded without moving the clock.
-			h.waitRate(10)
-			h.run(2 * time.Second)
+			// SetQueueRateLimit clips the ready time synchronously at the frozen fake now; the
+			// 10th task is then due exactly 2s later. The matcher re-arms its rate-limit timer
+			// with a relative delay, so a clock step between its Now() snapshot and the arm makes
+			// that deadline land just past 2s. Give it slack (only 10 tasks exist, so extra time
+			// cannot over-deliver), then let the last delivery be recorded.
+			h.run(2*time.Second + 500*time.Millisecond)
 			h.settle(10)
 			require.Equal(t, 10, h.total())
 		})

@@ -9,15 +9,17 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 python3 - "$list" "$work/cases.tsv" <<'PY'
-import sys
+import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f, open(dst, "w") as out:
     for raw in f:
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
-        pkg, regex = line.split(None, 1)
-        out.write(f"{pkg}\t{regex}\n")
+        pkg, name = line.split(None, 1)
+        if not re.fullmatch(r"Test\w*", name):
+            sys.exit(f"flaky-tests.txt: {name!r}: use an exact top-level test name")
+        out.write(f"{pkg}\t{name}\n")
 PY
 
 : >"$work/results.tsv"
@@ -26,7 +28,7 @@ while IFS=$'\t' read -r pkg regex; do
   json="$work/out.json"
   err="$work/err.txt"
   set +e
-  go test -json -race -count="$count" -run "^(${regex})$" "$pkg" >"$json" 2>"$err"
+  go test -json -race -timeout "${FLAKY_TIMEOUT:-15m}" -count="$count" -run "^(${regex})$" "$pkg" >"$json" 2>"$err"
   rc=$?
   set -e
   if [[ -s "$err" ]]; then
@@ -49,9 +51,9 @@ for line in open(path):
     if test != name and not test.startswith(name + "/"):
         continue
     act = ev.get("Action")
-    if test == name and act in ("pass", "skip"):
+    if test == name and act == "pass":
         runs += 1
-    elif test == name and act == "fail":
+    elif test == name and act in ("fail", "skip"):  # a skipped run proves nothing
         runs += 1
         fails += 1
     elif act == "output" and "--- FAIL:" in ev.get("Output", "") and shown < 30:

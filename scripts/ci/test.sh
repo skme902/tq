@@ -18,7 +18,7 @@ fi
 if [[ -n "${TEST_JSON:-}" ]]; then
   mkdir -p "$(dirname -- "$TEST_JSON")"
   # Keep the step log readable; the file is the raw JSON.
-  go test -json -race -count=1 ./... | tee "$TEST_JSON" | python3 -c '
+  go test -json -race -count=1 ./... | tee "$TEST_JSON" | python3 -u -c '
 import json, sys
 for line in sys.stdin:
     s = line.strip()
