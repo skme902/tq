@@ -611,3 +611,7 @@ Benchmarks (enqueue + dequeue + ack, backlog path and sync-match path, per store
 ```
 go test -run '^$' -bench 'BenchmarkEngine|BenchmarkStoreCommit' -benchtime 20000x .
 ```
+
+## CI / running checks locally
+
+Pull requests run lint and `go test -race` (with Postgres). Nightly repeats the flaky list, checks parity probes, and runs a bench smoke. Scripts are under `scripts/ci/`. See [docs/CI.md](docs/CI.md).

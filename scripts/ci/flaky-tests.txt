@@ -1,0 +1,9 @@
+# Tests repeated by scripts/ci/flaky.sh. Format: <package> <TestRegex> # note
+# A test stays listed until it passes nightly repeatedly.
+# Listing does not remove it from PR CI.
+
+. TestRateLimitZeroAndTinyRate # ratelimit_test.go
+./internal/matching TestPortAddConsumeTasksDBErrors # engine_port_test.go
+./internal/matching TestAckDuringDeleteKeepsBacklogCount # admin_r1_b1_test.go
+. TestPurgeQueue # admin_test.go
+. TestPeekTasks # admin_test.go
