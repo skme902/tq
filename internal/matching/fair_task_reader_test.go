@@ -118,6 +118,51 @@ func TestFairTaskReaderBacklogCountAfterOutOfOrderCompletion(t *testing.T) {
 	require.EqualValues(t, 2, blm.db.getTotalApproximateBacklogCount())
 }
 
+// Not upstream (review r1): adminPurge writes a known count, so it must also reset the
+// exclusions a previous reset recorded, or acks of tasks written after the purge are skipped.
+func TestFairTaskReaderBacklogCountAfterPurge(t *testing.T) {
+	t.Parallel()
+
+	reader, blm := newBacklogCountTestReader(t, 3, 3)
+	tasks := newBacklogCountTestTasks(8)
+	finish := func(id int64) {
+		t.Helper()
+		reader.lock.Lock()
+		entry, ok := reader.outstandingTasks.Get(outstandingTask{level: fairLevel{pass: 1, id: id}})
+		reader.lock.Unlock()
+		require.True(t, ok)
+		require.NotNil(t, entry.task)
+		entry.task.finish(taskFinishResult{consumedToken: true})
+	}
+	write := func(batch []*store.TaskInfo) {
+		reader.getAndPinAckLevel()
+		blm.db.Lock()
+		blm.db.updateBacklogStatsLocked(subqueueZero, int64(len(batch)), time.Time{})
+		blm.db.Unlock()
+		reader.wroteNewTasks(batch)
+		reader.unpinAckLevel(nil)
+	}
+
+	reader.mergeTasks(tasks[:3], mergeReadToEnd)
+	finish(3)
+	write(tasks[3:4]) // the reset after this write excludes completed task 3
+	require.True(t, reader.atEnd)
+	require.EqualValues(t, 3, blm.db.getTotalApproximateBacklogCount())
+
+	_, _, err := reader.adminPurge(context.Background())
+	require.NoError(t, err)
+	reader.releasePurgeHold()
+	require.EqualValues(t, 0, blm.db.getTotalApproximateBacklogCount())
+
+	// Four new tasks exceed the batch, so the reader leaves the end and acks apply deltas.
+	write(tasks[4:8])
+	require.False(t, reader.atEnd)
+	require.EqualValues(t, 4, blm.db.getTotalApproximateBacklogCount())
+	finish(5)
+	finish(6)
+	require.EqualValues(t, 2, blm.db.getTotalApproximateBacklogCount())
+}
+
 // newBacklogCountTestReader returns a reader whose backlog manager is never started, so tests
 // must not trigger reads or GC. GC is configured to effectively never run.
 func newBacklogCountTestReader(t *testing.T, batchSize int, initialCount int64) (*fairTaskReader, *fairBacklogManagerImpl) {

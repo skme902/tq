@@ -211,6 +211,10 @@ func (tr *fairTaskReader) adminPurge(ctx context.Context) (leased []*internalTas
 	}
 	// What is left in memory is above the purge point; anything else above it is unknown
 	// (written concurrently), and the next read to the end corrects the count.
+	// This writes a known count, so record the completions it excludes (v1.32.2 #12566); the
+	// purge dropped every completion at or below maxLevel, so stale exclusions must not skip
+	// the ack deltas of tasks written after it.
+	tr.acksExcludedFromBacklog = tr.completedTaskCountLocked()
 	tr.backlogMgr.db.updateFairAckLevel(tr.subqueue, tr.ackLevel, 0, int64(tr.loadedTasks+tr.leasedTasks+tr.delayedTasks), tr.backlogAge.oldestTime())
 	tr.maybeReadTasksLocked()
 	return leased, tr.ackLevel.inc(), nil
