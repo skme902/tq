@@ -1,6 +1,6 @@
 //go:build parity_upstream
 
-// Parity harness adapter: drives upstream temporalio/temporal v1.32.1 af08a5e5 matching
+// Parity harness adapter: drives upstream temporalio/temporal v1.32.2 6d085822 matching
 // (service/matching, in-process matchingEngineImpl, fairness on) with the shared parity driver.
 // This file is compiled only through `go test -overlay` into a copy-free overlay of the
 // pristine upstream clone (see parity/run.sh); it is not part of the library build.

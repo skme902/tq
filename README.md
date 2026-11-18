@@ -2,7 +2,7 @@
 
 A standalone, embeddable task queue library ported from the matching service of
 [temporalio/temporal](https://github.com/temporalio/temporal) v1.32.1 (`af08a5e5`), fair/priority
-path. It is MIT licensed (`LICENSE`, copyright skme902); the ported Temporal code keeps its MIT attribution in `UPSTREAM_LICENSE` and `NOTICE`. Every ported file carries an attribution header.
+path, with the applicable v1.32.2 (`6d085822`) matching fixes ported on top. It is MIT licensed (`LICENSE`, copyright skme902); the ported Temporal code keeps its MIT attribution in `UPSTREAM_LICENSE` and `NOTICE`. Every ported file carries an attribution header.
 
 Status (slice 6, final): a single partition; three stores (in-memory, PostgreSQL, SQLite); priority levels,
 weighted fairness (the upstream fair-path backlog), rate limiting (the upstream simple-limiter path), long polling,
@@ -598,7 +598,7 @@ go test -race ./...
 ```
 
 Parity harness (separate module `parity/`; the library does not depend on temporal). It needs a separate
-clone of upstream Temporal at tag v1.32.1 (commit af08a5e5), which is not included in this repo. Put it at
+clone of upstream Temporal at tag v1.32.2 (commit 6d085822), which is not included in this repo. Put it at
 `upstream/temporal` or set `UPSTREAM_DIR`; see [`parity/README.md`](parity/README.md):
 
 ```

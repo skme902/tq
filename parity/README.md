@@ -6,11 +6,11 @@ Temporal. Results and method: [`../docs/PARITY_REPORT.md`](../docs/PARITY_REPORT
 ## Prerequisites
 
 - Go (the version in `go.mod`) and python3.
-- **A separate clone of upstream Temporal at v1.32.1 (commit af08a5e5).** It is not part of this repo:
+- **A separate clone of upstream Temporal at v1.32.2 (commit 6d085822).** It is not part of this repo:
 
   ```
-  git clone --branch v1.32.1 --depth 1 https://github.com/temporalio/temporal ../upstream/temporal
-  git -C ../upstream/temporal rev-parse --short=8 HEAD   # af08a5e5
+  git clone --branch v1.32.2 --depth 1 https://github.com/temporalio/temporal ../upstream/temporal
+  git -C ../upstream/temporal rev-parse --short=8 HEAD   # 6d085822
   ```
 
   The default location is `<repo>/upstream/temporal`, which is gitignored. Point `UPSTREAM_DIR` at a clone in

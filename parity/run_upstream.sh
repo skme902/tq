@@ -6,7 +6,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # Upstream clone: UPSTREAM_DIR, default ../upstream/temporal. Fetch it separately (see parity/README.md):
-#   git clone --branch v1.32.1 https://github.com/temporalio/temporal ../upstream/temporal  # commit af08a5e5
+#   git clone --branch v1.32.2 https://github.com/temporalio/temporal ../upstream/temporal  # commit 6d085822
 upd="${UPSTREAM_DIR:-$here/../upstream/temporal}"
 if [[ ! -f "$upd/service/matching/matching_engine.go" ]]; then
   echo "run_upstream.sh: upstream clone not found at $upd (set UPSTREAM_DIR; see parity/README.md)" >&2; exit 2
@@ -19,7 +19,8 @@ cat > "$gen/overlay.json" <<JSON
  "$up/service/matching/parity_driver_test.go":"$gen/parity_driver_test.go",
  "$up/service/matching/parity_upstream_test.go":"$here/upstream/parity_upstream_test.go"}}
 JSON
-bin="$gen/matching.test"
+# The cached binary is keyed by the upstream commit so a different clone never reuses it.
+bin="$gen/matching-$(git -C "$up" rev-parse --short=12 HEAD 2>/dev/null || echo unknown).test"
 if [[ ! -x "$bin" || "$here/driver/driver.go" -nt "$bin" || "$here/upstream/parity_upstream_test.go" -nt "$bin" ]]; then
   (cd "$up" && go test -tags parity_upstream -overlay "$gen/overlay.json" -c -o "$bin" ./service/matching)
 fi
