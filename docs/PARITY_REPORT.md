@@ -1,4 +1,12 @@
-# Parity report: tq vs upstream Temporal matching (v1.32.1 af08a5e5)
+# Parity report: tq vs upstream Temporal matching (v1.32.2 6d085822)
+
+Parity target: v1.32.2 (`6d085822`) since 2026-11-18. That day `parity/results/probes.md` was
+regenerated against it (`scripts/ci/parity.sh`: 30 of 30 probe rows, 0 mismatches in the compared
+cells; only wall-clock cells moved). The full matrix in `parity/results/compare.md` and the numbers
+quoted below were not rerun; they are from v1.32.1 (`af08a5e5`) on 2026-10-27. Between the two
+tags the upstream matching changes are #12595 (priTaskReader only), #12566 (fair backlog count
+tracking, ported to tq), #11841 (worker-instance poll cancellation) and #11527 (sticky queue
+stats); none of them changes dispatch order or delivery.
 
 Status: slice 6 (final). All numbers below come from runs on 2026-10-27 (IST). Results:
 `parity/results/compare.md` (full matrix, finished 15:20:42 IST) and `parity/results/probes.md`
@@ -35,7 +43,7 @@ parity/                      separate Go module (github.com/skme902/tq/parity);
 
 **Upstream side (a).** The real `matchingEngine` from `newMatchingEngine` runs in-process. It is built
 with `go test -tags parity_upstream -c -overlay` inside the pristine upstream tree, so it is the real
-upstream code at af08a5e5. The adapter overrides nothing in the matching package.
+upstream code at the pinned commit (6d085822; af08a5e5 for the 2026-10-27 runs). The adapter overrides nothing in the matching package.
 
 The adapter is set up as follows:
 - **Persistence.** Upstream's own SQL persistence on SQLite in memory mode, through `sql.NewFactory` with MaxOpenConns 1. The `mem` variant uses the
@@ -444,7 +452,7 @@ No other mismatch was found. Every scenario was run 3 times on 2 of our stores.
   the library tests), so absolute drain latencies are not parity claims.
 - **Partitions are untested** because they are not implemented. Users who expect upstream's multi-partition throughput or scaling will not get it.
 - **Harness coupling.** The upstream adapter uses unexported internals (`newMatchingEngine`, `defaultTestConfig`, test
-  fixtures) at af08a5e5. It will need updating for any other upstream tag.
+  fixtures). It builds unchanged at af08a5e5 and 6d085822 but may need updating for other upstream tags.
 - **Workload coverage.** The harness covers activity task queues only, on one host. It does not inject failures (store errors or crashes); those are
   covered by the ported DBErrors tests and the store test suite, not by differential runs.
 
