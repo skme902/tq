@@ -220,9 +220,11 @@ func TestDeleteFailureStillDeliversTask(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("delete did not start")
 	}
-	// The read fetched both rows and its merge now holds the reader lock while it waits for
-	// the db lock that the in-flight delete holds. Release the delete only then, so the merge
-	// sees the adminDeleted mark, skips "low" and moves readLevel past it.
+	// The read fetched both rows while the delete is in flight. Its merge sees the
+	// adminDeleted mark, skips "low" and moves readLevel past it. Release the delete only once
+	// the merge is done. (Before v1.32.2 #12566 the merge blocked on the db lock the delete
+	// holds, to reset the backlog count; now an in-flight admin delete pins the ack level, so
+	// the merge does not reset the count and does not wait.)
 	select {
 	case <-g.getReturned:
 	case <-time.After(3 * time.Second):
@@ -230,15 +232,10 @@ func TestDeleteFailureStillDeliversTask(t *testing.T) {
 	}
 	tr := subqueueReader(t, e)
 	require.Eventually(t, func() bool {
-		if tr.lock.TryLock() {
-			tr.lock.Unlock()
-			return false
-		}
-		return true
-	}, 3*time.Second, time.Millisecond, "merge should hold the reader lock")
+		readLevel, _ := tr.getLevels()
+		return !readLevel.less(high)
+	}, 3*time.Second, time.Millisecond, "read should have moved past the task it skipped")
 	closeOnce(g.releaseDelete)
-	readLevel, _ := tr.getLevels()
-	require.False(t, readLevel.less(high), "read should have moved past the task it skipped")
 
 	select {
 	case err := <-errCh:
