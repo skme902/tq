@@ -112,7 +112,7 @@ func (tr *fairTaskReader) adminDeleteTask(ctx context.Context, tas store.TaskAdm
 		delete(tr.adminDeleted, level)
 		return false, nil, nil
 	}
-	db.updateFairAckLevel(tr.subqueue, tr.ackLevel, -1, tr.knownCountLocked(), tr.backlogAge.oldestTime())
+	db.updateFairAckLevel(tr.subqueue, tr.ackLevel, -1, tr.knownCountForResetLocked(), tr.backlogAge.oldestTime())
 	tr.advanceAckLevelLocked()
 	tr.maybeReadTasksLocked()
 	return true, leased, nil

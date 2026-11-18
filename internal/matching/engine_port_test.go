@@ -1,4 +1,5 @@
 // Ported from temporalio/temporal v1.32.1 af08a5e5, service/matching/matching_engine_test.go
+// (concurrentPublishAndConsumeValidateBacklogCounter bounds updated to v1.32.2 6d085822, #12566)
 // (fair suite): TestAddConsumeWorkflowTasksNoDBErrors, TestAddConsumeWorkflowTasksDBErrors,
 // TestConcurrentAddWorkflowTasksNoDBErrors (via addConsumeAllWorkflowTasksNonConcurrently and
 // concurrentPublishAndConsumeValidateBacklogCounter). History/RecordTaskStarted mocks are not
@@ -131,9 +132,18 @@ func TestPortConcurrentAddTasksNoDBErrors(t *testing.T) {
 	wg.Wait()
 
 	pqm := portPQM(t, e)
-	backlogCount := totalApproximateBacklogCount(pqm.backlogMgr)
-	db := pqm.backlogMgr.getDB()
+	// v1.32.2 (#12566): hold the reader lock so the count, ack level and completions are one
+	// snapshot, and check tight bounds instead of InDelta.
+	bm := pqm.backlogMgr
+	bm.subqueueLock.Lock()
+	tr := bm.subqueues[subqueueZero]
+	bm.subqueueLock.Unlock()
+	tr.lock.Lock()
+	defer tr.lock.Unlock()
+
+	db := bm.getDB()
 	db.Lock()
+	backlogCount := db.subqueues[subqueueZero].ApproximateBacklogCount
 	ackLevel := fairLevelFromStore(db.subqueues[subqueueZero].FairAckLevel)
 	db.Unlock()
 	resp, err := ts.Store.GetTasks(context.Background(), &store.GetTasksRequest{
@@ -141,6 +151,16 @@ func TestPortConcurrentAddTasksNoDBErrors(t *testing.T) {
 		PageSize: 1 << 30,
 	})
 	require.NoError(t, err)
-	require.InDelta(t, int64(len(resp.Tasks)), backlogCount, 2)
+	dbTasks := int64(len(resp.Tasks))
+	completedTasks := tr.completedTaskCountLocked()
+
+	// Completed tasks above the ack level may already be excluded from the estimate.
+	// Require enough backlog for the remaining dispatches, allowing a conservative overestimate.
+	require.LessOrEqual(t, completedTasks, dbTasks)
+	require.GreaterOrEqual(t, backlogCount, dbTasks-completedTasks)
+	// This upper bound only holds because this test doesn't inject CreateTasks faults.
+	// A write that fails without definitely failing (e.g. Unavailable) leaves the count
+	// incremented even if no task was written, so the count could legitimately exceed dbTasks.
+	require.LessOrEqual(t, backlogCount, dbTasks)
 	require.Equal(t, numWorkers*tasksToAdd, len(resp.Tasks))
 }

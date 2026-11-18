@@ -9,6 +9,7 @@ package matching
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -430,7 +431,8 @@ func (db *taskQueueDB) CompleteFairTasksLessThan(
 		ConditionRangeID: db.rangeID,
 	})
 	// ConditionFailedError means we lost ownership: not a store failure, caller will unload.
-	if err != nil && !store.IsConditionFailed(err) {
+	// Context canceled is expected if the task queue unloads during a GC.
+	if err != nil && !store.IsConditionFailed(err) && !errors.Is(err, context.Canceled) {
 		db.logger.Error("Persistent store operation failure",
 			"op", "CompleteTasksLessThan", "error", err, "ackLevel", exclusiveMaxLevel.String())
 	}

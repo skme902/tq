@@ -8,6 +8,7 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"hash/maphash"
 	"log/slog"
 	"sync/atomic"
@@ -245,7 +246,10 @@ func (w *fairTaskWriter) writeBatch(reqs []*writeTaskRequest) (retErr error) {
 	if err == nil {
 		w.backlogMgr.wroteNewTasks(resp) // must be called before unpin()
 	} else {
-		w.logger.Error("Persistent store operation failure", "op", "CreateTasks", "error", err)
+		// Context canceled is expected if the task queue unloads during a write.
+		if !errors.Is(err, context.Canceled) {
+			w.logger.Error("Persistent store operation failure", "op", "CreateTasks", "error", err)
+		}
 		w.backlogMgr.signalIfFatal(err)
 	}
 	return err
