@@ -20,7 +20,8 @@ cat > "$gen/overlay.json" <<JSON
  "$up/service/matching/parity_upstream_test.go":"$here/upstream/parity_upstream_test.go"}}
 JSON
 # The cached binary is keyed by the upstream commit so a different clone never reuses it.
-bin="$gen/matching-$(git -C "$up" rev-parse --short=12 HEAD 2>/dev/null || echo unknown).test"
+uprev=$(git -C "$up" rev-parse --short=12 HEAD) || { echo "run_upstream.sh: cannot resolve the upstream commit in $up" >&2; exit 2; }
+bin="$gen/matching-$uprev.test"
 if [[ ! -x "$bin" || "$here/driver/driver.go" -nt "$bin" || "$here/upstream/parity_upstream_test.go" -nt "$bin" ]]; then
   (cd "$up" && go test -tags parity_upstream -overlay "$gen/overlay.json" -c -o "$bin" ./service/matching)
 fi

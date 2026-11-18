@@ -2,6 +2,7 @@
 // Changes: fair-path only (classic CreateTasks/GetTasks/ack level and draining/migration and
 // partition scale state removed); protos replaced by store types; backlog gauges are the
 // unversioned (non-attribution) ones; no task lag gauge; injected clock.
+// v1.32.2 6d085822 (#12566): context.Canceled store errors are no longer logged as failures.
 // Copyright (c) 2025 Temporal Technologies Inc. MIT License; see UPSTREAM_LICENSE and NOTICE.
 
 package matching

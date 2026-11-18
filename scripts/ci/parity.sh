@@ -21,6 +21,7 @@ export UPSTREAM_DIR
 rev=$(git -C "$UPSTREAM_DIR" rev-parse HEAD)
 if [[ "$rev" != 6d085822* ]]; then
   echo "parity.sh: $UPSTREAM_DIR HEAD $rev does not start with 6d085822" >&2
+  echo "parity.sh: the parity target is upstream v1.32.2; check it out there (git -C \"\$UPSTREAM_DIR\" fetch --depth 1 origin tag v1.32.2 && git -C \"\$UPSTREAM_DIR\" checkout v1.32.2) or point UPSTREAM_DIR at such a clone" >&2
   exit 1
 fi
 echo "upstream: $rev"

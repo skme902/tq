@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | Upstream | github.com/temporalio/temporal |
-| Tag | **v1.32.1** (latest stable GitHub release; `v1.33.0-*` tags are pre-releases, not used) |
+| Tag | **v1.32.1**: the port baseline this map describes (`v1.33.0-*` tags are pre-releases, not used). Parity target: v1.32.2, see below |
 | Commit | **af08a5e5f2dd40f545f2afac7780daaa6987001e** — "Make fair task gc conditional on rangeid (#12283) (#12411)", 2026-10-07 23:48 IST |
 | Go | `go 1.26.8` in go.mod (no toolchain line); verified building/testing with go1.27.3 |
 | License | MIT (© Temporal Technologies 2025, © Uber 2020) → copied to `../UPSTREAM_LICENSE` |
-| Clone | `upstream/temporal` (fetched separately at tag v1.32.1, commit af08a5e5; pristine, `git status` clean; see parity/README.md) |
+| Clone | `upstream/temporal` (fetched separately; at tag v1.32.2, commit 6d085822, for parity runs; at v1.32.1 af08a5e5 to follow the line numbers below; pristine, `git status` clean; see parity/README.md) |
 | v1.32.2 | **6d085822273f4336796e6959c73ab1d14a23eb77** (2026-10-31 IST) is the parity target. Of its matching/persistence commits only #12566 (fair backlog count tracking, 3807ace9d) applies and is ported; #12595 (priTaskReader), #11841 (worker-instance poll cancellation) and #11527 (sticky/versioned stats) touch code tq does not have. The map below still describes v1.32.1 line numbers. |
 
 All paths are relative to `service/matching/` unless prefixed. Line numbers are for the commit above.
