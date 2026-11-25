@@ -49,8 +49,8 @@ jobs:
           cache-dependency-path: |
             go.sum
             parity/go.sum
-      - name: Clone upstream Temporal v1.32.1
-        run: git clone --depth 1 --branch v1.32.1 https://github.com/temporalio/temporal "$RUNNER_TEMP/temporal"
+      - name: Clone upstream Temporal v1.32.2
+        run: git clone --depth 1 --branch v1.32.2 https://github.com/temporalio/temporal "$RUNNER_TEMP/temporal"
       - name: Parity probes
         env:
           UPSTREAM_DIR: ${{ runner.temp }}/temporal

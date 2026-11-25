@@ -9,7 +9,7 @@ if [[ -z "${UPSTREAM_DIR:-}" ]]; then
     UPSTREAM_DIR="$PWD/upstream/temporal"
     if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
       mkdir -p "$(dirname "$UPSTREAM_DIR")"
-      git clone --depth 1 --branch v1.32.1 https://github.com/temporalio/temporal "$UPSTREAM_DIR"
+      git clone --depth 1 --branch v1.32.2 https://github.com/temporalio/temporal "$UPSTREAM_DIR"
     fi
   else
     echo "parity.sh: set UPSTREAM_DIR, or CLONE_UPSTREAM=1 to clone into upstream/temporal" >&2
@@ -19,8 +19,9 @@ fi
 export UPSTREAM_DIR
 
 rev=$(git -C "$UPSTREAM_DIR" rev-parse HEAD)
-if [[ "$rev" != af08a5e5* ]]; then
-  echo "parity.sh: $UPSTREAM_DIR HEAD $rev does not start with af08a5e5" >&2
+if [[ "$rev" != 6d085822* ]]; then
+  echo "parity.sh: $UPSTREAM_DIR HEAD $rev does not start with 6d085822" >&2
+  echo "parity.sh: the parity target is upstream v1.32.2; check it out there (git -C \"\$UPSTREAM_DIR\" fetch --depth 1 origin tag v1.32.2 && git -C \"\$UPSTREAM_DIR\" checkout v1.32.2) or point UPSTREAM_DIR at such a clone" >&2
   exit 1
 fi
 echo "upstream: $rev"

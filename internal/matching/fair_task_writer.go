@@ -2,12 +2,14 @@
 // (writeTaskRequest/taskIDBlock/noTaskIDs from task_writer.go, rangeIDToTaskIDBlock from
 // backlog_manager.go). Changes: protos → store types; the TopK persist ticker is replaced by a
 // clock check after each batch; metrics trimmed.
+// v1.32.2 6d085822 (#12566): context.Canceled store errors are no longer logged as failures.
 // Copyright (c) 2025 Temporal Technologies Inc. MIT License; see UPSTREAM_LICENSE and NOTICE.
 
 package matching
 
 import (
 	"context"
+	"errors"
 	"hash/maphash"
 	"log/slog"
 	"sync/atomic"
@@ -245,7 +247,10 @@ func (w *fairTaskWriter) writeBatch(reqs []*writeTaskRequest) (retErr error) {
 	if err == nil {
 		w.backlogMgr.wroteNewTasks(resp) // must be called before unpin()
 	} else {
-		w.logger.Error("Persistent store operation failure", "op", "CreateTasks", "error", err)
+		// Context canceled is expected if the task queue unloads during a write.
+		if !errors.Is(err, context.Canceled) {
+			w.logger.Error("Persistent store operation failure", "op", "CreateTasks", "error", err)
+		}
 		w.backlogMgr.signalIfFatal(err)
 	}
 	return err

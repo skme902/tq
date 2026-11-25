@@ -22,7 +22,7 @@ The test job sets `TQ_TEST_POSTGRES_DSN` so Postgres tests run, and `CI_REQUIRE_
 | Job | What it does |
 |---|---|
 | `flaky` | `scripts/ci/flaky.sh` with `FLAKY_COUNT=30` and Postgres 17. Any failure fails the job. |
-| `parity` | Clones `temporalio/temporal` v1.32.1 into `$RUNNER_TEMP/temporal` and runs `scripts/ci/parity.sh`. Uploads `probes.md` and the probe log. |
+| `parity` | Clones `temporalio/temporal` v1.32.2 into `$RUNNER_TEMP/temporal` and runs `scripts/ci/parity.sh`. Uploads `probes.md` and the probe log. |
 | `bench` | Postgres 17, then `scripts/ci/bench-smoke.sh`. Uploads `bench.txt`. No thresholds. |
 
 ## Running checks locally
@@ -75,11 +75,11 @@ PR CI still runs the full `go test` suite, including every test named in the fla
 
 ### Parity
 
-Parity compares the deterministic cells of a fresh `parity/results/probes.md` with the committed file. It needs a clone of [temporalio/temporal](https://github.com/temporalio/temporal) at v1.32.1, commit `af08a5e5`. The script checks `git rev-parse HEAD` and refuses any other commit. It restores the committed `probes.md` before it exits. `scripts/ci/probecmp.py` compares the deterministic cells only: for 14-cell `| ours/` delivery rows the identity and count cells (added, add errors, delivered, lost, dup) and `complete`; other `| ours/` rows (order and mean-score tables) in full; for `| probe-` system-limit rows the delivered count and `complete`. Latency cells, the system-limit first-1s count and rate, and the config-change lag table are wall-clock and not compared, so a rate cap that stops applying is not caught here. A mismatch (`probe rows N M mismatches K` with `K > 0`) fails the script.
+Parity compares the deterministic cells of a fresh `parity/results/probes.md` with the committed file. It needs a clone of [temporalio/temporal](https://github.com/temporalio/temporal) at v1.32.2, commit `6d085822`. The script checks `git rev-parse HEAD` and refuses any other commit. It restores the committed `probes.md` before it exits. `scripts/ci/probecmp.py` compares the deterministic cells only: for 14-cell `| ours/` delivery rows the identity and count cells (added, add errors, delivered, lost, dup) and `complete`; other `| ours/` rows (order and mean-score tables) in full; for `| probe-` system-limit rows the delivered count and `complete`. Latency cells, the system-limit first-1s count and rate, and the config-change lag table are wall-clock and not compared, so a rate cap that stops applying is not caught here. A mismatch (`probe rows N M mismatches K` with `K > 0`) fails the script.
 
 ```bash
 # Clone yourself:
-git clone --depth 1 --branch v1.32.1 https://github.com/temporalio/temporal /tmp/temporal
+git clone --depth 1 --branch v1.32.2 https://github.com/temporalio/temporal /tmp/temporal
 UPSTREAM_DIR=/tmp/temporal OUT_DIR=/tmp/tq-parity scripts/ci/parity.sh
 
 # Or let the script clone to upstream/temporal (gitignored):
