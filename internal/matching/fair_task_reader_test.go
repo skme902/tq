@@ -214,6 +214,10 @@ func TestFairTaskReaderNoStuckReportDuringUnload(t *testing.T) {
 
 	reader.getAndPinAckLevel()
 	reader.wroteNewTasks(newBacklogCountTestTasks(1))
+	// The reader is in the state the check looks for: not at the end, nothing loaded (the write
+	// was above readLevel and dropped), no read pending.
+	require.False(t, reader.atEnd)
+	require.Zero(t, reader.getLoadedTasks())
 	reader.unpinAckLevel(nil)
 
 	require.Empty(t, blm.metricsHandler.(*captureMetrics).snapshot(metrics.FairReaderStuckDetected))

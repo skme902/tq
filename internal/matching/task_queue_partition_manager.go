@@ -42,7 +42,7 @@ type taskQueuePartitionManagerImpl struct {
 	metricsCtx    context.Context
 	metricsCancel context.CancelFunc
 	// emitterDone is closed when the backlog-metrics emitter has exited (after it zeroed its
-	// gauges); nil if it was never started.
+	// gauges); nil if it was never started. Guarded by cfgMu.
 	emitterDone chan struct{}
 
 	// maxAttempts is the effective QueueConfig.MaxAttempts / Config.MaxAttempts (0 =
@@ -79,13 +79,17 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 	pm.rateLimitManager.UserDataChanged()
 	pm.emitPausedGauge()
 	pm.defaultQueue.Start()
-	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 {
-		pm.emitterDone = make(chan struct{})
+	pm.cfgMu.Lock()
+	// Start after Stop starts nothing (review M3); Stop reads emitterDone under the same lock.
+	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 && !pm.stopped {
+		done := make(chan struct{})
+		pm.emitterDone = done
 		go func() {
-			defer close(pm.emitterDone)
+			defer close(done)
 			pm.emitLogicalBacklogMetrics(pm.metricsCtx)
 		}()
 	}
+	pm.cfgMu.Unlock()
 }
 
 func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
@@ -94,12 +98,14 @@ func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
 	pm.cfgMu.Lock() // waits for an in-flight config callback
 	pm.stopped = true
 	pm.metricsHandler.Gauge(metrics.QueuePaused, 0) // an unloaded queue does not report paused
+	emitterDone := pm.emitterDone
 	pm.cfgMu.Unlock()
 	pm.defaultQueue.Stop(unloadCause)
 	// The emitter zeroes its gauges as its last step (upstream #12316). Deviation: wait for it, so
-	// the gauges are zero when Stop returns (our emit is an in-memory read, so this is short).
-	if pm.emitterDone != nil {
-		<-pm.emitterDone
+	// the gauges are zero when Stop returns (our emit is an in-memory read, so this is short; a
+	// metrics.Handler must not call back into the engine, see its doc).
+	if emitterDone != nil {
+		<-emitterDone
 	}
 }
 
@@ -113,7 +119,10 @@ func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
 func (pm *taskQueuePartitionManagerImpl) emitLogicalBacklogMetrics(ctx context.Context) {
 	var emitted map[int32]struct{}
 	defer func() {
-		if emitted != nil {
+		// Not upstream (review r1): if the queue was reloaded meanwhile, the new manager owns
+		// these series (same tags); zeroing them would clear its live values until its next
+		// emit. A reload after this check emits only after a full interval, so after the zero.
+		if emitted != nil && !pm.engine.partitionReloaded(pm) {
 			pm.emitZeroLogicalBacklog(emitted)
 			pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, 0)
 		}
@@ -141,6 +150,9 @@ func (pm *taskQueuePartitionManagerImpl) emitLogicalBacklogMetrics(ctx context.C
 // count per task_priority and the backlog age (oldest across priorities) from the same stats
 // DescribeQueue returns. It returns the priorities it recorded, or nil if it recorded nothing.
 func (pm *taskQueuePartitionManagerImpl) fetchAndEmitLogicalBacklogMetrics() map[int32]struct{} {
+	if h := logicalBacklogEmitHook.Load(); h != nil {
+		(*h)(pm)
+	}
 	if !pm.config.BreakdownMetricsByTaskQueue || !pm.defaultQueue.backlogMgr.isInitialized() {
 		return nil
 	}
@@ -153,6 +165,17 @@ func (pm *taskQueuePartitionManagerImpl) fetchAndEmitLogicalBacklogMetrics() map
 	}
 	pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, age.Seconds())
 	return pris
+}
+
+// logicalBacklogEmitHook, if set (tests only), runs at the start of each logical backlog emit.
+var logicalBacklogEmitHook atomic.Pointer[func(*taskQueuePartitionManagerImpl)]
+
+// partitionReloaded reports whether a different manager is now loaded for pm's partition.
+func (e *Engine) partitionReloaded(pm *taskQueuePartitionManagerImpl) bool {
+	e.partitionsLock.RLock()
+	defer e.partitionsLock.RUnlock()
+	cur, ok := e.partitions[pm.partition]
+	return ok && cur != pm
 }
 
 // staleLogicalBacklog returns the priorities in prev that cur no longer reports (upstream

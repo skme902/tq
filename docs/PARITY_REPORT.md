@@ -12,7 +12,9 @@ Ahead of the target (checked 2026-11-25; v1.32.2 is still the newest stable tag)
 from upstream `main` that are not in any release are ported because they fix code tq has.
 #11580 (97a4129d4) skips the "fair reader stuck" check while the queue unloads, which was a false
 error log and metric. #12316 (a7eaebfc1) zeroes the backlog gauges from the emitter, so an emit in
-flight at unload can't leave a stale value. Neither touches dispatch, so the parity target stays
+flight at unload can't leave a stale value. Two deviations there: `Stop` waits for the emitter, so
+the zero has landed when `Stop` returns (upstream lets it land just after), and the exiting emitter
+skips the zero if the queue has already been reloaded, so it can't clear the new manager's series. Neither touches dispatch, so the parity target stays
 v1.32.2. Unreleased `main` changes that are refactors, tuning or Temporal-only features (#11579,
 #12556, #12539, #12562, #13116, flow control, worker heartbeats) are not ported.
 
@@ -289,6 +291,8 @@ Reruns of run 2 and a run 3 gave 0.995/0.996 for mem and 0.994/0.993 for sqlite.
     `approximate_backlog_count` and `task_dispatch_latency`, `source`/`forwarded` on dispatch latency, the periodic logical
     backlog emitter (1m ± 5%) with `physical_*` gauges at ack-level sync, zeroing on unload, and the task_tracker (5 s buckets,
     30 s window) follow upstream. Differences:
+    - Unload zeroing follows upstream main #12316 (zeroed by the emitter as its last step, ahead of
+      the v1.32.2 target), with `Stop` waiting for it and no zero over a reloaded queue (see the top).
     - No `task_type`, `operation`, `worker_version`/build-ID or `service_name` tags; there is one task type and no versioning.
     - `partition` is always the partition ID (we have no `breakdownByPartition` switch; there is only partition 0 today).
     - Upstream's boolean `breakdownByTaskQueue` becomes `Config.MetricsQueueTagLimit`: the first N (namespace, name) pairs
