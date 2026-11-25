@@ -8,6 +8,7 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/skme902/tq/clock"
 	"github.com/skme902/tq/internal/counter"
+	"github.com/skme902/tq/metrics"
 	"github.com/skme902/tq/store"
 )
 
@@ -189,4 +191,34 @@ func newBacklogCountTestTasks(n int64) []*store.TaskInfo {
 		tasks = append(tasks, &store.TaskInfo{Pass: 1, ID: id})
 	}
 	return tasks
+}
+
+// Ported from upstream main 97a4129d4 (#11580, after v1.32.2): a write that fails while the
+// queue unloads leaves the reader not at the end with nothing loaded, and maybeReadTasksLocked
+// is a no-op once tqCtx is done. A later write on the way down must not report "fair reader
+// stuck". Upstream relied on existing tests; this reproduces the sequence from its description.
+func TestFairTaskReaderNoStuckReportDuringUnload(t *testing.T) {
+	t.Parallel()
+
+	reader, blm := newBacklogCountTestReader(t, 10, 0)
+	reader.mergeTasks(nil, mergeReadToEnd)
+	require.True(t, reader.atEnd)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	blm.tqCtx = ctx // the queue is unloading (e.g. lost its rangeID lease)
+
+	reader.getAndPinAckLevel()
+	reader.unpinAckLevel(errors.New("write outcome unknown"))
+	require.False(t, reader.atEnd)
+
+	reader.getAndPinAckLevel()
+	reader.wroteNewTasks(newBacklogCountTestTasks(1))
+	// The reader is in the state the check looks for: not at the end, nothing loaded (the write
+	// was above readLevel and dropped), no read pending.
+	require.False(t, reader.atEnd)
+	require.Zero(t, reader.getLoadedTasks())
+	reader.unpinAckLevel(nil)
+
+	require.Empty(t, blm.metricsHandler.(*captureMetrics).snapshot(metrics.FairReaderStuckDetected))
 }

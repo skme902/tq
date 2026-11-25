@@ -530,7 +530,11 @@ func (tr *fairTaskReader) mergeTasks(tasks []*store.TaskInfo, mode mergeMode) {
 	// The bug that led to this is fixed, but we'll leave this check defensively in case other
 	// bugs produce the same state.
 	// Deviation (delay): delayed tasks also end the stall, when their timers fire.
-	if mode == mergeWrite && !tr.atEnd && tr.loadedTasks == 0 && tr.delayedTasks == 0 && !tr.readPending && tr.backoffTimer == nil {
+	//
+	// Don't softassert if we're unloading: that state is benign and the reader is being torn down.
+	// (upstream main 97a4129d4, #11580, after v1.32.2)
+	if mode == mergeWrite && !tr.atEnd && tr.loadedTasks == 0 && tr.delayedTasks == 0 && !tr.readPending &&
+		tr.backoffTimer == nil && tr.backlogMgr.tqCtx.Err() == nil {
 		softAssert(tr.logger, false, "fair reader stuck")
 		tr.backlogMgr.metricsHandler.Counter(metrics.FairReaderStuckDetected, 1)
 		tr.maybeReadTasksLocked()

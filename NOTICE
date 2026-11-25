@@ -10,4 +10,5 @@ tag v1.32.1, commit af08a5e5f2dd40f545f2afac7780daaa6987001e, licensed under the
 The full upstream license text is in UPSTREAM_LICENSE. Files containing ported code carry a
 header of the form "Ported from temporalio/temporal v1.32.1 af08a5e5, <upstream path>".
 Fixes from tag v1.32.2, commit 6d085822273f4336796e6959c73ab1d14a23eb77 (same license), are
-ported on top; files carrying them say so in their header or at the change.
+ported on top; files carrying them say so in their header or at the change. A few later bug
+fixes from upstream main (not yet in a release) are ported the same way and name their commit.

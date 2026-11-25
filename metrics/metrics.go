@@ -14,7 +14,8 @@ type Tag struct {
 	Key, Value string
 }
 
-// Handler records metrics. Implementations must be safe for concurrent use.
+// Handler records metrics. Implementations must be safe for concurrent use and must not call
+// back into the engine (for example Stop): queue unload waits for in-flight metric calls.
 type Handler interface {
 	Counter(name string, delta int64, tags ...Tag)
 	Gauge(name string, value float64, tags ...Tag)

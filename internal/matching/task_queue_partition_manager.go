@@ -3,6 +3,7 @@
 // partition counts); AddTask keeps the sync-match-then-spool structure. User data changes are
 // QueueConfigWatcher notifications; the initial user data load is a synchronous
 // UserDataChanged in Start (upstream: async onUserDataChanged after userDataManager.Start).
+// Backlog gauge zeroing from the emitter: upstream main a7eaebfc1 (#12316, after v1.32.2).
 // Copyright (c) 2025 Temporal Technologies Inc. MIT License; see UPSTREAM_LICENSE and NOTICE.
 
 package matching
@@ -40,6 +41,9 @@ type taskQueuePartitionManagerImpl struct {
 	// metricsCtx ends the periodic backlog-metrics emission (upstream initCtx).
 	metricsCtx    context.Context
 	metricsCancel context.CancelFunc
+	// emitterDone is closed when the backlog-metrics emitter has exited (after it zeroed its
+	// gauges); nil if it was never started. Guarded by cfgMu.
+	emitterDone chan struct{}
 
 	// maxAttempts is the effective QueueConfig.MaxAttempts / Config.MaxAttempts (0 =
 	// unlimited), refreshed on load and on every config notification.
@@ -75,9 +79,17 @@ func (pm *taskQueuePartitionManagerImpl) Start() {
 	pm.rateLimitManager.UserDataChanged()
 	pm.emitPausedGauge()
 	pm.defaultQueue.Start()
-	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 {
-		go pm.emitLogicalBacklogMetrics(pm.metricsCtx)
+	pm.cfgMu.Lock()
+	// Start after Stop starts nothing (review M3); Stop reads emitterDone under the same lock.
+	if pm.config.BreakdownMetricsByTaskQueue && pm.config.BacklogMetricsEmitInterval > 0 && !pm.stopped {
+		done := make(chan struct{})
+		pm.emitterDone = done
+		go func() {
+			defer close(done)
+			pm.emitLogicalBacklogMetrics(pm.metricsCtx)
+		}()
 	}
+	pm.cfgMu.Unlock()
 }
 
 func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
@@ -86,14 +98,35 @@ func (pm *taskQueuePartitionManagerImpl) Stop(unloadCause unloadCause) {
 	pm.cfgMu.Lock() // waits for an in-flight config callback
 	pm.stopped = true
 	pm.metricsHandler.Gauge(metrics.QueuePaused, 0) // an unloaded queue does not report paused
+	emitterDone := pm.emitterDone
 	pm.cfgMu.Unlock()
 	pm.defaultQueue.Stop(unloadCause)
-	pm.emitZeroLogicalBacklog()
+	// The emitter zeroes its gauges as its last step (upstream #12316). Deviation: wait for it, so
+	// the gauges are zero when Stop returns (our emit is an in-memory read, so this is short; a
+	// metrics.Handler must not call back into the engine, see its doc).
+	if emitterDone != nil {
+		<-emitterDone
+	}
 }
 
 // emitLogicalBacklogMetrics is upstream's loop: every BacklogMetricsEmitInterval (±5% jitter,
 // upstream backoff.Jitter(interval, 0.05)) emit the live per-priority backlog stats.
+//
+// Upstream main a7eaebfc1 (#12316, after v1.32.2): this goroutine is the only writer of the
+// logical backlog gauges. Zeroing here, both for series that drop out between emits and on exit,
+// orders it after the last real emit, so an emit that was in flight when the queue unloaded
+// can't leave a stale value behind.
 func (pm *taskQueuePartitionManagerImpl) emitLogicalBacklogMetrics(ctx context.Context) {
+	var emitted map[int32]struct{}
+	defer func() {
+		// Not upstream (review r1): if the queue was reloaded meanwhile, the new manager owns
+		// these series (same tags); zeroing them would clear its live values until its next
+		// emit. A reload after this check emits only after a full interval, so after the zero.
+		if emitted != nil && !pm.engine.partitionReloaded(pm) {
+			pm.emitZeroLogicalBacklog(emitted)
+			pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, 0)
+		}
+	}()
 	for {
 		interval := pm.config.BacklogMetricsEmitInterval
 		d := time.Duration(float64(interval) * (0.95 + 0.1*rand.Float64()))
@@ -103,36 +136,67 @@ func (pm *taskQueuePartitionManagerImpl) emitLogicalBacklogMetrics(ctx context.C
 			t.Stop()
 			return
 		case <-ch:
-			pm.fetchAndEmitLogicalBacklogMetrics()
+			pris := pm.fetchAndEmitLogicalBacklogMetrics()
+			if pris == nil {
+				continue // not emitted; keep the last snapshot so live series are not zeroed
+			}
+			pm.emitZeroLogicalBacklog(staleLogicalBacklog(emitted, pris))
+			emitted = pris
 		}
 	}
 }
 
 // fetchAndEmitLogicalBacklogMetrics is upstream's without version attribution: the backlog
 // count per task_priority and the backlog age (oldest across priorities) from the same stats
-// DescribeQueue returns.
-func (pm *taskQueuePartitionManagerImpl) fetchAndEmitLogicalBacklogMetrics() {
+// DescribeQueue returns. It returns the priorities it recorded, or nil if it recorded nothing.
+func (pm *taskQueuePartitionManagerImpl) fetchAndEmitLogicalBacklogMetrics() map[int32]struct{} {
+	if h := logicalBacklogEmitHook.Load(); h != nil {
+		(*h)(pm)
+	}
 	if !pm.config.BreakdownMetricsByTaskQueue || !pm.defaultQueue.backlogMgr.isInitialized() {
-		return
+		return nil
 	}
 	var age time.Duration
+	pris := make(map[int32]struct{})
 	for pri, stats := range pm.defaultQueue.backlogMgr.BacklogStatsByPriority() {
 		pm.metricsHandler.Gauge(metrics.ApproximateBacklogCount, float64(stats.ApproximateBacklogCount), metrics.TaskPriorityTag(pri))
 		age = max(age, stats.ApproximateBacklogAge)
+		pris[pri] = struct{}{}
 	}
 	pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, age.Seconds())
+	return pris
 }
 
-// emitZeroLogicalBacklog is upstream emitZeroLogicalBacklogForQueue: zero the gauges on unload
-// so stale values do not persist.
-func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog() {
-	if !pm.config.BreakdownMetricsByTaskQueue || pm.config.BacklogMetricsEmitInterval <= 0 {
-		return
+// logicalBacklogEmitHook, if set (tests only), runs at the start of each logical backlog emit.
+var logicalBacklogEmitHook atomic.Pointer[func(*taskQueuePartitionManagerImpl)]
+
+// partitionReloaded reports whether a different manager is now loaded for pm's partition.
+func (e *Engine) partitionReloaded(pm *taskQueuePartitionManagerImpl) bool {
+	e.partitionsLock.RLock()
+	defer e.partitionsLock.RUnlock()
+	cur, ok := e.partitions[pm.partition]
+	return ok && cur != pm
+}
+
+// staleLogicalBacklog returns the priorities in prev that cur no longer reports (upstream
+// #12316). The age gauge is per queue here, not per priority, so it is never stale while the
+// queue emits.
+func staleLogicalBacklog(prev, cur map[int32]struct{}) map[int32]struct{} {
+	stale := make(map[int32]struct{})
+	for pri := range prev {
+		if _, ok := cur[pri]; !ok {
+			stale[pri] = struct{}{}
+		}
 	}
-	for pri := range pm.defaultQueue.backlogMgr.BacklogStatsByPriority() {
+	return stale
+}
+
+// emitZeroLogicalBacklog zeroes the count gauges of the given priorities. Only the emitter
+// goroutine calls it (upstream #12316); on exit it also zeroes the age gauge.
+func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklog(pris map[int32]struct{}) {
+	for pri := range pris {
 		pm.metricsHandler.Gauge(metrics.ApproximateBacklogCount, 0, metrics.TaskPriorityTag(pri))
 	}
-	pm.metricsHandler.Gauge(metrics.ApproximateBacklogAgeSeconds, 0)
 }
 
 // userDataChanged is called on QueueConfigWatcher notifications.
