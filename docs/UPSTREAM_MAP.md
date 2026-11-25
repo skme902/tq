@@ -8,7 +8,7 @@
 | Go | `go 1.26.8` in go.mod (no toolchain line); verified building/testing with go1.27.3 |
 | License | MIT (© Temporal Technologies 2025, © Uber 2020) → copied to `../UPSTREAM_LICENSE` |
 | Clone | `upstream/temporal` (fetched separately; at tag v1.32.2, commit 6d085822, for parity runs; at v1.32.1 af08a5e5 to follow the line numbers below; pristine, `git status` clean; see parity/README.md) |
-| v1.32.2 | **6d085822273f4336796e6959c73ab1d14a23eb77** (2026-10-31 IST) is the parity target. Of its matching/persistence commits only #12566 (fair backlog count tracking, 3807ace9d) applies and is ported; #12595 (priTaskReader), #11841 (worker-instance poll cancellation) and #11527 (sticky/versioned stats) touch code tq does not have. The map below still describes v1.32.1 line numbers. |
+| v1.32.2 | **6d085822273f4336796e6959c73ab1d14a23eb77** (2026-10-31 IST) is the parity target. Of its matching/persistence commits only #12566 (fair backlog count tracking, 3807ace9d) applies and is ported; #12595 (priTaskReader), #11841 (worker-instance poll cancellation) and #11527 (sticky/versioned stats) touch code tq does not have. The map below still describes v1.32.1 line numbers. Also ported from unreleased `main` (2026-11-25): #11580 and #12316, see PARITY_REPORT. |
 
 All paths are relative to `service/matching/` unless prefixed. Line numbers are for the commit above.
 Only facts read in the source are stated; anything inferred is marked *(inference)*.

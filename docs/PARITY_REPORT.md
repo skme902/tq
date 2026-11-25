@@ -8,6 +8,14 @@ tags the upstream matching changes are #12595 (priTaskReader only), #12566 (fair
 tracking, ported to tq), #11841 (worker-instance poll cancellation) and #11527 (sticky queue
 stats); none of them changes dispatch order or delivery.
 
+Ahead of the target (checked 2026-11-25; v1.32.2 is still the newest stable tag): two bug fixes
+from upstream `main` that are not in any release are ported because they fix code tq has.
+#11580 (97a4129d4) skips the "fair reader stuck" check while the queue unloads, which was a false
+error log and metric. #12316 (a7eaebfc1) zeroes the backlog gauges from the emitter, so an emit in
+flight at unload can't leave a stale value. Neither touches dispatch, so the parity target stays
+v1.32.2. Unreleased `main` changes that are refactors, tuning or Temporal-only features (#11579,
+#12556, #12539, #12562, #13116, flow control, worker heartbeats) are not ported.
+
 Status: slice 6 (final). All numbers below come from runs on 2026-10-27 (IST). Results:
 `parity/results/compare.md` (full matrix, finished 15:20:42 IST) and `parity/results/probes.md`
 (ablations, system-limit probes and config-lag probes, finished 15:25:05 IST). Raw traces are in `parity/traces/`
